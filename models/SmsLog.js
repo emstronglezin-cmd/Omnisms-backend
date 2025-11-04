@@ -1,12 +1,16 @@
-const mongoose = require('mongoose');
+const db = require('../config/firebase');
 
-const smsLogSchema = new mongoose.Schema({
-  user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  message_id: { type: String, required: true },
-  cost: { type: Number, required: true },
-  operator: { type: String, required: true },
-  date: { type: Date, default: Date.now },
-  status: { type: String, enum: ['sent', 'failed'], default: 'sent' },
-});
+class SmsLog {
+  static async logSms(data) {
+    const smsLogRef = db.collection('smsLogs').doc();
+    await smsLogRef.set(data);
+    return { id: smsLogRef.id, ...data };
+  }
 
-module.exports = mongoose.model('SmsLog', smsLogSchema);
+  static async getSmsLogsByUser(userId) {
+    const snapshot = await db.collection('smsLogs').where('user_id', '==', userId).get();
+    return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  }
+}
+
+module.exports = SmsLog;

@@ -1,9 +1,16 @@
-const mongoose = require('mongoose');
+const db = require('../config/firebase');
 
-const smsCostSchema = new mongoose.Schema({
-  provider: { type: String, required: true },
-  unitCost: { type: Number, required: true },
-  updatedAt: { type: Date, default: Date.now },
-});
+class SmsCost {
+  static async setSmsCost(data) {
+    const smsCostRef = db.collection('smsCosts').doc();
+    await smsCostRef.set(data);
+    return { id: smsCostRef.id, ...data };
+  }
 
-module.exports = mongoose.model('SmsCost', smsCostSchema);
+  static async getSmsCost() {
+    const snapshot = await db.collection('smsCosts').get();
+    return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  }
+}
+
+module.exports = SmsCost;

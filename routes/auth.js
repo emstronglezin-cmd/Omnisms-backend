@@ -1,7 +1,5 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcrypt');
-const User = require('../models/User');
+const Parse = require('parse/node');
 
 const router = express.Router();
 
@@ -9,16 +7,23 @@ const router = express.Router();
 router.post('/register', async (req, res) => {
   const { name, country, phone, password, userType } = req.body;
   try {
-    const existingUser = await User.findOne({ phone });
+    const query = new Parse.Query(Parse.User);
+    query.equalTo('username', phone);
+    const existingUser = await query.first();
+
     if (existingUser) {
       return res.status(400).json({ message: 'Phone number already exists' });
     }
 
-    const user = new User({ name, country, phone, password, userType });
-    await user.save();
+    const user = new Parse.User();
+    user.set('username', phone);
+    user.set('password', password);
+    user.set('name', name);
+    user.set('country', country);
+    user.set('userType', userType);
 
-    const token = jwt.sign({ id: user._id, userType: user.userType }, process.env.JWT_SECRET, { expiresIn: '1h' });
-    res.status(201).json({ message: 'User registered successfully', token });
+    await user.signUp();
+    res.status(201).json({ message: 'User registered successfully' });
   } catch (err) {
     res.status(400).json({ message: 'Error registering user', error: err.message });
   }
@@ -28,16 +33,10 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
   const { phone, password } = req.body;
   try {
-    const user = await User.findOne({ phone });
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
-
-    const token = jwt.sign({ id: user._id, userType: user.userType }, process.env.JWT_SECRET, { expiresIn: '1h' });
-    res.status(200).json({ token });
+    const user = await Parse.User.logIn(phone, password);
+    res.status(200).json({ sessionToken: user.getSessionToken() });
   } catch (err) {
-    res.status(500).json({ message: 'Error logging in', error: err.message });
+    res.status(400).json({ message: 'Invalid credentials', error: err.message });
   }
 });
 

@@ -1,10 +1,16 @@
-const mongoose = require('mongoose');
+const db = require('../config/firebase');
 
-const groupMessageSchema = new mongoose.Schema({
-  groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', required: true },
-  senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  content: { type: String, required: true },
-  timestamp: { type: Date, default: Date.now },
-});
+class GroupMessage {
+  static async createGroupMessage(data) {
+    const groupMessageRef = db.collection('groupMessages').doc();
+    await groupMessageRef.set(data);
+    return { id: groupMessageRef.id, ...data };
+  }
 
-module.exports = mongoose.model('GroupMessage', groupMessageSchema);
+  static async getMessagesByGroup(groupId) {
+    const snapshot = await db.collection('groupMessages').where('groupId', '==', groupId).get();
+    return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  }
+}
+
+module.exports = GroupMessage;
