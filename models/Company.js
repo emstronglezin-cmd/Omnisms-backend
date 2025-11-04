@@ -1,11 +1,16 @@
-const mongoose = require('mongoose');
+const db = require('../config/firebase');
 
-const companySchema = new mongoose.Schema({
-  name: { type: String, required: true, unique: true },
-  logo: { type: String },
-  owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  verified: { type: Boolean, default: false },
-  createdAt: { type: Date, default: Date.now },
-});
+class Company {
+  static async createCompany(data) {
+    const companyRef = db.collection('companies').doc();
+    await companyRef.set(data);
+    return { id: companyRef.id, ...data };
+  }
 
-module.exports = mongoose.model('Company', companySchema);
+  static async getCompaniesByOwner(ownerId) {
+    const snapshot = await db.collection('companies').where('owner', '==', ownerId).get();
+    return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  }
+}
+
+module.exports = Company;

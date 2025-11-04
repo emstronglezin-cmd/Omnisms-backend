@@ -1,6 +1,5 @@
 require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
 const authRoutes = require('./routes/auth');
 const messageRoutes = require('./routes/messages');
 const groupRoutes = require('./routes/groups');
@@ -20,6 +19,7 @@ const swaggerDocument = require('./swagger.json');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const ParseServer = require('parse-server').ParseServer;
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -59,13 +59,17 @@ app.use('/ads', adsRoutes);
 app.use('/credits', creditRoutes);
 app.use('/companies', companyRoutes);
 
-// Database connection
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-  .then(() => console.log('Connected to MongoDB'))
-  .catch((err) => console.error('Failed to connect to MongoDB', err));
+// Configure Parse Server
+const parseServer = new ParseServer({
+  databaseURI: process.env.PARSE_DATABASE_URI, // Back4App database URI
+  cloud: './cloud/main.js', // Path to your Cloud Code
+  appId: process.env.PARSE_APP_ID,
+  masterKey: process.env.PARSE_MASTER_KEY, // Keep this key secret!
+  serverURL: process.env.PARSE_SERVER_URL, // URL of your Parse Server
+});
+
+// Mount Parse Server on /parse
+app.use('/parse', parseServer.app);
 
 // Socket.io setup
 const server = http.createServer(app);

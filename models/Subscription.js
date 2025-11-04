@@ -1,13 +1,16 @@
-const mongoose = require('mongoose');
+const db = require('../config/firebase');
 
-const subscriptionSchema = new mongoose.Schema({
-  user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  plan_name: { type: String, required: true },
-  price: { type: Number, required: true },
-  start_date: { type: Date, required: true },
-  end_date: { type: Date, required: true },
-  status: { type: String, enum: ['active', 'inactive'], default: 'inactive' },
-  payment_reference: { type: String, required: true },
-});
+class Subscription {
+  static async createSubscription(data) {
+    const subscriptionRef = db.collection('subscriptions').doc();
+    await subscriptionRef.set(data);
+    return { id: subscriptionRef.id, ...data };
+  }
 
-module.exports = mongoose.model('Subscription', subscriptionSchema);
+  static async getSubscriptionsByUser(userId) {
+    const snapshot = await db.collection('subscriptions').where('user_id', '==', userId).get();
+    return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  }
+}
+
+module.exports = Subscription;
