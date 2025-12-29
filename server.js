@@ -59,6 +59,10 @@ app.use('/ads', adsRoutes);
 app.use('/credits', creditRoutes);
 app.use('/companies', companyRoutes);
 
+// API to check user premium status
+const meRoutes = require('./routes/me');
+app.use('/me', meRoutes);
+
 // Configure Parse Server
 const parseServer = new ParseServer({
   databaseURI: process.env.PARSE_DATABASE_URI, // Back4App database URI

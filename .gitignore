@@ -3,3 +3,5 @@ config/omnisms-b98c5-firebase-adminsdk-fbsvc-c49b735d46.json
 node_modules
 # Ignorer les fichiers contenant des secrets
 functions/omnisms-b98c5-firebase-adminsdk-fbsvc-c49b735d46.json
+.env
+.env
