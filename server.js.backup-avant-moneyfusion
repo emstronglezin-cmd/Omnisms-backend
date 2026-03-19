@@ -1,0 +1,14 @@
+// ===== PAYMENT MONEYFUSION (FIX DEFINITIF) =====
+      timeout: 5000
+    return res.redirect(
+      'https://www.pay.moneyfusion.net/Omnisms/d32197cb9d141761/pay/'
+    );
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log('OmniSMS Backend running on port ' + PORT));
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log('OmniSMS Backend running on port ' + PORT));
+
+// ===== MONEYFUSION PAYMENT REDIRECT =====
+app.get('/payment', (req, res) => {

@@ -40,4 +40,21 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// Modifier le profil utilisateur
+router.put('/profile', authenticate, async (req, res) => {
+  const { name, country, password } = req.body;
+  try {
+    const user = req.user;
+
+    if (name) user.set('name', name);
+    if (country) user.set('country', country);
+    if (password) user.set('password', password);
+
+    await user.save(null, { useMasterKey: true });
+    res.status(200).json({ message: 'Profil mis à jour avec succès' });
+  } catch (err) {
+    res.status(500).json({ message: 'Erreur lors de la mise à jour du profil', error: err.message });
+  }
+});
+
 module.exports = router;

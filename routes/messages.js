@@ -44,4 +44,40 @@ router.get('/:userId', authenticate, async (req, res) => {
   }
 });
 
+// Réagir avec un emoji
+router.post('/:id/react', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { emoji } = req.body;
+  try {
+    const message = await Message.findById(id);
+    if (!message) return res.status(404).json({ message: 'Message non trouvé' });
+
+    message.reactions = message.reactions || [];
+    message.reactions.push({ userId: req.user.id, emoji });
+    await message.save();
+
+    res.status(200).json({ message: 'Réaction ajoutée avec succès' });
+  } catch (err) {
+    res.status(500).json({ message: 'Erreur lors de l\'ajout de la réaction', error: err.message });
+  }
+});
+
+// Supprimer un message
+router.delete('/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const message = await Message.findById(id);
+    if (!message) return res.status(404).json({ message: 'Message non trouvé' });
+
+    if (message.senderId.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Vous ne pouvez supprimer que vos propres messages' });
+    }
+
+    await message.remove();
+    res.status(200).json({ message: 'Message supprimé avec succès' });
+  } catch (err) {
+    res.status(500).json({ message: 'Erreur lors de la suppression du message', error: err.message });
+  }
+});
+
 module.exports = router;

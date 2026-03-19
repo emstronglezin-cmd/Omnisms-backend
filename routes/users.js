@@ -26,3 +26,16 @@ router.post('/link', authenticate, async (req, res) => {
 });
 
 module.exports = router;
+// ================================
+// 🧠 OmniSMS - User Channel Status
+// ================================
+/**
+ * channel: 'online' | 'offline'
+ */
+function setUserChannel(user, channel) {
+  user.channel = channel;
+  user.lastSeen = new Date();
+  return user;
+}
+
+module.exports.setUserChannel = setUserChannel;

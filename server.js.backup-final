@@ -1,0 +1,60 @@
+// ===== PAYMENT MONEYFUSION (FIX DEFINITIF) =====
+      timeout: 5000
+    return res.redirect(
+    );
+
+app.listen(PORT, () => console.log('OmniSMS Backend running on port ' + PORT));
+
+app.listen(PORT, () => console.log('OmniSMS Backend running on port ' + PORT));
+
+// ===== MONEYFUSION PAYMENT REDIRECT =====
+app.get('/payment', (req, res) => {
+
+// ===== MONEYFUSION PAYMENT ROUTE =====
+const axios = require('axios');
+
+app.get('/pay', async (req, res) => {
+  try {
+    const response = await axios.post(
+      'https://www.pay.moneyfusion.net/Omnisms/d32197cb9d141761/pay/',
+      {
+        amount: 2000,
+        currency: 'XOF',
+        description: 'Abonnement OmniSMS'
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    // Redirection vers la page de paiement MoneyFusion
+    if (response.data && response.data.payment_url) {
+      return res.redirect(response.data.payment_url);
+    }
+
+    return res.status(500).send('Erreur: lien de paiement introuvable');
+
+  } catch (error) {
+    console.error('MoneyFusion error:', error.message);
+    return res.status(500).send('Erreur paiement MoneyFusion');
+  }
+});
+// ===== END MONEYFUSION =====
+
+
+// ===== SERVER PORT (FIXED) =====
+// ==============================
+
+
+// ===== SERVER PORT (FINAL & UNIQUE) =====
+// =======================================
+
+
+// ===== SERVER PORT (FINAL & UNIQUE) =====
+const PORT = 5000;
+// =======================================
+
+    res.send('Page de paiement MoneyFusion');
+});
