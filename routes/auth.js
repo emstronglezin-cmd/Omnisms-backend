@@ -1,5 +1,6 @@
 const express = require('express');
-const Parse = require('parse/node');
+const Parse = require('../parse/node');
+const authenticate = require('../middleware/authenticate');
 
 const router = express.Router();
 
