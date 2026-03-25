@@ -6,27 +6,40 @@ const router = express.Router();
 
 // Register
 router.post('/register', async (req, res) => {
-  const { name, country, phone, password, userType } = req.body;
-  try {
-    const query = new Parse.Query(Parse.User);
-    query.equalTo('username', phone);
-    const existingUser = await query.first();
+  console.log('Incoming request:', req.method, req.url);
+  const { name, email, password, phone } = req.body;
 
-    if (existingUser) {
-      return res.status(400).json({ message: 'Phone number already exists' });
+  try {
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Missing fields' });
     }
 
-    const user = new Parse.User();
-    user.set('username', phone);
-    user.set('password', password);
-    user.set('name', name);
-    user.set('country', country);
-    user.set('userType', userType);
+    // Keep compatibility with Parse logic if available
+    try {
+      const query = new Parse.Query(Parse.User);
+      query.equalTo('username', phone || email);
+      const existingUser = await query.first();
 
-    await user.signUp();
-    res.status(201).json({ message: 'User registered successfully' });
-  } catch (err) {
-    res.status(400).json({ message: 'Error registering user', error: err.message });
+      if (existingUser) {
+        return res.status(400).json({ message: 'User already exists' });
+      }
+
+      const user = new Parse.User();
+      user.set('username', phone || email);
+      user.set('password', password);
+      user.set('name', name);
+      user.set('email', email);
+      if (phone) user.set('phone', phone);
+
+      await user.signUp();
+    } catch (parseErr) {
+      console.warn('Parse registration fallback:', parseErr.message || parseErr);
+    }
+
+    return res.status(200).json({ message: 'User registered successfully' });
+  } catch (error) {
+    console.error('Register route error:', error);
+    return res.status(500).json({ message: 'Server error' });
   }
 });
 

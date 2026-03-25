@@ -89,6 +89,12 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// Logging middleware
+app.use((req, res, next) => {
+  console.log('Incoming request:', req.method, req.url);
+  next();
+});
+
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -105,7 +111,7 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: "API running" });
+  res.send('Backend is running');
 });
 
 app.get('/api/status', (req, res) => {
@@ -119,6 +125,7 @@ app.get('/api/status', (req, res) => {
 /* ========================================
    ROUTES
 ======================================== */
+app.use('/api/auth', authRoutes);
 app.use('/auth', authRoutes);
 app.use('/messages', messageRoutes);
 app.use('/groups', groupRoutes);
