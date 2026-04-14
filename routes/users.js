@@ -1,41 +1,93 @@
-const express = require('express');
-const User = require('../models/User');
+'use strict';
+/**
+ * OmniSMS — Routes Utilisateurs
+ *
+ * Utilise Firestore comme base de données.
+ * Aucune dépendance Mongoose/Parse.
+ */
+
+const express      = require('express');
+const router       = express.Router();
+const db           = require('../config/firebase');
 const authenticate = require('../middleware/authenticate');
+const { logger }   = require('../middleware/logger');
 
-const router = express.Router();
-
-// Link user with phone or publicId
+// ── POST /users/link — associer phone / publicId ─────────────
 router.post('/link', authenticate, async (req, res) => {
-  const { phone, userId, publicId } = req.body;
-  try {
-    let user = await User.findOne({ phone });
+  const { phone, publicId } = req.body;
 
-    if (!user) {
-      user = new User({ phone, publicId });
-      await user.save();
-    } else {
-      if (userId) user._id = userId;
-      if (publicId) user.publicId = publicId;
-      await user.save();
+  if (!phone && !publicId) {
+    return res.status(400).json({ error: 'phone ou publicId requis.', code: 'MISSING_FIELDS' });
+  }
+
+  try {
+    const ref  = db.collection('users').doc(req.user.uid);
+    const snap = await ref.get();
+
+    const now = new Date().toISOString();
+
+    if (!snap.exists) {
+      // Créer l'utilisateur s'il n'existe pas (premier accès)
+      const newUser = {
+        uid      : req.user.uid,
+        phone    : phone  || null,
+        publicId : publicId || null,
+        channel  : 'online',
+        lastSeen : now,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await ref.set(newUser);
+      return res.status(201).json({ id: req.user.uid, ...newUser });
     }
 
-    res.status(200).json(user);
+    const updates = { lastSeen: now, updatedAt: now, channel: 'online' };
+    if (phone)    updates.phone    = phone;
+    if (publicId) updates.publicId = publicId;
+
+    await ref.update(updates);
+
+    const updated = await ref.get();
+    return res.status(200).json({ id: updated.id, ...updated.data() });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    logger.error('Erreur /users/link', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
-module.exports = router;
-// ================================
-// 🧠 OmniSMS - User Channel Status
-// ================================
+// ── GET /users/:userId — récupérer un utilisateur ───────────
+router.get('/:userId', authenticate, async (req, res) => {
+  const { userId } = req.params;
+
+  // Sécurité : un utilisateur ne peut voir que son propre profil
+  if (req.user.uid !== userId) {
+    return res.status(403).json({ error: 'Accès refusé.', code: 'FORBIDDEN' });
+  }
+
+  try {
+    const snap = await db.collection('users').doc(userId).get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Utilisateur non trouvé.', code: 'NOT_FOUND' });
+    }
+
+    const { password: _pw, ...safeUser } = snap.data();
+    return res.status(200).json({ id: snap.id, ...safeUser });
+  } catch (err) {
+    logger.error('Erreur GET /users/:userId', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
+
 /**
- * channel: 'online' | 'offline'
+ * Helper exporté — mettre à jour le canal de communication d'un utilisateur.
+ * @param {FirebaseFirestore.DocumentReference} userRef
+ * @param {'online'|'offline'} channel
  */
-function setUserChannel(user, channel) {
-  user.channel = channel;
-  user.lastSeen = new Date();
-  return user;
+async function setUserChannel(userRef, channel) {
+  const now = new Date().toISOString();
+  await userRef.update({ channel, lastSeen: now, updatedAt: now });
 }
 
+module.exports = router;
 module.exports.setUserChannel = setUserChannel;

@@ -1,9 +1,19 @@
+'use strict';
+/**
+ * OmniSMS — Firestore (Production)
+ *
+ * Exporte une instance Firestore connectée au vrai projet Firebase.
+ * Utilisé par tous les modèles (User, Message, Group, etc.).
+ *
+ * La connexion passe par firebase-admin/index.js qui s'initialise
+ * via FIREBASE_SERVICE_ACCOUNT_JSON.
+ */
+
 const admin = require('../firebase-admin/index');
-// const serviceAccount = require('./omnisms-b98c5-firebase-adminsdk-fbsvc-c49b735d46.json');
 
-admin.initializeApp({
-  credential: admin.credential.cert({}),
-  databaseURL: `https://mock.firebaseio.com`
-});
+const db = admin.firestore();
 
-module.exports = admin;
+// Paramètres Firestore recommandés pour la production
+db.settings({ ignoreUndefinedProperties: true });
+
+module.exports = db;

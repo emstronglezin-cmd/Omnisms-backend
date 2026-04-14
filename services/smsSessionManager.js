@@ -1,14 +1,14 @@
-// smsSessionManager.js
-// Gestion des sessions SMS
+'use strict';
+/**
+ * OmniSMS — SMS Session Manager (stub de compatibilité)
+ *
+ * Le système de commandes SMS est stateless (pas de sessions nécessaires).
+ * Ce fichier est conservé pour la compatibilité avec du code legacy.
+ * Les nouvelles fonctionnalités sont dans services/smsHandler.js
+ */
 
-const startSession = (userId) => {
-    console.log(`Démarrage de la session SMS pour l'utilisateur ${userId}`);
-    // Logique pour démarrer une session SMS
-};
-
-const endSession = (userId) => {
-    console.log(`Fin de la session SMS pour l'utilisateur ${userId}`);
-    // Logique pour terminer une session SMS
-};
+// Stub silencieux — pas de console.warn en production
+const startSession = (_userId) => {};
+const endSession   = (_userId) => {};
 
 module.exports = { startSession, endSession };

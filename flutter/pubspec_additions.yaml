@@ -1,0 +1,66 @@
+# ============================================================
+# OmniSMS — Dépendances Flutter à ajouter dans pubspec.yaml
+# ============================================================
+# Ajoutez ces lignes dans la section "dependencies:" de votre
+# pubspec.yaml existant. Ne pas remplacer votre fichier entier.
+# Ensuite : flutter pub get
+# ============================================================
+
+dependencies:
+  # HTTP (appels API backend)
+  http: ^1.2.0
+
+  # WebView (afficher la page de paiement Money Fusion)
+  webview_flutter: ^4.4.2
+
+  # URL Launcher (ouvrir Fusion Link dans le navigateur)
+  url_launcher: ^6.2.2
+
+  # Firebase (normalement déjà présent dans OmniSMS)
+  firebase_core: ^2.24.0
+  firebase_auth: ^4.15.0
+  cloud_firestore: ^4.14.0
+
+# ============================================================
+# android/app/src/main/AndroidManifest.xml — Permissions
+# ============================================================
+#
+# Dans <manifest> :
+#   <uses-permission android:name="android.permission.INTERNET"/>
+#
+# Dans <activity> (pour le deeplink de retour) :
+#   <intent-filter>
+#     <action android:name="android.intent.action.VIEW"/>
+#     <category android:name="android.intent.category.DEFAULT"/>
+#     <category android:name="android.intent.category.BROWSABLE"/>
+#     <data android:scheme="omnisms" android:host="payment-return"/>
+#   </intent-filter>
+
+# ============================================================
+# ios/Runner/Info.plist — Deeplink iOS
+# ============================================================
+#
+# <key>CFBundleURLTypes</key>
+# <array>
+#   <dict>
+#     <key>CFBundleTypeRole</key><string>Editor</string>
+#     <key>CFBundleURLSchemes</key>
+#     <array><string>omnisms</string></array>
+#   </dict>
+# </array>
+#
+# <key>LSApplicationQueriesSchemes</key>
+# <array>
+#   <string>https</string>
+#   <string>http</string>
+# </array>
+
+# ============================================================
+# Build avec URL backend personnalisée
+# ============================================================
+#
+# flutter build apk \
+#   --dart-define=BACKEND_URL=https://votre-backend.onrender.com
+#
+# flutter run \
+#   --dart-define=BACKEND_URL=https://votre-backend.onrender.com
