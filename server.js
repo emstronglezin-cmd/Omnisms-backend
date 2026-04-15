@@ -88,6 +88,33 @@ app.use(globalSlowDown);
 app.use(globalLimiter);
 
 /* ============================================================
+   ROUTES PRIORITAIRES — Aucun middleware bloquant
+   Enregistrées AVANT le rate-limit pour répondre immédiatement
+============================================================ */
+
+// GET /health — Health check Render / monitoring
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status : 'ok',
+    app    : 'OmniSMS',
+    version: '1.0.0',
+  });
+});
+
+// GET / — Page d'accueil HTML
+app.get('/', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.status(200).send(
+    '<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
+    + '<title>OmniSMS API</title>'
+    + '<style>body{font-family:sans-serif;display:flex;align-items:center;'
+    + 'justify-content:center;min-height:100vh;margin:0;background:#0d1117;color:#f0f6fc;}'
+    + 'h1{font-size:2rem;}span{color:#3fb950;}</style></head>'
+    + '<body><h1>OmniSMS API &mdash; <span>Running</span></h1></body></html>'
+  );
+});
+
+/* ============================================================
    IMPORT DES ROUTES
 ============================================================ */
 const authRoutes          = require('./routes/auth');
@@ -114,69 +141,6 @@ function loadOptional(routePath, mount) {
     }
   }
 }
-
-/* ============================================================
-   HEALTH CHECK (non rate-limité)
-   Inclut le statut Firebase et des providers SMS
-============================================================ */
-app.get('/health', async (req, res) => {
-  const mem = process.memoryUsage();
-
-  // Vérifier la connexion Firebase
-  let firebaseStatus = 'connected';
-  let firebaseProject = null;
-  try {
-    const db = require('./config/firebase');
-    // Lecture légère pour confirmer la connexion
-    await db.collection('_health').doc('ping').get();
-    const admin = require('./firebase-admin/index');
-    firebaseProject = admin.app?.().options?.projectId || 'unknown';
-  } catch (err) {
-    firebaseStatus = `error: ${err.message}`;
-  }
-
-  // Statut des providers SMS
-  let smsProvider = {};
-  try {
-    const { getProviderStatus } = require('./services/smsProvider');
-    smsProvider = getProviderStatus();
-  } catch { smsProvider = { activeProvider: 'unknown' }; }
-
-  res.json({
-    status  : firebaseStatus === 'connected' ? 'ok' : 'degraded',
-    service : 'OmniSMS Backend v2.3',
-    version : '2.3.0',
-    uptime  : `${Math.floor(process.uptime())}s`,
-    firebase: {
-      status : firebaseStatus,
-      project: firebaseProject,
-    },
-    sms     : smsProvider,
-    memory  : {
-      heapUsed : `${Math.round(mem.heapUsed  / 1024 / 1024)}MB`,
-      heapTotal: `${Math.round(mem.heapTotal / 1024 / 1024)}MB`,
-      rss      : `${Math.round(mem.rss       / 1024 / 1024)}MB`,
-    },
-    node    : process.version,
-    time    : new Date().toISOString(),
-  });
-});
-
-app.get('/', (req, res) => {
-  res.json({
-    name   : 'OmniSMS Backend',
-    version: '2.3.0',
-    status : 'running',
-    health : '/health',
-    status2: '/api/status',
-    routes : {
-      sms     : 'POST /sms/incoming, POST /sms/test, GET /sms/commands',
-      contacts: 'POST /add-contact, GET /contacts/:userId, DELETE /contacts/:userId/:phone, POST /send-sms',
-      auth    : 'POST /api/auth/register, POST /api/auth/login, GET /api/auth/me, PUT /api/auth/profile',
-      payment : 'POST /api/payment/fusion-pay, POST /api/payment/fusion-callback, POST /api/payment/fusion-callback-api',
-    },
-  });
-});
 
 /* ============================================================
    ROUTES AUTHENTIFICATION
