@@ -1,55 +1,85 @@
-const express = require('express');
-const Subscription = require('../models/Subscription');
-const User = require('../models/User');
-const authenticate = require('../middleware/authenticate');
-const router = express.Router();
+'use strict';
+/**
+ * OmniSMS — Routes Abonnements
+ *
+ * Utilise Firestore comme source de vérité.
+ * Aucune dépendance sur l'in-memory store (config/db).
+ */
 
-// Webhook to validate subscription payment
-router.post('/webhook/moneyfusion', async (req, res) => {
+const express = require('express');
+const router  = express.Router();
+const db      = require('../config/firebase');
+const { logger } = require('../middleware/logger');
+
+/**
+ * GET /subscriptions/status/:phone
+ * → Vérifier le statut premium d'un utilisateur par téléphone
+ */
+router.get('/status/:phone', async (req, res) => {
+  const { phone } = req.params;
+
+  if (!phone) {
+    return res.status(400).json({ error: 'phone est requis.', code: 'MISSING_FIELDS' });
+  }
+
   try {
-    // Replace MoneyFusion logic with direct API calls
-    const isValid = true; // Placeholder for signature validation logic
-    if (!isValid) {
-      return res.status(400).json({ error: 'Invalid signature' });
+    const snap = await db
+      .collection('users_sms')
+      .where('phone', '==', phone)
+      .limit(1)
+      .get();
+
+    if (snap.empty) {
+      return res.status(404).json({ error: 'Utilisateur non trouvé.', phone });
     }
 
-    // Placeholder for processing webhook data
-    console.log('Processing MoneyFusion webhook:', req.body);
-    res.status(200).json({ message: 'Webhook processed successfully' });
-  } catch (error) {
-    console.error('Error processing MoneyFusion webhook:', error.message);
-    res.status(500).json({ error: 'Failed to process webhook' });
+    const user = snap.docs[0].data();
+    return res.status(200).json({
+      phone              : user.phone,
+      premium            : user.premium || false,
+      credits            : user.credits || 0,
+      premiumActivatedAt : user.premiumActivatedAt || null,
+      activationChannel  : user.activationChannel || null,
+    });
+  } catch (err) {
+    logger.error('Erreur /subscriptions/status', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
-// Subscription plans
-const plans = {
-  premium: { amount: 2000, description: 'Premium Plan - 1 Month' },
-  native_sms_weekly: { amount: 50, description: 'Native SMS Plan - 1 Week' },
-  native_sms_monthly: { amount: 150, description: 'Native SMS Plan - 1 Month' },
-  enterprise: { amount: 10000, description: 'Enterprise Plan - 1 Month' },
-};
+/**
+ * GET /subscriptions/plans
+ * → Retourner les plans disponibles
+ */
+router.get('/plans', (req, res) => {
+  const { PAYMENT_NUMBER, PREMIUM_AMOUNT, CREDIT_TABLE } = require('../services/creditSystem');
 
-// Subscribe to a plan
-router.post('/subscribe', authenticate, async (req, res) => {
-  const { plan } = req.body;
-  const user = await User.findById(req.user.id);
-
-  if (!user) return res.status(404).json({ message: 'User not found' });
-  if (!plans[plan]) return res.status(400).json({ message: 'Invalid plan selected' });
-
-  try {
-    const invoiceData = {
-      items: [{ name: plans[plan].description, quantity: 1, unit_price: plans[plan].amount }],
-      totalAmount: plans[plan].amount,
-      description: plans[plan].description,
-    };
-
-    const invoice = await createInvoice(invoiceData);
-    res.status(200).json({ message: 'Invoice created successfully', invoice });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to create invoice', error: error.message });
-  }
+  return res.status(200).json({
+    plans: [
+      {
+        id      : 'premium',
+        name    : 'OmniSMS Premium',
+        amount  : PREMIUM_AMOUNT,
+        currency: 'XOF',
+        description: 'Accès illimité à toutes les fonctionnalités',
+        activation: {
+          online : 'Payer via Fusion Pay → 2000 XOF',
+          offline: `Envoyer ${PREMIUM_AMOUNT}F au ${PAYMENT_NUMBER} → SMS "CONFIRM PREMIUM"`,
+        },
+      },
+      ...(CREDIT_TABLE || []).map(t => ({
+        id      : `credits_${t.amount}`,
+        name    : `Recharge ${t.amount}F`,
+        amount  : t.amount,
+        currency: 'XOF',
+        credits : t.credits,
+        description: `+${t.credits} crédits SMS`,
+        activation: {
+          offline: `Envoyer ${t.amount}F au ${PAYMENT_NUMBER} → SMS "CONFIRM ${t.amount}"`,
+        },
+      })),
+    ],
+  });
 });
 
 module.exports = router;

@@ -1,81 +1,184 @@
-const express = require('express');
-const Group = require('../models/Group');
-const GroupMessage = require('../models/GroupMessage');
+'use strict';
+/**
+ * OmniSMS — Routes Groupes
+ *
+ * Utilise Firestore comme base de données.
+ * Aucune dépendance Mongoose/Parse.
+ */
+
+const express      = require('express');
+const router       = express.Router();
+const db           = require('../config/firebase');
 const authenticate = require('../middleware/authenticate');
+const { logger }   = require('../middleware/logger');
 
-const router = express.Router();
-
-// Create a group
+// ── POST /groups — Créer un groupe ──────────────────────────
 router.post('/', authenticate, async (req, res) => {
-  const { name, members } = req.body;
+  const { name, members = [] } = req.body;
+
+  if (!name) {
+    return res.status(400).json({ error: 'name est requis.', code: 'MISSING_FIELDS' });
+  }
+
   try {
-    const group = new Group({ name, members });
-    await group.save();
-    res.status(201).json(group);
+    const now = new Date().toISOString();
+    const groupData = {
+      name,
+      members : [...new Set([req.user.uid, ...members])],  // owner inclus
+      ownerId : req.user.uid,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const ref = await db.collection('groups').add(groupData);
+    logger.info('Groupe créé', { groupId: ref.id, owner: req.user.uid });
+    return res.status(201).json({ id: ref.id, ...groupData });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    logger.error('Erreur création groupe', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
-// Add members to a group
+// ── GET /groups — Lister les groupes de l'utilisateur ───────
+router.get('/', authenticate, async (req, res) => {
+  try {
+    const snap = await db
+      .collection('groups')
+      .where('members', 'array-contains', req.user.uid)
+      .orderBy('createdAt', 'desc')
+      .get();
+
+    const groups = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    return res.status(200).json(groups);
+  } catch (err) {
+    logger.error('Erreur liste groupes', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
+
+// ── POST /groups/:id/members — Ajouter des membres ──────────
 router.post('/:id/members', authenticate, async (req, res) => {
-  const { id } = req.params;
+  const { id }      = req.params;
   const { members } = req.body;
-  try {
-    const group = await Group.findById(id);
-    if (!group) return res.status(404).json({ error: 'Group not found' });
 
-    group.members.push(...members);
-    await group.save();
-    res.status(200).json(group);
+  if (!members || !Array.isArray(members) || members.length === 0) {
+    return res.status(400).json({ error: 'members (tableau) est requis.', code: 'MISSING_FIELDS' });
+  }
+
+  try {
+    const ref  = db.collection('groups').doc(id);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+    }
+
+    if (snap.data().ownerId !== req.user.uid) {
+      return res.status(403).json({ error: 'Seul le propriétaire peut ajouter des membres.', code: 'FORBIDDEN' });
+    }
+
+    const current = snap.data().members || [];
+    const merged  = [...new Set([...current, ...members])];
+
+    await ref.update({ members: merged, updatedAt: new Date().toISOString() });
+    const updated = await ref.get();
+    return res.status(200).json({ id: updated.id, ...updated.data() });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    logger.error('Erreur ajout membres', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
-// Remove a member from a group
+// ── DELETE /groups/:id/members/:memberId — Retirer un membre
 router.delete('/:id/members/:memberId', authenticate, async (req, res) => {
   const { id, memberId } = req.params;
-  try {
-    const group = await Group.findById(id);
-    if (!group) return res.status(404).json({ error: 'Group not found' });
 
-    group.members = group.members.filter((member) => member.toString() !== memberId);
-    await group.save();
-    res.status(200).json(group);
+  try {
+    const ref  = db.collection('groups').doc(id);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+    }
+
+    if (snap.data().ownerId !== req.user.uid) {
+      return res.status(403).json({ error: 'Seul le propriétaire peut retirer des membres.', code: 'FORBIDDEN' });
+    }
+
+    const members = (snap.data().members || []).filter(m => m !== memberId);
+    await ref.update({ members, updatedAt: new Date().toISOString() });
+
+    const updated = await ref.get();
+    return res.status(200).json({ id: updated.id, ...updated.data() });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    logger.error('Erreur suppression membre', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
-// Send a message to a group
+// ── POST /groups/:id/messages — Envoyer un message de groupe
 router.post('/:id/messages', authenticate, async (req, res) => {
-  const { id } = req.params;
+  const { id }      = req.params;
   const { content } = req.body;
-  try {
-    const group = await Group.findById(id);
-    if (!group) return res.status(404).json({ error: 'Group not found' });
 
-    const message = new GroupMessage({
-      groupId: id,
-      senderId: req.user.id,
-      content,
-    });
-    await message.save();
-    res.status(201).json(message);
+  if (!content) {
+    return res.status(400).json({ error: 'content est requis.', code: 'MISSING_FIELDS' });
+  }
+
+  try {
+    const groupSnap = await db.collection('groups').doc(id).get();
+
+    if (!groupSnap.exists) {
+      return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+    }
+
+    if (!(groupSnap.data().members || []).includes(req.user.uid)) {
+      return res.status(403).json({ error: 'Vous n\'êtes pas membre de ce groupe.', code: 'FORBIDDEN' });
+    }
+
+    const now = new Date().toISOString();
+    const msgData = {
+      groupId  : id,
+      senderId : req.user.uid,
+      content  : content.trim(),
+      createdAt: now,
+    };
+
+    const ref = await db.collection('group_messages').add(msgData);
+    return res.status(201).json({ id: ref.id, ...msgData });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    logger.error('Erreur message groupe', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
-// Get messages from a group
+// ── GET /groups/:id/messages — Récupérer les messages ───────
 router.get('/:id/messages', authenticate, async (req, res) => {
   const { id } = req.params;
+
   try {
-    const messages = await GroupMessage.find({ groupId: id }).sort({ timestamp: -1 });
-    res.status(200).json(messages);
+    const groupSnap = await db.collection('groups').doc(id).get();
+
+    if (!groupSnap.exists) {
+      return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+    }
+
+    if (!(groupSnap.data().members || []).includes(req.user.uid)) {
+      return res.status(403).json({ error: 'Vous n\'êtes pas membre de ce groupe.', code: 'FORBIDDEN' });
+    }
+
+    const snap = await db
+      .collection('group_messages')
+      .where('groupId', '==', id)
+      .orderBy('createdAt', 'desc')
+      .limit(100)
+      .get();
+
+    const messages = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    return res.status(200).json(messages);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    logger.error('Erreur messages groupe', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 

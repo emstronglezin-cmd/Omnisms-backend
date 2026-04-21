@@ -1,23 +1,34 @@
-const express = require('express');
-const Message = require('../models/Message');
+'use strict';
+/**
+ * OmniSMS — Routes Statistiques
+ *
+ * Utilise Firestore comme source de vérité.
+ */
+
+const express      = require('express');
+const router       = express.Router();
+const db           = require('../config/firebase');
 const authenticate = require('../middleware/authenticate');
+const { logger }   = require('../middleware/logger');
 
-const router = express.Router();
-
-// Récupérer les statistiques utilisateur
+// ── GET /statistics — Statistiques de l'utilisateur ─────────
 router.get('/', authenticate, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const uid = req.user.uid;
 
-    const messagesSent = await Message.countDocuments({ senderId: userId });
-    const messagesReceived = await Message.countDocuments({ receiverId: userId });
+    const [sentSnap, receivedSnap] = await Promise.all([
+      db.collection('messages').where('senderId', '==', uid).select().get(),
+      db.collection('messages').where('receiverId', '==', uid).select().get(),
+    ]);
 
-    res.status(200).json({
-      messagesSent,
-      messagesReceived,
+    return res.status(200).json({
+      messagesSent    : sentSnap.size,
+      messagesReceived: receivedSnap.size,
+      userId          : uid,
     });
   } catch (err) {
-    res.status(500).json({ message: 'Erreur lors de la récupération des statistiques', error: err.message });
+    logger.error('Erreur statistics', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
