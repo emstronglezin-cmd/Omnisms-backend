@@ -1,50 +1,67 @@
-const SmsLog = require('../models/SmsLog');
+'use strict';
+/**
+ * OmniSMS — Utilitaire Twilio (wrapper)
+ *
+ * Utilisez de préférence services/smsProvider.js qui gère
+ * multi-provider + retry automatique.
+ *
+ * Ce fichier est conservé pour compatibilité avec le code legacy.
+ * Il n'écrase plus le processus si les variables d'environnement manquent.
+ */
 
-// Validate Twilio environment variables
-const requiredEnvVars = ['TWILIO_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER'];
-requiredEnvVars.forEach((envVar) => {
-  if (!process.env[envVar]) {
-    throw new Error(`La variable d'environnement ${envVar} est manquante. Veuillez la définir dans le fichier .env.`);
+const { logger } = require('../middleware/logger');
+
+/**
+ * Envoyer un SMS via Twilio.
+ * Retourne { success, sid } ou { success: false, error }.
+ */
+async function sendSms(to, body) {
+  const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, TWILIO_PHONE } = process.env;
+  const from = TWILIO_PHONE_NUMBER || TWILIO_PHONE;
+
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !from) {
+    logger.warn('Twilio non configuré — SMS non envoyé', { to });
+    return { success: false, error: 'Twilio non configuré (variables d\'environnement manquantes)' };
   }
-});
 
-const sendSms = async (to, body, userId) => {
   try {
-    // Log SMS details
-    const smsLog = new SmsLog({
-      user_id: userId,
-      message_id: 'simulated-message-sid', // Simulated message ID
-      cost: 12, // Example cost
-      operator: 'Twilio',
-      status: 'sent',
-    });
-    await smsLog.save();
-  } catch (err) {
-    console.error('SMS Log Error:', err.message);
-    throw new Error('Failed to log SMS');
-  }
-};
+    const twilio = require('twilio');
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-const handleIncomingSms = async (req, res) => {
+    const message = await client.messages.create({ body, from, to });
+    logger.info('SMS Twilio envoyé', { to, sid: message.sid });
+    return { success: true, sid: message.sid };
+  } catch (err) {
+    logger.error('Erreur Twilio', { to, error: err.message });
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Gérer un SMS entrant Twilio (webhook handler).
+ */
+async function handleIncomingSms(req, res) {
   const { From, Body } = req.body;
 
   try {
-    console.log(`Incoming SMS from ${From}: ${Body}`);
+    logger.info('SMS Twilio entrant', { from: From, preview: Body?.substring(0, 40) });
 
-    // Deduct cost and distribute via PayDunya
-    const smsCost = 12; // FCFA
-    const twilioShare = 7; // FCFA
-    const ownerShare = smsCost - twilioShare;
+    // Déléguer au gestionnaire principal
+    const { handleSMS } = require('../services/smsHandler');
+    const { normalizePhone } = require('../config/db');
+    const reply = await handleSMS(normalizePhone(From), Body, req.ip);
 
-    // Simulate PayDunya transfer for owner's share
-    const paydunya = require('../services/paydunya');
-    await paydunya.withdrawFunds(ownerShare, 'owner_account');
+    const safe = reply
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
 
-    res.status(200).send('<Response><Message>Thank you for your message!</Message></Response>');
-  } catch (error) {
-    console.error('Error handling incoming SMS:', error.message);
-    res.status(500).send('Failed to process SMS');
+    res.set('Content-Type', 'text/xml');
+    res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${safe}</Message></Response>`);
+  } catch (err) {
+    logger.error('Erreur handler SMS Twilio entrant', { error: err.message });
+    res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>Erreur. Réessayez.</Message></Response>`);
   }
-};
+}
 
 module.exports = { sendSms, handleIncomingSms };

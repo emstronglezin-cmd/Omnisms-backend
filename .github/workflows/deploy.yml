@@ -1,0 +1,206 @@
+name: OmniSMS — CI/CD Deploy
+
+# ──────────────────────────────────────────────────────────────
+# Ce workflow s'exécute automatiquement lors d'un push sur main.
+#
+# Étapes :
+#  1. Lint & test (vérifie la syntaxe Node.js)
+#  2. Audit sécurité npm
+#  3. Deploy sur Render via Deploy Hook
+#
+# Secrets GitHub requis (Settings → Secrets → Actions) :
+#  RENDER_DEPLOY_HOOK_URL : URL du deploy hook Render
+#                          (Render → Service → Settings → Deploy Hook)
+# ──────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────
+  # JOB 1 : Lint & Security Audit
+  # ────────────────────────────────────────────────────────────
+  lint-and-audit:
+    name: Lint & Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --omit=dev
+
+      - name: Check Node.js syntax (all JS files)
+        run: |
+          echo "🔍 Vérification syntaxe JS..."
+          find . -name "*.js" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" \
+            -not -path "*/functions/*" \
+            -not -path "*/parse/*" \
+            | sort \
+            | while read f; do
+              node --check "$f" && echo "✅ $f" || (echo "❌ $f" && exit 1)
+            done
+          echo "✅ Tous les fichiers JS sont valides"
+
+      - name: NPM Security Audit
+        run: |
+          echo "🔒 Audit de sécurité npm..."
+          # Échouer uniquement sur les vulnérabilités high et critical
+          npm audit --audit-level=high --omit=dev || echo "⚠️ Vulnérabilités détectées (voir ci-dessus)"
+        continue-on-error: true   # Ne pas bloquer le déploiement pour les vulns dans les dépendances tierces
+
+      - name: Verify required files exist
+        run: |
+          echo "📁 Vérification des fichiers critiques..."
+          files=(
+            "server.js"
+            "firebase-admin/index.js"
+            "config/firebase.js"
+            "middleware/security.js"
+            "middleware/logger.js"
+            "middleware/authenticate.js"
+            "routes/admin.js"
+            "routes/payment.fusionpay.js"
+            "routes/payment.online.js"
+            "routes/sms.webhook.js"
+            "render.yaml"
+          )
+          for f in "${files[@]}"; do
+            [ -f "$f" ] && echo "✅ $f" || (echo "❌ $f MANQUANT" && exit 1)
+          done
+
+      - name: Check for sensitive data leaks
+        run: |
+          echo "🔐 Recherche de données sensibles dans le code..."
+          # Chercher des patterns de clés en dur (faux positifs possibles)
+          FOUND=0
+          
+          # Exclure les fichiers .env.example et les commentaires
+          if grep -r "BEGIN RSA PRIVATE KEY\|BEGIN EC PRIVATE KEY" \
+            --include="*.js" --include="*.json" \
+            --exclude-dir=node_modules --exclude-dir=.git \
+            . 2>/dev/null | grep -v ".env.example" | grep -v "#"; then
+            echo "❌ Clé privée détectée dans le code source !"
+            FOUND=1
+          fi
+
+          if grep -r "AAAA[A-Za-z0-9+/]{30,}" \
+            --include="*.js" --include="*.json" \
+            --exclude-dir=node_modules --exclude-dir=.git \
+            . 2>/dev/null | grep -v ".env.example"; then
+            echo "⚠️ Possible token Firebase hardcodé"
+          fi
+          
+          [ $FOUND -eq 0 ] && echo "✅ Aucune donnée sensible détectée"
+
+  # ────────────────────────────────────────────────────────────
+  # JOB 2 : Deploy sur Render (uniquement sur push main)
+  # ────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Render
+    runs-on: ubuntu-latest
+    needs: lint-and-audit
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Trigger Render Deploy Hook
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK_URL }}" ]; then
+            echo "⚠️ RENDER_DEPLOY_HOOK_URL non configuré dans les secrets GitHub."
+            echo "   → Allez dans GitHub → Settings → Secrets → Actions → New secret"
+            echo "   → Nom : RENDER_DEPLOY_HOOK_URL"
+            echo "   → Valeur : votre URL de deploy hook Render (Settings → Deploy Hook)"
+            exit 0   # Ne pas échouer — le hook est optionnel
+          fi
+
+          echo "🚀 Déclenchement du déploiement Render..."
+          
+          HTTP_STATUS=$(curl -s -o /tmp/render_response.txt -w "%{http_code}" \
+            -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}")
+          
+          RESPONSE=$(cat /tmp/render_response.txt)
+          
+          echo "HTTP Status: $HTTP_STATUS"
+          echo "Response: $RESPONSE"
+          
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ Déploiement Render déclenché avec succès !"
+          else
+            echo "❌ Erreur déploiement Render (HTTP $HTTP_STATUS)"
+            exit 1
+          fi
+
+      - name: Wait and verify deployment
+        if: success()
+        run: |
+          BACKEND_URL="${{ secrets.BACKEND_URL }}"
+          
+          if [ -z "$BACKEND_URL" ]; then
+            echo "ℹ️  BACKEND_URL non configuré — vérification santé ignorée"
+            exit 0
+          fi
+          
+          echo "⏳ Attente du démarrage Render (60s)..."
+          sleep 60
+          
+          echo "🔍 Vérification santé : ${BACKEND_URL}/health"
+          
+          for i in 1 2 3 4 5; do
+            HTTP_STATUS=$(curl -s -o /tmp/health_response.txt -w "%{http_code}" \
+              --max-time 30 "${BACKEND_URL}/health" || echo "000")
+            
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Backend opérationnel !"
+              cat /tmp/health_response.txt | python3 -m json.tool 2>/dev/null || true
+              exit 0
+            fi
+            
+            echo "⏳ Tentative $i/5 — HTTP $HTTP_STATUS — nouvelle tentative dans 20s..."
+            sleep 20
+          done
+          
+          echo "⚠️ Le backend n'a pas répondu dans les délais (cold start possible)"
+          exit 0   # Ne pas échouer — Render free tier a un cold start
+
+  # ────────────────────────────────────────────────────────────
+  # JOB 3 : Notification de statut (optionnel)
+  # ────────────────────────────────────────────────────────────
+  notify:
+    name: Notify Status
+    runs-on: ubuntu-latest
+    needs: [lint-and-audit, deploy]
+    if: always() && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Summary
+        run: |
+          echo "## 📊 Résumé du déploiement OmniSMS" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Étape | Statut |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint & Audit | ${{ needs.lint-and-audit.result == 'success' && '✅' || '❌' }} ${{ needs.lint-and-audit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy Render | ${{ needs.deploy.result == 'success' && '✅' || needs.deploy.result == 'skipped' && '⏭️' || '❌' }} ${{ needs.deploy.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit** : \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch** : \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Auteur** : ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY

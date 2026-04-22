@@ -1,0 +1,140 @@
+# ════════════════════════════════════════════════════════════════
+# OmniSMS Backend — Configuration Render.com
+# ════════════════════════════════════════════════════════════════
+#
+# ⚙️  Setup initial :
+#  1. Connectez votre repo GitHub sur https://render.com
+#  2. New → Web Service → connecter le repo
+#  3. Render détecte ce fichier automatiquement
+#  4. Ajoutez les variables d'environnement sensibles dans
+#     Dashboard → Service → Settings → Environment
+#
+# 🔄 Auto-deploy via GitHub Actions :
+#  → Créer un Deploy Hook dans Render :
+#     Dashboard → Service → Settings → Deploy Hook → Create Hook
+#  → Copier l'URL et l'ajouter dans GitHub :
+#     Repo → Settings → Secrets → Actions → RENDER_DEPLOY_HOOK_URL
+#  → Chaque push sur main déclenchera un déploiement automatique
+#
+# 📊 Health check : GET /health
+# ════════════════════════════════════════════════════════════════
+
+services:
+  - type: web
+    name: omnisms-backend
+    runtime: node
+    plan: free          # Changer en "starter" pour la production
+
+    branch: main
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+
+    # Health check (Render attend HTTP 200 avant de router le trafic)
+    healthCheckPath: /health
+
+    envVars:
+      # ── Serveur ────────────────────────────────────────────
+      - key: NODE_ENV
+        value: production
+
+      - key: PORT
+        value: 10000    # Render utilise le port 10000 par défaut
+
+      - key: LOG_LEVEL
+        value: info     # debug | info | warn | error
+
+      # ── URL du backend ─────────────────────────────────────
+      # Render injecte RENDER_EXTERNAL_URL automatiquement.
+      # Sinon, mettre l'URL manuellement (ex: omnisms-backend.onrender.com)
+      - key: BACKEND_URL
+        fromService:
+          type: web
+          name: omnisms-backend
+          property: host
+
+      # ── Variables sensibles (saisir manuellement dans Render) ──
+
+      - key: JWT_SECRET
+        sync: false     # Secret JWT long et aléatoire (min 32 chars)
+
+      - key: ADMIN_KEY
+        sync: false     # Clé admin secrète
+
+      - key: API_KEY
+        sync: false     # Clé API interne optionnelle
+
+      # ── Firebase (OBLIGATOIRE) ─────────────────────────────
+      # JSON complet du service account Firebase, sur une seule ligne.
+      # console.firebase.google.com → Paramètres → Comptes de service
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+
+      # ── SYSTÈME 3 : GeniusPay (PRIMAIRE) ──────────────────
+      # Clé publique GeniusPay (header X-API-Key)
+      - key: GENIUSPAY_PUBLIC_KEY
+        sync: false
+
+      # Clé secrète GeniusPay (header X-API-Secret) — JAMAIS côté client
+      - key: GENIUSPAY_SECRET_KEY
+        sync: false
+
+      # Optionnel mais recommandé : secret HMAC pour valider les webhooks
+      # Configurer aussi dans le dashboard GeniusPay
+      - key: GENIUSPAY_WEBHOOK_SECRET
+        sync: false
+
+      # Aliases pour compatibilité (acceptés aussi par le backend)
+      - key: GENIUSPAY_API_KEY
+        sync: false
+
+      - key: GENIUSPAY_API_SECRET
+        sync: false
+
+      # ── SYSTÈME 1 : Fusion Link (CONSERVÉ) ────────────────
+      - key: MONEYFUSION_PAYMENT_LINK
+        sync: false
+
+      # ── SYSTÈME 2 : Fusion Pay API (NOUVEAU) ───────────────
+      - key: FUSION_PAY_API_URL
+        sync: false
+
+      - key: FUSION_PAY_API_KEY
+        sync: false
+
+      - key: FUSION_PAY_APP_ID
+        value: OmniSMS
+
+      - key: FUSION_PAY_WEBHOOK_SECRET
+        sync: false     # Optionnel — pour valider les signatures webhook
+
+      # ── SMS Providers (optionnels) ─────────────────────────
+      - key: AFRICASTALKING_API_KEY
+        sync: false
+
+      - key: AFRICASTALKING_USERNAME
+        sync: false
+
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+
+      - key: TWILIO_PHONE
+        sync: false
+
+      - key: TWILIO_PHONE_NUMBER
+        sync: false     # Alias pour TWILIO_PHONE (compatibilité smsProvider.js)
+
+      - key: ORANGE_CLIENT_ID
+        sync: false
+
+      - key: ORANGE_CLIENT_SECRET
+        sync: false
+
+      - key: ORANGE_SENDER_ID
+        sync: false     # Optionnel — numéro expéditeur Orange
+
+      # ── CORS ───────────────────────────────────────────────
+      - key: CORS_ORIGIN
+        value: "*"      # Remplacer par l'URL Flutter/frontend en production

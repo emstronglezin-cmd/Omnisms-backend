@@ -1,82 +1,134 @@
-const express = require('express');
-const Message = require('../models/Message');
+'use strict';
+/**
+ * OmniSMS — Routes Messages
+ *
+ * Utilise Firestore comme base de données.
+ * Aucune dépendance Mongoose/Parse.
+ */
+
+const express      = require('express');
+const router       = express.Router();
+const db           = require('../config/firebase');
 const authenticate = require('../middleware/authenticate');
-const { sendSms } = require('../services/africasTalking');
+const { logger }   = require('../middleware/logger');
 
-const router = express.Router();
-
-// Send message
+// ── POST /messages/send ──────────────────────────────────────
 router.post('/send', authenticate, async (req, res) => {
-  const { receiverId, content, type } = req.body; // type: 'text' or 'voice'
-  try {
-    const message = new Message({
-      senderId: req.user.id,
-      receiverId,
-      content,
-      type,
-    });
-    await message.save();
+  const { receiverId, content, type = 'text' } = req.body;
 
-    // If the recipient is a native SMS user, send via Africa's Talking
+  if (!receiverId || !content) {
+    return res.status(400).json({ error: 'receiverId et content sont requis.', code: 'MISSING_FIELDS' });
+  }
+
+  try {
+    const now = new Date().toISOString();
+    const msgData = {
+      senderId  : req.user.uid,
+      receiverId,
+      content   : content.trim(),
+      type,
+      reactions : [],
+      createdAt : now,
+      updatedAt : now,
+    };
+
+    const ref = await db.collection('messages').add(msgData);
+
+    // Envoi SMS via Africa's Talking si type 'text' et service disponible
     if (type === 'text') {
-      await sendSms(receiverId, content);
+      try {
+        const { sendSms } = require('../services/africasTalking');
+        await sendSms(receiverId, content);
+      } catch (smsErr) {
+        // Non bloquant — le message est sauvegardé même si SMS échoue
+        logger.warn('SMS Africa\'s Talking échoué', { error: smsErr.message, receiverId });
+      }
     }
 
-    res.status(201).json({ message: 'Message sent successfully', data: message });
+    logger.info('Message envoyé', { messageId: ref.id, senderId: req.user.uid });
+    return res.status(201).json({ message: 'Message envoyé avec succès.', data: { id: ref.id, ...msgData } });
   } catch (err) {
-    res.status(500).json({ message: 'Error sending message', error: err.message });
+    logger.error('Erreur envoi message', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
-// Get messages
+// ── GET /messages/:userId ────────────────────────────────────
 router.get('/:userId', authenticate, async (req, res) => {
   const { userId } = req.params;
+
+  // Un utilisateur ne peut lire que ses propres messages
+  if (req.user.uid !== userId) {
+    return res.status(403).json({ error: 'Accès refusé.', code: 'FORBIDDEN' });
+  }
+
   try {
-    const messages = await Message.find({
-      $or: [
-        { senderId: userId },
-        { receiverId: userId },
-      ],
-    }).sort({ timestamp: -1 });
-    res.status(200).json(messages);
+    const [sent, received] = await Promise.all([
+      db.collection('messages').where('senderId', '==', userId).orderBy('createdAt', 'desc').limit(100).get(),
+      db.collection('messages').where('receiverId', '==', userId).orderBy('createdAt', 'desc').limit(100).get(),
+    ]);
+
+    const messages = [
+      ...sent.docs.map(d => ({ id: d.id, ...d.data() })),
+      ...received.docs.map(d => ({ id: d.id, ...d.data() })),
+    ].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    return res.status(200).json(messages);
   } catch (err) {
-    res.status(500).json({ message: 'Error retrieving messages', error: err.message });
+    logger.error('Erreur récupération messages', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
-// Réagir avec un emoji
+// ── POST /messages/:id/react ─────────────────────────────────
 router.post('/:id/react', authenticate, async (req, res) => {
-  const { id } = req.params;
+  const { id }    = req.params;
   const { emoji } = req.body;
-  try {
-    const message = await Message.findById(id);
-    if (!message) return res.status(404).json({ message: 'Message non trouvé' });
 
-    message.reactions = message.reactions || [];
-    message.reactions.push({ userId: req.user.id, emoji });
-    await message.save();
-
-    res.status(200).json({ message: 'Réaction ajoutée avec succès' });
-  } catch (err) {
-    res.status(500).json({ message: 'Erreur lors de l\'ajout de la réaction', error: err.message });
+  if (!emoji) {
+    return res.status(400).json({ error: 'emoji est requis.', code: 'MISSING_FIELDS' });
   }
-});
 
-// Supprimer un message
-router.delete('/:id', authenticate, async (req, res) => {
-  const { id } = req.params;
   try {
-    const message = await Message.findById(id);
-    if (!message) return res.status(404).json({ message: 'Message non trouvé' });
+    const ref  = db.collection('messages').doc(id);
+    const snap = await ref.get();
 
-    if (message.senderId.toString() !== req.user.id) {
-      return res.status(403).json({ message: 'Vous ne pouvez supprimer que vos propres messages' });
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Message non trouvé.', code: 'NOT_FOUND' });
     }
 
-    await message.remove();
-    res.status(200).json({ message: 'Message supprimé avec succès' });
+    const reactions = snap.data().reactions || [];
+    reactions.push({ userId: req.user.uid, emoji, at: new Date().toISOString() });
+
+    await ref.update({ reactions, updatedAt: new Date().toISOString() });
+    return res.status(200).json({ message: 'Réaction ajoutée avec succès.' });
   } catch (err) {
-    res.status(500).json({ message: 'Erreur lors de la suppression du message', error: err.message });
+    logger.error('Erreur réaction message', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
+
+// ── DELETE /messages/:id ─────────────────────────────────────
+router.delete('/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const ref  = db.collection('messages').doc(id);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Message non trouvé.', code: 'NOT_FOUND' });
+    }
+
+    if (snap.data().senderId !== req.user.uid) {
+      return res.status(403).json({ error: 'Vous ne pouvez supprimer que vos propres messages.', code: 'FORBIDDEN' });
+    }
+
+    await ref.delete();
+    return res.status(200).json({ message: 'Message supprimé avec succès.' });
+  } catch (err) {
+    logger.error('Erreur suppression message', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
 
