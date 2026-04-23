@@ -106,6 +106,15 @@ const fusionPayLimiter = rateLimit({
   message        : { error: 'Trop de tentatives. Réessayez dans 1 minute.', code: 'FUSION_PAY_RATE_LIMIT' },
 });
 
+/** GeniusPay initiation : 10 req / 1 min par IP */
+const geniusPayLimiter = rateLimit({
+  windowMs       : 60 * 1000,
+  max            : 10,
+  standardHeaders: true,
+  legacyHeaders  : false,
+  message        : { error: 'Trop de tentatives GeniusPay. Réessayez dans 1 minute.', code: 'GENIUSPAY_RATE_LIMIT' },
+});
+
 // ── 5. Slow-down (délai progressif avant blocage) ─────────────
 /** Après 100 req, ajouter 200ms de délai par requête supplémentaire */
 const globalSlowDown = slowDown({
@@ -161,6 +170,7 @@ module.exports = {
   authLimiter,
   paymentConfirmLimiter,
   fusionPayLimiter,
+  geniusPayLimiter,
   inputSanitizer,
   requireJson,
 };

@@ -69,11 +69,28 @@ services:
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
 
-      # ── SYSTÈME 1 : Fusion Link (CONSERVÉ) ────────────────
-      - key: MONEYFUSION_PAYMENT_LINK
+      # ── SYSTÈME 3 : GeniusPay (PRIMAIRE) ──────────────────
+      # Clé publique GeniusPay (header X-API-Key)
+      - key: GENIUSPAY_PUBLIC_KEY
         sync: false
 
-      # ── SYSTÈME 2 : Fusion Pay API (NOUVEAU) ───────────────
+      # Clé secrète GeniusPay (header X-API-Secret) — JAMAIS côté client
+      - key: GENIUSPAY_SECRET_KEY
+        sync: false
+
+      # Optionnel mais recommandé : secret HMAC pour valider les webhooks
+      # Configurer aussi dans le dashboard GeniusPay
+      - key: GENIUSPAY_WEBHOOK_SECRET
+        sync: false
+
+      # Aliases pour compatibilité (acceptés aussi par le backend)
+      - key: GENIUSPAY_API_KEY
+        sync: false
+
+      - key: GENIUSPAY_API_SECRET
+        sync: false
+
+      # ── SYSTÈME 2 : Fusion Pay API (CONSERVÉ — PARALLÈLE) ─────
       - key: FUSION_PAY_API_URL
         sync: false
 

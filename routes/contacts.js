@@ -30,9 +30,9 @@ function validate(req, res) {
   return null;
 }
 
-// Lien d'abonnement pour les non-abonnés
-const SUBSCRIPTION_LINK = process.env.MONEYFUSION_PAYMENT_LINK
-  || 'https://www.pay.moneyfusion.net/abonnement-a-omnisms-_1762539771460/';
+// Lien d'abonnement GeniusPay
+const SUBSCRIPTION_LINK = process.env.GENIUSPAY_PAYMENT_LINK
+  || `${process.env.BACKEND_URL || 'https://omnisms-backend.onrender.com'}/api/payment/link`;
 
 // ─────────────────────────────────────────────────────────────
 // POST /add-contact

@@ -17,8 +17,8 @@
 const db = require('../config/firebase');
 const { logger } = require('./logger');
 
-const SUBSCRIPTION_LINK = process.env.MONEYFUSION_PAYMENT_LINK
-  || 'https://www.pay.moneyfusion.net/abonnement-a-omnisms-_1762539771460/';
+const SUBSCRIPTION_LINK = process.env.GENIUSPAY_PAYMENT_LINK
+  || `${process.env.BACKEND_URL || 'https://omnisms-backend.onrender.com'}/api/payment/link`;
 
 /**
  * Middleware — vérifie isSubscribed dans Firestore.

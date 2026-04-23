@@ -29,6 +29,7 @@ const {
   globalSlowDown,
   paymentConfirmLimiter,
   authLimiter,
+  geniusPayLimiter,
   inputSanitizer,
   requireJson,
 } = require('./middleware/security');
@@ -74,7 +75,11 @@ app.use(corsMiddleware);
 app.use(requestLogger);
 
 // 5. Body parsers (limits strictes)
-app.use(express.json({ limit: '1mb' }));
+// Capture du corps brut (rawBody) pour la vérification HMAC des webhooks GeniusPay
+app.use(express.json({
+  limit : '1mb',
+  verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
+}));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // 6. Protection HTTP Parameter Pollution
@@ -127,8 +132,11 @@ const groupRoutes         = require('./routes/groups');
 const userRoutes          = require('./routes/users');
 const meRoutes            = require('./routes/me');
 const notifRoutes         = require('./routes/notifications');
-const statsRoutes         = require('./routes/statistics');
-const contactRoutes       = require('./routes/contacts');  // 🆕 contacts + send-sms
+const statsRoutes          = require('./routes/statistics');
+const contactRoutes        = require('./routes/contacts');      // contacts + send-sms
+const geniusPayRoutes      = require('./routes/payment.geniuspay'); // Routes avancées GeniusPay
+const paymentRoutes        = require('./routes/payment');       // POST /api/payment/geniuspay
+const webhookRoutes        = require('./routes/webhook');       // POST /api/payment/webhook
 
 // Chargement des routes optionnelles (pas bloquant si fichier absent)
 function loadOptional(routePath, mount) {
@@ -153,13 +161,13 @@ app.use('/auth',     authLimiter, requireJson, authRoutes);  // alias rétrocomp
    SYSTÈME 1 : FUSION LINK (CONSERVÉ)
    GET  /payment-success
    POST /confirm-payment  ← rate-limit strict
-   GET  /moneyfusion-link
+
 ============================================================ */
 app.use('/', paymentOnlineRoutes);
 app.use('/confirm-payment', paymentConfirmLimiter);
 
 /* ============================================================
-   SYSTÈME 2 : FUSION PAY API (NOUVEAU — PARALLÈLE)
+   SYSTÈME 2 : FUSION PAY API (CONSERVÉ — PARALLÈLE)
    POST /api/payment/fusion-pay
    POST /api/payment/fusion-callback
    GET  /api/payment/fusion-status/:token
@@ -169,6 +177,31 @@ app.use('/confirm-payment', paymentConfirmLimiter);
    GET  /api/payment/fusion-link-url
 ============================================================ */
 app.use('/api/payment', paymentFusionRoutes);
+
+/* ============================================================
+   SYSTÈME 3 : GENIUSPAY (PRIMAIRE)
+
+   Routes simples (nouvelles) :
+     POST /api/payment/geniuspay     → créer paiement, retourne checkout_url
+     POST /api/payment/webhook       → webhook GeniusPay (signature HMAC)
+
+   Routes avancées (existantes) :
+     POST /api/payment/geniuspay/create
+     POST /api/payment/geniuspay/webhook
+     GET  /api/payment/geniuspay/status/:paymentId
+     GET  /api/payment/geniuspay/user-status
+     GET  /api/payment/geniuspay/return
+     GET  /api/payment/geniuspay/config
+     GET  /api/payment/link
+============================================================ */
+// Routes simples — POST /api/payment/geniuspay et POST /api/payment/webhook
+app.use('/api/payment', geniusPayLimiter, paymentRoutes);
+app.use('/api/payment', webhookRoutes);
+
+// Routes avancées — /api/payment/geniuspay/*
+app.use('/api/payment/geniuspay', geniusPayLimiter, geniusPayRoutes);
+// GET /api/payment/link → défini dans geniusPayRoutes
+app.use('/api/payment', geniusPayRoutes);
 
 /* ============================================================
    SMS WEBHOOKS (OFFLINE)
@@ -222,6 +255,15 @@ loadOptional('./routes/transcription', '/transcription');
 loadOptional('./routes/subscriptions', '/subscriptions');
 
 /* ============================================================
+   STATUT UTILISATEUR PREMIUM — GET /api/user/status
+   Retourne { premium: true/false } pour un userId donné.
+   Accessible sans authentification.
+   Utilise le controller paymentController (mémoire + Firestore).
+============================================================ */
+const { getUserStatus } = require('./controllers/paymentController');
+app.get('/api/user/status', getUserStatus);
+
+/* ============================================================
    API STATUS
 ============================================================ */
 app.get('/api/status', (req, res) => {
@@ -230,6 +272,20 @@ app.get('/api/status', (req, res) => {
     port   : PORT,
     env    : process.env.NODE_ENV || 'development',
     payment: {
+      geniuspay: {
+        enabled: !!(process.env.GENIUSPAY_PUBLIC_KEY || process.env.GENIUSPAY_API_KEY),
+        routes : [
+          'POST /api/payment/geniuspay      ← nouveau endpoint simple',
+          'POST /api/payment/webhook        ← nouveau webhook simple',
+          'GET  /api/user/status?userId=XXX ← statut premium',
+          'POST /api/payment/geniuspay/create',
+          'POST /api/payment/geniuspay/webhook',
+          'GET  /api/payment/geniuspay/status/:id',
+          'GET  /api/payment/link',
+        ],
+        status : (process.env.GENIUSPAY_PUBLIC_KEY || process.env.GENIUSPAY_API_KEY)
+          ? 'ACTIF' : 'INACTIF (GENIUSPAY_PUBLIC_KEY absent)',
+      },
       fusion_link: {
         enabled: true,
         routes : ['GET /payment-success', 'POST /confirm-payment'],
@@ -242,6 +298,7 @@ app.get('/api/status', (req, res) => {
       },
       sms_offline: { enabled: true },
     },
+    userStatus: 'GET /api/user/status?userId=XXX',
     security: {
       helmet      : true,
       cors        : true,
@@ -324,6 +381,11 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🌍 ENV     : ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔥 Firebase : ${process.env.FIREBASE_SERVICE_ACCOUNT_JSON ? '✅ configuré' : '⚠️  absent'}`);
   console.log(`💳 FusionPay: ${process.env.FUSION_PAY_API_URL ? '✅ actif' : '⏸  inactif'}`);
+  const gpConfigured = !!(
+    (process.env.GENIUSPAY_PUBLIC_KEY || process.env.GENIUSPAY_API_KEY) &&
+    (process.env.GENIUSPAY_SECRET_KEY || process.env.GENIUSPAY_API_SECRET)
+  );
+  console.log(`💰 GeniusPay: ${gpConfigured ? '✅ actif' : '⏸  inactif (GENIUSPAY_PUBLIC_KEY / GENIUSPAY_SECRET_KEY)'}`);
   // Afficher le provider SMS actif
   try {
     const { getProviderStatus } = require('./services/smsProvider');
