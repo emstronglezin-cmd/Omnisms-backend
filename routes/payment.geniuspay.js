@@ -32,8 +32,8 @@ const geniuspay  = require('../services/geniuspay');
 const BACKEND_URL          = process.env.BACKEND_URL || 'https://omnisms-backend.onrender.com';
 const PREMIUM_AMOUNT       = geniuspay.PREMIUM_AMOUNT;    // 2000
 const PREMIUM_CURRENCY     = geniuspay.PREMIUM_CURRENCY;  // XOF
-const SUBSCRIPTION_LINK    = process.env.MONEYFUSION_PAYMENT_LINK
-  || 'https://www.pay.moneyfusion.net/abonnement-a-omnisms-_1762539771460/';
+const SUBSCRIPTION_LINK    = process.env.GENIUSPAY_PAYMENT_LINK
+  || `${BACKEND_URL}/api/payment/link`;
 
 // ── Helper : générer un orderId unique ────────────────────────
 function generateOrderId() {
@@ -581,7 +581,7 @@ router.get(
 
     // Si GeniusPay non configuré → fallback sur Fusion Link
     if (!process.env.GENIUSPAY_API_KEY || !process.env.GENIUSPAY_API_SECRET) {
-      const fallbackUrl = process.env.MONEYFUSION_PAYMENT_LINK || SUBSCRIPTION_LINK;
+      const fallbackUrl = process.env.GENIUSPAY_PAYMENT_LINK || SUBSCRIPTION_LINK;
       logger.info('[GeniusPay Link] GeniusPay non configuré — fallback Fusion Link', { userId });
 
       return res.status(200).json({

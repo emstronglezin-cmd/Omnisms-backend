@@ -32,9 +32,9 @@ const { logPaymentAttempt } = require('./antifraud');
 const { logger } = require('../middleware/logger');
 const { normalizePhone } = require('../config/db');
 
-// Lien d'abonnement Fusion Link (conservé)
-const SUBSCRIPTION_LINK = process.env.MONEYFUSION_PAYMENT_LINK
-  || 'https://www.pay.moneyfusion.net/abonnement-a-omnisms-_1762539771460/';
+// Lien d'abonnement GeniusPay
+const SUBSCRIPTION_LINK = process.env.GENIUSPAY_PAYMENT_LINK
+  || `${process.env.BACKEND_URL || 'https://omnisms-backend.onrender.com'}/api/payment/link`;
 
 // ─────────────────────────────────────────────────────────────
 // Helpers

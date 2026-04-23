@@ -90,11 +90,7 @@ services:
       - key: GENIUSPAY_API_SECRET
         sync: false
 
-      # ── SYSTÈME 1 : Fusion Link (CONSERVÉ) ────────────────
-      - key: MONEYFUSION_PAYMENT_LINK
-        sync: false
-
-      # ── SYSTÈME 2 : Fusion Pay API (NOUVEAU) ───────────────
+      # ── SYSTÈME 2 : Fusion Pay API (CONSERVÉ — PARALLÈLE) ─────
       - key: FUSION_PAY_API_URL
         sync: false
 
