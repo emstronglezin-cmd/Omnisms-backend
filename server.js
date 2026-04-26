@@ -137,6 +137,7 @@ const contactRoutes        = require('./routes/contacts');      // contacts + se
 const geniusPayRoutes      = require('./routes/payment.geniuspay'); // Routes avancées GeniusPay
 const paymentRoutes        = require('./routes/payment');       // POST /api/payment/geniuspay
 const webhookRoutes        = require('./routes/webhook');       // POST /api/payment/webhook
+const smsHybridRoutes      = require('./routes/sms.hybrid');    // ★ Flow SMS hybride (NOUVEAU)
 
 // Chargement des routes optionnelles (pas bloquant si fichier absent)
 function loadOptional(routePath, mount) {
@@ -204,7 +205,17 @@ app.use('/api/payment/geniuspay', geniusPayLimiter, geniusPayRoutes);
 app.use('/api/payment', geniusPayRoutes);
 
 /* ============================================================
-   SMS WEBHOOKS (OFFLINE)
+   SMS HYBRIDE (NOUVEAU — ADDITIONNEL)
+   POST /sms/hybrid/incoming  ← webhook universel hybride
+   GET  /sms/hybrid/aliases   ← lister les alias d'un utilisateur
+   GET  /sms/hybrid/status    ← statut du service
+   POST /sms/hybrid/test      ← test (non-production)
+   Priorité : flow hybride → fallback smsHandler existant
+============================================================ */
+app.use('/sms/hybrid', smsHybridRoutes);
+
+/* ============================================================
+   SMS WEBHOOKS (OFFLINE — EXISTANT — INCHANGÉ)
    POST /sms/incoming
    POST /sms/test
    GET  /sms/commands
