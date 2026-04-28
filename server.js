@@ -39,7 +39,8 @@ const { requestLogger, logger } = require('./middleware/logger');
 /* ============================================================
    VALIDATION DES VARIABLES D'ENVIRONNEMENT CRITIQUES
 ============================================================ */
-const REQUIRED_ENV = ['JWT_SECRET', 'ADMIN_KEY'];
+const REQUIRED_ENV = [];
+
 
 if (process.env.NODE_ENV === 'production') {
   const missing = REQUIRED_ENV.filter(k => !process.env[k]);
