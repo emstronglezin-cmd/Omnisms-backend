@@ -1,21 +1,23 @@
 'use strict';
 /**
  * ╔══════════════════════════════════════════════════════════════╗
- * ║       OmniSMS — Service SMS Hybride (NOUVEAU)               ║
+ * ║       OmniSMS — Service SMS Hybride (v3)                    ║
  * ╠══════════════════════════════════════════════════════════════╣
  * ║                                                              ║
- * ║  Ce service gère le flow SMS "hors-ligne" enrichi :          ║
+ * ║  Préfixes acceptés pour les alias : *  ou  #                ║
+ * ║  (le @ est également conservé pour rétrocompatibilité)       ║
  * ║                                                              ║
  * ║  1. PREMIER MESSAGE HORS LIGNE                               ║
- * ║     Format : @NOM NUMERO message                             ║
- * ║     Ex    : @MAMAN 70223344 Bonjour maman                   ║
+ * ║     Format : *NOM NUMERO message                             ║
+ * ║     Aussi  : #NOM NUMERO message                             ║
+ * ║     Ex    : *MAMAN 70223344 Bonjour maman                   ║
  * ║     → Créer l'utilisateur si absent                          ║
  * ║     → Sauvegarder l'alias scopé à l'expéditeur              ║
  * ║     → Envoyer le message au destinataire                     ║
- * ║     → Répondre : "Alias @MAMAN enregistré et message envoyé."║
+ * ║     → Répondre : "Alias *MAMAN enregistré et message envoyé."║
  * ║                                                              ║
  * ║  2. MESSAGES SUIVANTS HORS LIGNE                             ║
- * ║     Format : @NOM message (tout sur une ligne)               ║
+ * ║     Format : *NOM message   ou   #NOM message               ║
  * ║     → Chercher l'alias par numéro expéditeur                 ║
  * ║     → Résoudre le numéro cible                               ║
  * ║     → Envoyer le message                                     ║
@@ -29,21 +31,29 @@
  * ║                                                              ║
  * ╠══════════════════════════════════════════════════════════════╣
  * ║  ISOLATION TOTALE : ce fichier N'IMPORTE PAS smsHandler.js  ║
- * ║  Il réutilise seulement : smsProvider, UserSms, Alias,       ║
- * ║  Invitation, logger, normalizePhone                          ║
  * ╚══════════════════════════════════════════════════════════════╝
  */
 
-const { sendSMS }       = require('./smsProvider');
-const UserSms           = require('../models/UserSms');
-const Alias             = require('../models/Alias');
-const Invitation        = require('../models/Invitation');
-const { logger }        = require('../middleware/logger');
+const { sendSMS }        = require('./smsProvider');
+const UserSms            = require('../models/UserSms');
+const Alias              = require('../models/Alias');
+const Invitation         = require('../models/Invitation');
+const { logger }         = require('../middleware/logger');
 const { normalizePhone } = require('../config/db');
 
 // ─────────────────────────────────────────────────────────────
 // Constantes
 // ─────────────────────────────────────────────────────────────
+
+/**
+ * Préfixes acceptés pour les alias SMS.
+ * * et # sont les préfixes principaux.
+ * @ est conservé pour la rétrocompatibilité.
+ */
+const ALIAS_PREFIXES = ['*', '#', '@'];
+
+/** Regex correspondant à l'un des préfixes d'alias */
+const PREFIX_RE = /^[*#@]/;
 
 /** Message d'invitation ajouté quand le destinataire n'est pas inscrit */
 const INVITATION_SUFFIX =
@@ -58,11 +68,13 @@ const INSTRUCTIONS_DEMARRER = `
    Exemple : NOM Marie
 
 📤 Pour envoyer un message :
-• Première fois : @NOM NUMERO message
-  Exemple : @PAPA 70112233 Bonsoir papa
+• Première fois : *NOM NUMERO message
+  Exemple : *PAPA 70112233 Bonsoir papa
 
-• Fois suivantes : @NOM message
-  Exemple : @PAPA Je rentre à 20h
+• Fois suivantes : *NOM message
+  Exemple : *PAPA Je rentre à 20h
+
+💡 Le # fonctionne aussi : #PAPA 70112233 Bonsoir
 
 🎁 5 SMS offerts dès l'inscription.
 💎 Abonnement illimité disponible.
@@ -76,9 +88,9 @@ Tapez NOM VotrePrenom pour commencer.
 
 /**
  * Détecter si le message est la commande DÉMARRER.
- * Variantes acceptées : DÉMARRER, DEMARRER, START, COMMENCER
+ * Variantes acceptées : DÉMARRER, DEMARRER, START, COMMENCER, INSCRIRE, INSCRIPTION
  *
- * @param {string} msg - Message brut
+ * @param {string} msg
  * @returns {boolean}
  */
 function isDemarrer(msg) {
@@ -88,61 +100,71 @@ function isDemarrer(msg) {
 }
 
 /**
- * Tenter de parser un message au format "@NOM NUMERO texte".
+ * Retirer le préfixe d'alias (* # @) d'une chaîne.
+ * @param {string} s
+ * @returns {string}
+ */
+function stripPrefix(s) {
+  return s.replace(/^[*#@]+/, '');
+}
+
+/**
+ * Tenter de parser un message au format "PREFIX_NOM NUMERO texte".
+ * Préfixes acceptés : * # @
  * Le NUMERO peut être :
  *   - 8 chiffres locaux : 70223344
  *   - Avec indicatif    : +22670223344 / 0022670223344
- *   - Précédé de l'espace après @NOM
  *
  * @param {string} msg - Message brut de l'expéditeur
- * @returns {{ alias:string, targetRaw:string, text:string }|null}
- *   alias     → nom après @ (casse originale)
- *   targetRaw → numéro brut détecté
- *   text      → le reste du message
+ * @returns {{ prefix:string, alias:string, targetRaw:string, text:string }|null}
  */
 function parseFirstMessage(msg) {
   const trimmed = msg.trim();
 
-  // Doit commencer par @
-  if (!trimmed.startsWith('@')) return null;
+  // Doit commencer par un préfixe d'alias
+  if (!PREFIX_RE.test(trimmed)) return null;
 
-  // Regex : @ALIAS NUMERO texte
-  // ALIAS  = [A-Za-zÀ-ÿ0-9_-]+  (pas d'espace, peut contenir tirets/underscore)
+  // Regex : PREFIX ALIAS NUMERO texte
+  // PREFIX = [*#@]
+  // ALIAS  = [A-Za-zÀ-ÿ0-9_-]+
   // NUMERO = séquence de chiffres avec éventuellement + ou 00 au début
-  const RE = /^@([A-Za-zÀ-ÿ0-9_\-]+)\s+(\+?[0-9]{7,15})\s+(.+)$/s;
+  const RE = /^([*#@])([A-Za-zÀ-ÿ0-9_\-]+)\s+(\+?[0-9]{7,15})\s+(.+)$/s;
   const match = trimmed.match(RE);
   if (!match) return null;
 
   return {
-    alias    : match[1],
-    targetRaw: match[2],
-    text     : match[3].trim(),
+    prefix   : match[1],
+    alias    : match[2],
+    targetRaw: match[3],
+    text     : match[4].trim(),
   };
 }
 
 /**
- * Tenter de parser un message au format "@NOM texte" (sans numéro).
+ * Tenter de parser un message au format "PREFIX_NOM texte" (sans numéro).
  * Ce format est utilisé pour les messages suivants (alias déjà enregistré).
  *
  * @param {string} msg
- * @returns {{ alias:string, text:string }|null}
+ * @returns {{ prefix:string, alias:string, text:string }|null}
  */
 function parseFollowupMessage(msg) {
   const trimmed = msg.trim();
-  if (!trimmed.startsWith('@')) return null;
 
-  // @NOM suivi d'un espace et d'un texte (pas de numéro après @NOM)
-  const RE = /^@([A-Za-zÀ-ÿ0-9_\-]+)\s+(.+)$/s;
+  // Doit commencer par un préfixe d'alias
+  if (!PREFIX_RE.test(trimmed)) return null;
+
+  const RE = /^([*#@])([A-Za-zÀ-ÿ0-9_\-]+)\s+(.+)$/s;
   const match = trimmed.match(RE);
   if (!match) return null;
 
   // Vérifier que ce n'est PAS un numéro (sinon c'est un premier message)
-  const secondWord = match[2].split(/\s+/)[0];
+  const secondWord = match[3].split(/\s+/)[0];
   if (/^\+?[0-9]{7,15}$/.test(secondWord)) return null; // → c'est un premier message
 
   return {
-    alias: match[1],
-    text : match[2].trim(),
+    prefix: match[1],
+    alias : match[2],
+    text  : match[3].trim(),
   };
 }
 
@@ -153,11 +175,6 @@ function parseFollowupMessage(msg) {
 /**
  * Envoyer un SMS et logger le résultat.
  * Ne lève jamais d'exception — retourne toujours un résultat.
- *
- * @param {string} to      - Numéro destinataire (E.164)
- * @param {string} content - Contenu du message
- * @param {string} context - Contexte pour les logs
- * @returns {Promise<{success:boolean, provider:string, error?:string}>}
  */
 async function safeSend(to, content, context = '') {
   try {
@@ -176,10 +193,6 @@ async function safeSend(to, content, context = '') {
 
 /**
  * Vérifier si un utilisateur est inscrit dans la collection "users".
- * Utilisé pour détecter si le destinataire est connu ou non.
- *
- * @param {string} phone
- * @returns {Promise<boolean>}
  */
 async function isRegistered(phone) {
   const user = await UserSms.getByPhone(phone);
@@ -194,20 +207,16 @@ async function isRegistered(phone) {
  * Traiter un SMS entrant dans le flow hybride.
  *
  * Ordre de détection :
- *   1. DÉMARRER            → instructions inscription
- *   2. @NOM NUMERO texte   → premier message (alias + envoi)
- *   3. @NOM texte          → message suivant (résolution alias)
- *   4. Autres              → renvoyer vers smsHandler existant (hors scope ici)
+ *   1. DÉMARRER              → instructions inscription
+ *   2. *NOM NUMERO texte     → premier message (alias + envoi)
+ *   3. *NOM texte            → message suivant (résolution alias)
+ *   4. Autres                → { handled: false } → délégué à smsHandler
  *
  * @param {string} fromPhone  - Numéro expéditeur (normalisé E.164)
  * @param {string} rawMessage - Contenu brut du SMS
- * @param {object} [opts]     - Options optionnelles
- * @param {string} [opts.ip]  - IP de la requête (logs)
- * @returns {Promise<{
- *   handled  : boolean,   ← true si le flow hybride a traité le message
- *   reply    : string,    ← réponse à envoyer à l'expéditeur (peut être vide)
- *   action   : string,    ← label descriptif de l'action effectuée
- * }>}
+ * @param {object} [opts]
+ * @param {string} [opts.ip]
+ * @returns {Promise<{ handled:boolean, reply:string, action:string }>}
  */
 async function handleHybridSms(fromPhone, rawMessage, opts = {}) {
   const from = normalizePhone(fromPhone);
@@ -224,13 +233,11 @@ async function handleHybridSms(fromPhone, rawMessage, opts = {}) {
   if (isDemarrer(msg)) {
     logger.info('[HybridSMS] Commande DÉMARRER détectée', { from });
 
-    // Marquer les invitations en attente comme converties
     const joined = await Invitation.markAsJoined(from).catch(() => 0);
     if (joined > 0) {
       logger.info('[HybridSMS] Invitations converties', { from, count: joined });
     }
 
-    // Créer l'utilisateur s'il n'existe pas encore
     await UserSms.getOrCreate(from);
 
     return {
@@ -240,25 +247,27 @@ async function handleHybridSms(fromPhone, rawMessage, opts = {}) {
     };
   }
 
-  // ── 2. PREMIER MESSAGE : @NOM NUMERO texte ───────────────────
+  // ── 2. PREMIER MESSAGE : *NOM NUMERO texte ──────────────────
   const first = parseFirstMessage(msg);
   if (first) {
+    const p = first.prefix; // * ou # ou @
+
     logger.info('[HybridSMS] Premier message détecté', {
       from,
+      prefix: p,
       alias : first.alias,
       target: first.targetRaw,
     });
 
-    // S'assurer que l'expéditeur existe
     await UserSms.getOrCreate(from);
 
     let targetPhone;
     try {
       targetPhone = normalizePhone(first.targetRaw);
-    } catch {
+    } catch (e) {
       return {
         handled: true,
-        reply  : `❌ Numéro invalide : "${first.targetRaw}".\n\nFormat attendu : @MAMAN 70223344 Bonjour`,
+        reply  : `❌ Numéro invalide : "${first.targetRaw}".\n\nFormat attendu : ${p}MAMAN 70223344 Bonjour`,
         action : 'INVALID_NUMBER',
       };
     }
@@ -273,51 +282,44 @@ async function handleHybridSms(fromPhone, rawMessage, opts = {}) {
       created,
     });
 
-    // Construire le message à envoyer au destinataire
-    // Vérifier si le destinataire est inscrit sur OmniSMS
+    // Vérifier si le destinataire est inscrit
     const recipientRegistered = await isRegistered(targetPhone);
     let outgoingMessage = first.text;
 
     if (!recipientRegistered) {
-      // Destinataire non inscrit → ajouter le suffix d'invitation viral
       outgoingMessage += INVITATION_SUFFIX;
 
-      // Enregistrer l'invitation (idempotent — ne crée pas de doublon)
       const senderUser = await UserSms.getByPhone(from);
       await Invitation.recordInvitation({
         inviterPhone  : from,
-        inviterName   : senderUser?.name || null,
+        inviterName   : senderUser && senderUser.name ? senderUser.name : null,
         inviteePhone  : targetPhone,
         messagePreview: first.text.slice(0, 40),
       });
 
-      logger.info('[HybridSMS] Invitation enregistrée', {
-        inviter: from,
-        invitee: targetPhone,
-      });
+      logger.info('[HybridSMS] Invitation enregistrée', { inviter: from, invitee: targetPhone });
     }
 
-    // Envoyer le message au destinataire
-    const sendResult = await safeSend(targetPhone, outgoingMessage, `(premier msg alias @${first.alias})`);
+    const sendResult = await safeSend(
+      targetPhone, outgoingMessage, `(premier msg alias ${p}${first.alias})`
+    );
 
-    // Construire la réponse à l'expéditeur
     const actionWord = created ? 'enregistré' : 'mis à jour';
     let reply;
 
     if (sendResult.success) {
       reply = [
-        `✅ Alias @${first.alias} ${actionWord}.`,
+        `✅ Alias ${p}${first.alias} ${actionWord}.`,
         `📤 Message envoyé à ${targetPhone}.`,
-        '',
-        `Prochain message : @${first.alias} VotreMessage`,
+        ``,
+        `Prochain message : ${p}${first.alias} VotreMessage`,
         `(sans numéro, OmniSMS se souvient ! 🧠)`,
       ].join('\n');
     } else {
-      // Alias sauvegardé même si l'envoi échoue (réseau)
       reply = [
-        `✅ Alias @${first.alias} ${actionWord}.`,
+        `✅ Alias ${p}${first.alias} ${actionWord}.`,
         `⚠️ Message non livré (erreur réseau) — réessayez :`,
-        `  @${first.alias} ${first.text}`,
+        `  ${p}${first.alias} ${first.text}`,
       ].join('\n');
     }
 
@@ -328,31 +330,31 @@ async function handleHybridSms(fromPhone, rawMessage, opts = {}) {
     };
   }
 
-  // ── 3. MESSAGE SUIVANT : @NOM texte ─────────────────────────
+  // ── 3. MESSAGE SUIVANT : *NOM texte ─────────────────────────
   const followup = parseFollowupMessage(msg);
   if (followup) {
+    const p = followup.prefix;
+
     logger.info('[HybridSMS] Message suivant détecté', {
       from,
-      alias: followup.alias,
+      prefix: p,
+      alias : followup.alias,
     });
 
-    // S'assurer que l'expéditeur existe
     await UserSms.getOrCreate(from);
 
-    // Résoudre l'alias
     const resolved = await Alias.resolveAlias(from, followup.alias);
 
     if (!resolved) {
-      // Alias inconnu → suggérer d'enregistrer
       return {
         handled: true,
         reply  : [
-          `❓ Alias @${followup.alias} inconnu.`,
+          `❓ Alias ${p}${followup.alias} inconnu.`,
           ``,
           `Pour l'enregistrer, envoyez :`,
-          `@${followup.alias} NUMERO message`,
+          `${p}${followup.alias} NUMERO message`,
           ``,
-          `Exemple : @${followup.alias} 70223344 Bonjour`,
+          `Exemple : ${p}${followup.alias} 70223344 Bonjour`,
         ].join('\n'),
         action : 'ALIAS_NOT_FOUND',
       };
@@ -360,7 +362,6 @@ async function handleHybridSms(fromPhone, rawMessage, opts = {}) {
 
     const { targetPhone, targetName } = resolved;
 
-    // Vérifier si le destinataire est inscrit
     const recipientRegistered = await isRegistered(targetPhone);
     let outgoingMessage = followup.text;
 
@@ -370,14 +371,15 @@ async function handleHybridSms(fromPhone, rawMessage, opts = {}) {
       const senderUser = await UserSms.getByPhone(from);
       await Invitation.recordInvitation({
         inviterPhone  : from,
-        inviterName   : senderUser?.name || null,
+        inviterName   : senderUser && senderUser.name ? senderUser.name : null,
         inviteePhone  : targetPhone,
         messagePreview: followup.text.slice(0, 40),
       });
     }
 
-    // Envoyer
-    const sendResult = await safeSend(targetPhone, outgoingMessage, `(alias @${followup.alias})`);
+    const sendResult = await safeSend(
+      targetPhone, outgoingMessage, `(alias ${p}${followup.alias})`
+    );
     const displayName = targetName || targetPhone;
 
     let reply;
@@ -398,7 +400,6 @@ async function handleHybridSms(fromPhone, rawMessage, opts = {}) {
   }
 
   // ── 4. Message non géré par ce service ──────────────────────
-  // Le routeur délèguera à smsWebhookRoutes (smsHandler existant)
   return {
     handled: false,
     reply  : '',
@@ -412,10 +413,11 @@ async function handleHybridSms(fromPhone, rawMessage, opts = {}) {
 
 module.exports = {
   handleHybridSms,
-  // Parseurs exposés pour les tests
   parseFirstMessage,
   parseFollowupMessage,
   isDemarrer,
+  stripPrefix,
+  ALIAS_PREFIXES,
   INSTRUCTIONS_DEMARRER,
   INVITATION_SUFFIX,
 };

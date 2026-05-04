@@ -13,8 +13,10 @@
  *   CONTACTS           → Lister les contacts
  *
  *  ── Envoi SMS ───────────────────────────────────────────────
- *   @Jean\nMessage     → Envoyer à un contact par nom
- *   @+22670000000\nMsg → Envoyer à un numéro
+ *   *Jean\nMessage     → Envoyer à un contact par nom (préfixe * ou #)
+ *   #Jean\nMessage     → Identique avec le préfixe #
+ *   @Jean\nMessage     → Aussi accepté (rétrocompatibilité)
+ *   *+22670000000\nMsg → Envoyer à un numéro
  *
  *  ── Crédits & Recharge ──────────────────────────────────────
  *   RECHARGE <montant> → Instructions de paiement
@@ -40,9 +42,12 @@ const SUBSCRIPTION_LINK = process.env.GENIUSPAY_PAYMENT_LINK
 // Helpers
 // ─────────────────────────────────────────────────────────────
 
-/** Vérifier si un message est un envoi SMS formaté @Dest\nMessage */
+/**
+ * Vérifier si un message est un envoi SMS formaté *Dest\nMessage
+ * Préfixes acceptés : * # @
+ */
 function isSmsSendCommand(msg) {
-  return msg.startsWith('@') && msg.includes('\n');
+  return /^[*#@]/.test(msg) && msg.includes('\n');
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -133,7 +138,7 @@ async function handleSMS(phone, rawMessage, ip = '0.0.0.0') {
       }
 
       logger.info('Contact ajouté', { owner: normalized, contact: contactNormalized });
-      return `✅ Contact ${contactName} (${contact.phone}) ajouté !\n\nEnvoyez @${contactName}\\nVotreMessage pour lui écrire.`;
+      return `✅ Contact ${contactName} (${contact.phone}) ajouté !\n\nEnvoyez *${contactName}\\nVotreMessage pour lui écrire.`;
     } catch (err) {
       logger.error('Erreur ADD contact', { error: err.message });
       return `❌ Numéro invalide : ${contactPhone}\n\nExemple : ADD Jean +22670000000`;
@@ -156,7 +161,8 @@ async function handleSMS(phone, rawMessage, ip = '0.0.0.0') {
   }
 
   /* ============================================================
-     COMMANDE : @Dest\nMessage — Envoi SMS intelligent
+     COMMANDE : *Dest\nMessage — Envoi SMS intelligent
+     Préfixes acceptés : * # @
   ============================================================ */
   if (isSmsSendCommand(msg)) {
     const lines    = msg.split('\n');
@@ -164,7 +170,7 @@ async function handleSMS(phone, rawMessage, ip = '0.0.0.0') {
     const content  = lines.slice(1).join('\n').trim();
 
     if (!content) {
-      return `❌ Message vide.\n\nFormat : @Jean\\nVotre message`;
+      return `❌ Message vide.\n\nFormat : *Jean\\nVotre message`;
     }
 
     // Vérifier l'abonnement ou le quota
@@ -187,7 +193,7 @@ async function handleSMS(phone, rawMessage, ip = '0.0.0.0') {
     if (!resolved) {
       return (
         `❌ Destinataire "${target}" introuvable.\n\n` +
-        `Format @Nom → cherche dans vos contacts.\n` +
+        `Format *Nom → cherche dans vos contacts.\n` +
         `Ajoutez ce contact : ADD ${target.slice(1)} NUMERO`
       );
     }
@@ -238,7 +244,7 @@ async function handleSMS(phone, rawMessage, ip = '0.0.0.0') {
       'ADD Nom Num     → Ajouter contact\n' +
       'CONTACTS        → Voir contacts\n\n' +
       '── Envoi SMS ──\n' +
-      '@Nom            → Envoyer (suivi du msg)\n\n' +
+      '*Nom ou #Nom    → Envoyer (suivi du msg)\n\n' +
       '── Recharge ──\n' +
       'RECHARGE <F>    → Instructions recharge\n' +
       'CONFIRM <F>     → Valider recharge\n' +

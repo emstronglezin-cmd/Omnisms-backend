@@ -10,7 +10,7 @@
  * ║  Endpoint principal :                                        ║
  * ║    POST /sms/hybrid/incoming                                 ║
  * ║      → Webhook universel (Africa's Talking / Twilio / Orange)║
- * ║      → Détecte le format hybride @NOM NUMERO message         ║
+ * ║      → Détecte le format hybride *NOM NUMERO message         ║
  * ║      → Si format hybride → hybridSms.handleHybridSms()      ║
  * ║      → Sinon → délègue au handler existant (smsHandler)      ║
  * ║                                                              ║
@@ -100,9 +100,9 @@ router.post('/incoming', async (req, res) => {
   // ── Répondre 200 immédiatement pour éviter le retry webhook ─
   res.status(200).json({ received: true });
 
-  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
-    || req.ip
-    || '0.0.0.0';
+  const ip = req.headers['x-forwarded-for']
+    ? req.headers['x-forwarded-for'].split(',')[0].trim()
+    : (req.ip || '0.0.0.0');
 
   setImmediate(async () => {
     try {
@@ -120,7 +120,7 @@ router.post('/incoming', async (req, res) => {
       let from;
       try {
         from = normalizePhone(phone);
-      } catch {
+      } catch (e) {
         logger.warn('[HybridRoute] Numéro expéditeur invalide', { phone, ip });
         return;
       }
@@ -138,7 +138,7 @@ router.post('/incoming', async (req, res) => {
         // Le flow hybride a traité le message → envoyer la réponse
         logger.info('[HybridRoute] Traité par flow hybride', {
           from,
-          action: result.action,
+          action  : result.action,
           hasReply: !!result.reply,
         });
         await replyToSender(from, result.reply);
@@ -153,7 +153,7 @@ router.post('/incoming', async (req, res) => {
     } catch (err) {
       logger.error('[HybridRoute] Erreur non gérée dans le traitement', {
         error: err.message,
-        stack: err.stack?.split('\n').slice(0, 3).join(' | '),
+        stack: err.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : '',
       });
     }
   });
@@ -190,13 +190,16 @@ router.get('/aliases', async (req, res) => {
       success: true,
       phone,
       count  : aliases.length,
-      aliases: aliases.map(a => ({
-        alias      : `@${a.alias}`,
-        targetPhone: a.targetPhone,
-        targetName : a.targetName,
-        createdAt  : a.createdAt,
-        updatedAt  : a.updatedAt,
-      })),
+      aliases: aliases.map(function(a) {
+        return {
+          alias      : `*${a.alias}`,
+          altAlias   : `#${a.alias}`,
+          targetPhone: a.targetPhone,
+          targetName : a.targetName,
+          createdAt  : a.createdAt,
+          updatedAt  : a.updatedAt,
+        };
+      }),
     });
   } catch (err) {
     logger.error('[HybridRoute] Erreur listage aliases', { error: err.message });
@@ -212,10 +215,10 @@ router.get('/aliases', async (req, res) => {
  * Statut du service SMS hybride.
  * Retourne les endpoints disponibles et la version.
  */
-router.get('/status', (_req, res) => {
+router.get('/status', function(_req, res) {
   return res.status(200).json({
     service : 'OmniSMS Hybrid SMS',
-    version : '1.0.0',
+    version : '2.0.0',
     status  : 'active',
     endpoints: {
       webhook : 'POST /sms/hybrid/incoming',
@@ -223,10 +226,12 @@ router.get('/status', (_req, res) => {
       test    : 'POST /sms/hybrid/test  (non-production seulement)',
     },
     formats: {
-      demarrer       : 'DÉMARRER',
-      premierMessage : '@NOM NUMERO message',
-      messageSuivant : '@NOM message',
+      demarrer        : 'DÉMARRER  (ou DEMARRER / START)',
+      premierMessage  : '*NOM NUMERO message  (ou #NOM NUMERO message)',
+      messageSuivant  : '*NOM message         (ou #NOM message)',
+      retrocompat     : '@NOM NUMERO message  (@ conservé pour compatibilité)',
     },
+    prefixesAcceptes: ['*', '#', '@'],
     collections: {
       aliases    : 'aliases',
       invitations: 'invitations',
@@ -243,7 +248,8 @@ router.get('/status', (_req, res) => {
  * Endpoint de test pour simuler un SMS entrant sans passer par
  * un vrai provider.
  *
- * Body : { phone: "+22670000000", message: "@MAMAN 70223344 Bonjour" }
+ * Body : { phone: "+22670000000", message: "*MAMAN 70223344 Bonjour" }
+ *        ou   { phone: "+22670000000", message: "#PAPA Je rentre" }
  *
  * Retourne la réponse qui aurait été envoyée par SMS.
  * Désactivé en production pour éviter les abus.
@@ -260,7 +266,7 @@ router.post('/test', async (req, res) => {
   if (!phone || !message) {
     return res.status(400).json({
       error  : 'Champs "phone" et "message" requis.',
-      example: { phone: '+22670000000', message: '@MAMAN 70223344 Bonjour' },
+      example: { phone: '+22670000000', message: '*MAMAN 70223344 Bonjour' },
     });
   }
 
@@ -268,7 +274,7 @@ router.post('/test', async (req, res) => {
     let from;
     try {
       from = normalizePhone(phone);
-    } catch {
+    } catch (e) {
       return res.status(400).json({ error: `Numéro invalide : "${phone}"` });
     }
 
