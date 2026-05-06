@@ -10,11 +10,16 @@
 
 const jwt = require('jsonwebtoken');
 
-const JWT_SECRET = process.env.JWT_SECRET;
+// JWT_SECRET is read dynamically so Render env vars are always picked up.
+// We never call process.exit() here — missing JWT_SECRET is handled at
+// call-time (signToken throws, authenticate returns 503).
+function getJwtSecret() {
+  return process.env.JWT_SECRET || null;
+}
 
-if (!JWT_SECRET && process.env.NODE_ENV === 'production') {
-  console.error('❌ [Auth] JWT_SECRET est absent — le serveur ne peut pas valider les tokens.');
-  process.exit(1);
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠️  [Auth] JWT_SECRET absent — tokens cannot be signed/verified until it is set.');
+  console.warn('⚠️  [Auth] Add JWT_SECRET in Render: Settings → Environment Variables.');
 }
 
 /**
@@ -43,8 +48,16 @@ function authenticate(req, res, next) {
     });
   }
 
+  const secret = getJwtSecret();
+  if (!secret) {
+    return res.status(503).json({
+      error: 'Service d\'authentification non configuré (JWT_SECRET manquant).',
+      code : 'AUTH_NOT_CONFIGURED',
+    });
+  }
+
   try {
-    const decoded = jwt.verify(token, JWT_SECRET || 'dev_secret_change_me', {
+    const decoded = jwt.verify(token, secret, {
       algorithms: ['HS256'],   // Forcer l'algorithme — évite les attaques "none" et RSA-to-HMAC
     });
 
@@ -88,7 +101,9 @@ function optionalAuth(req, res, next) {
     : authHeader.trim();
 
   try {
-    req.user = jwt.verify(token, JWT_SECRET || 'dev_secret_change_me', {
+    const secret = getJwtSecret();
+    if (!secret) { req.user = null; return next(); }
+    req.user = jwt.verify(token, secret, {
       algorithms: ['HS256'],
     });
   } catch {
@@ -104,8 +119,9 @@ function optionalAuth(req, res, next) {
  * @param {string} [expiresIn='7d']  - Durée de validité
  */
 function signToken(payload, expiresIn = '7d') {
-  if (!JWT_SECRET) throw new Error('JWT_SECRET non configuré');
-  return jwt.sign(payload, JWT_SECRET, {
+  const secret = getJwtSecret();
+  if (!secret) throw new Error('JWT_SECRET non configuré — ajoutez-le dans Render Environment Variables.');
+  return jwt.sign(payload, secret, {
     algorithm: 'HS256',
     expiresIn,
   });

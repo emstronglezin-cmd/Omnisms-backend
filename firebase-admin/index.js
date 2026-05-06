@@ -1,50 +1,89 @@
 'use strict';
 /**
- * OmniSMS — Firebase Admin SDK (Production)
+ * OmniSMS — Firebase Admin SDK
  *
- * Initialisation unique du SDK Firebase Admin.
- * Credentials chargées UNIQUEMENT depuis la variable d'environnement
- * FIREBASE_SERVICE_ACCOUNT_JSON (JSON stringifié du service account).
+ * Graceful initialization — never calls process.exit().
+ * If FIREBASE_SERVICE_ACCOUNT_JSON is missing or invalid, exports a stub
+ * that rejects Promises at call time so routes can respond 503 instead of crashing.
  *
- * En production (Render) : définir cette variable dans le dashboard.
- * En développement local : créer un fichier .env avec la variable.
- *
- * Si la variable est absente → le serveur refuse de démarrer.
- * Zéro fallback, zéro mock, zéro données en mémoire.
+ * Production (Render): set FIREBASE_SERVICE_ACCOUNT_JSON in Environment Variables.
  */
 
 const admin = require('firebase-admin');
 
-if (!admin.apps.length) {
+/* ── Async-safe stub (all terminal ops return rejected Promises) ── */
+function makeStub(reason) {
+  const reject = () =>
+    Promise.reject(
+      new Error('[Firebase] Not available: ' + reason +
+        '. Set FIREBASE_SERVICE_ACCOUNT_JSON in Render env vars.')
+    );
+
+  function firestoreStub() {
+    const fs = {
+      collection : () => fs,
+      doc        : () => fs,
+      where      : () => fs,
+      orderBy    : () => fs,
+      limit      : () => fs,
+      startAfter : () => fs,
+      select     : () => fs,
+      settings   : () => {},
+      // terminal ops — async rejected, never blocking
+      get    : reject,
+      add    : reject,
+      set    : reject,
+      update : reject,
+      delete : reject,
+    };
+    return fs;
+  }
+
+  return {
+    _stub    : true,
+    _reason  : reason,
+    firestore: firestoreStub,
+    auth     : () => ({
+      verifyIdToken : reject,
+      getUser       : reject,
+      createUser    : reject,
+    }),
+    apps: [],
+  };
+}
+
+let adminInstance;
+
+if (admin.apps.length) {
+  // Already initialized (e.g. hot-reload or double require)
+  adminInstance = admin;
+} else {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
   if (!raw) {
-    console.error('❌ [Firebase] FIREBASE_SERVICE_ACCOUNT_JSON est absent.');
-    console.error('   Ajoutez cette variable dans votre fichier .env ou dans les');
-    console.error('   variables d\'environnement Render (Settings → Environment).');
-    console.error('   Valeur attendue : le contenu JSON du service account Firebase.');
-    process.exit(1); // Arrêt immédiat — impossible de démarrer sans Firebase
-  }
+    console.warn('[Firebase] FIREBASE_SERVICE_ACCOUNT_JSON absent — degraded stub mode.');
+    console.warn('[Firebase] Firebase-dependent routes will return HTTP 503.');
+    console.warn('[Firebase] Add the variable in Render: Settings → Environment.');
+    adminInstance = makeStub('FIREBASE_SERVICE_ACCOUNT_JSON absent');
+  } else {
+    let sa;
+    try { sa = JSON.parse(raw); } catch (e) {
+      console.error('[Firebase] Invalid JSON in FIREBASE_SERVICE_ACCOUNT_JSON:', e.message);
+      adminInstance = makeStub('malformed JSON: ' + e.message);
+      sa = null;
+    }
 
-  let serviceAccount;
-  try {
-    serviceAccount = JSON.parse(raw);
-  } catch (parseErr) {
-    console.error('❌ [Firebase] FIREBASE_SERVICE_ACCOUNT_JSON est invalide (JSON malformé).');
-    console.error('   Assurez-vous que la valeur est un JSON valide (sans retour à la ligne).');
-    console.error('   Détail :', parseErr.message);
-    process.exit(1);
-  }
-
-  try {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-    console.log('✅ [Firebase] SDK Admin initialisé — projet :', serviceAccount.project_id);
-  } catch (initErr) {
-    console.error('❌ [Firebase] Échec initializeApp :', initErr.message);
-    process.exit(1);
+    if (sa) {
+      try {
+        admin.initializeApp({ credential: admin.credential.cert(sa) });
+        console.log('[Firebase] Admin SDK initialized — project:', sa.project_id || '(unknown)');
+        adminInstance = admin;
+      } catch (e) {
+        console.error('[Firebase] initializeApp failed:', e.message);
+        adminInstance = makeStub('initializeApp failed: ' + e.message);
+      }
+    }
   }
 }
 
-module.exports = admin;
+module.exports = adminInstance;
