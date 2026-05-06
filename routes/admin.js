@@ -149,9 +149,11 @@ router.get('/stats', async (req, res) => {
    → Liste des utilisateurs (pagination par curseur Firestore)
 ============================================================ */
 router.get('/users', async (req, res) => {
-  const limit  = Math.min(parseInt(req.query.limit)  || 50, 200);
-  const after  = req.query.after || null;
-  const filter = req.query.subscribed; // 'true' | 'false' | undefined
+  const cqAdmin = req.cleanedQuery || {};
+  const _qry = (k) => cqAdmin[k] !== undefined ? cqAdmin[k] : (req.query && req.query[k]);
+  const limit  = Math.min(parseInt(_qry('limit'))  || 50, 200);
+  const after  = _qry('after') || null;
+  const filter = _qry('subscribed'); // 'true' | 'false' | undefined
 
   try {
     let query = db.collection('users').orderBy('updatedAt', 'desc').limit(limit);
@@ -328,9 +330,11 @@ router.post('/user/:userId/deactivate', async (req, res) => {
    → Historique des paiements Fusion Pay
 ============================================================ */
 router.get('/payments', async (req, res) => {
-  const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
-  const status = req.query.status;
-  const after  = req.query.after || null;
+  const cqAdminP = req.cleanedQuery || {};
+  const _qryP = (k) => cqAdminP[k] !== undefined ? cqAdminP[k] : (req.query && req.query[k]);
+  const limit  = Math.min(parseInt(_qryP('limit')) || 50, 200);
+  const status = _qryP('status');
+  const after  = _qryP('after') || null;
 
   try {
     let query = db.collection('payments_fusionpay').orderBy('updatedAt', 'desc').limit(limit);
@@ -364,7 +368,8 @@ router.get('/payments', async (req, res) => {
    → Tous les abonnements (depuis collection subscriptions)
 ============================================================ */
 router.get('/subscriptions', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const cqAdminS = req.cleanedQuery || {};
+  const limit = Math.min(parseInt(cqAdminS.limit || (req.query && req.query.limit)) || 50, 200);
 
   try {
     const snap = await db.collection('subscriptions')

@@ -502,7 +502,8 @@ router.get(
     if (validationError) return;
 
     // Accepter userId via query param ou via JWT (req.user)
-    const userId = (req.query.userId || req.user?.uid || '').trim();
+    const cq0 = req.cleanedQuery || {};
+    const userId = (cq0.userId || (req.query && req.query.userId) || req.user?.uid || '').trim();
 
     if (!userId) {
       return res.status(400).json({
@@ -576,8 +577,9 @@ router.get(
     const validationError = handleValidation(req, res);
     if (validationError) return;
 
-    const userId = req.query.userId.trim();
-    const phone  = req.query.phone  || null;
+    const cq1 = req.cleanedQuery || {};
+    const userId = ((cq1.userId || (req.query && req.query.userId) || '')).trim();
+    const phone  = cq1.phone || (req.query && req.query.phone) || null;
 
     // Si GeniusPay non configuré → fallback sur Fusion Link
     if (!process.env.GENIUSPAY_API_KEY || !process.env.GENIUSPAY_API_SECRET) {
@@ -668,8 +670,9 @@ router.get(
  * Affiche une page HTML simple de confirmation.
  */
 router.get('/return', (req, res) => {
-  const safeOrderId = (req.query.orderId || '').replace(/[<>"'&]/g, '');
-  const safeUserId  = (req.query.userId  || '').replace(/[<>"'&]/g, '');
+  const cq2 = req.cleanedQuery || {};
+  const safeOrderId = ((cq2.orderId || (req.query && req.query.orderId) || '')).replace(/[<>"'&]/g, '');
+  const safeUserId  = ((cq2.userId  || (req.query && req.query.userId)  || '')).replace(/[<>"'&]/g, '');
 
   const html = `<!DOCTYPE html>
 <html lang="fr">

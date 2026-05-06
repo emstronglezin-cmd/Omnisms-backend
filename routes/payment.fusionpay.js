@@ -525,7 +525,8 @@ router.get('/fusion-user/:userId', async (req, res) => {
  * L'app Flutter détecte cette URL et lance la vérification du statut.
  */
 router.get('/fusion-return', (req, res) => {
-  const safeUserId = (req.query.userId || '').replace(/[<>"'&]/g, '');
+  const cqFusion = req.cleanedQuery || {};
+  const safeUserId = ((cqFusion.userId || (req.query && req.query.userId) || '')).replace(/[<>"'&]/g, '');
 
   const html = `<!DOCTYPE html>
 <html lang="fr">

@@ -2,15 +2,12 @@
 /**
  * OmniSMS — Routes Authentification
  *
- * Utilise Firebase Admin SDK (Firestore + JWT personnalisé).
- * Validation des entrées via express-validator.
- * Aucune dépendance Parse.
- *
  * Endpoints :
- *  POST /api/auth/register  → Créer un compte
- *  POST /api/auth/login     → Connexion
- *  PUT  /api/auth/profile   → Mettre à jour le profil (auth requise)
+ *  POST /api/auth/register  → Créer un compte (email + password)
+ *  POST /api/auth/login     → Connexion (email ou phone + password)
+ *  POST /api/auth/google    → Google Sign-In (Firebase ID token)
  *  GET  /api/auth/me        → Récupérer son profil (auth requise)
+ *  PUT  /api/auth/profile   → Mettre à jour le profil (auth requise)
  */
 
 const express  = require('express');
@@ -96,17 +93,33 @@ router.post(
         phone       : phone ? phone.trim() : null,
         isSubscribed: false,
         credits     : 0,
+        provider    : 'email',
         createdAt   : now,
         updatedAt   : now,
       };
 
       const docRef = await db.collection('users').add(userData);
 
+      // Générer un JWT immédiatement après l'inscription
+      const token = signToken({
+        uid  : docRef.id,
+        email: userData.email,
+        name : userData.name,
+      });
+
       logger.info('Utilisateur créé', { uid: docRef.id, email: userData.email });
 
       return res.status(201).json({
-        message: 'Compte créé avec succès.',
-        userId : docRef.id,
+        message : 'Compte créé avec succès.',
+        userId  : docRef.id,
+        token,
+        user: {
+          id          : docRef.id,
+          name        : userData.name,
+          email       : userData.email,
+          isSubscribed: false,
+          credits     : 0,
+        },
       });
     } catch (err) {
       logger.error('Erreur register', { error: err.message });
@@ -152,7 +165,6 @@ router.post(
     }
 
     try {
-      // Chercher par email ou téléphone
       let snap;
       if (email) {
         snap = await db
@@ -178,6 +190,14 @@ router.post(
       const doc  = snap.docs[0];
       const user = { id: doc.id, ...doc.data() };
 
+      // Les comptes Google n'ont pas de mot de passe hashé
+      if (!user.password) {
+        return res.status(401).json({
+          error: 'Ce compte utilise Google Sign-In. Connectez-vous avec Google.',
+          code : 'USE_GOOGLE_SIGNIN',
+        });
+      }
+
       const passwordMatch = await bcrypt.compare(password, user.password);
       if (!passwordMatch) {
         return res.status(401).json({
@@ -186,14 +206,12 @@ router.post(
         });
       }
 
-      // Générer un JWT signé
       const token = signToken({
         uid  : user.id,
         email: user.email,
         name : user.name,
       });
 
-      // Mettre à jour la dernière connexion
       await db.collection('users').doc(user.id).update({
         lastLoginAt: new Date().toISOString(),
       });
@@ -213,6 +231,138 @@ router.post(
       });
     } catch (err) {
       logger.error('Erreur login', { error: err.message });
+      return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/google  — Google Sign-In via Firebase ID Token
+// ─────────────────────────────────────────────────────────────
+/**
+ * Le frontend obtient un idToken Firebase après Google Sign-In,
+ * puis l'envoie ici. On le vérifie côté serveur via Firebase Admin SDK,
+ * on crée le compte Firestore s'il n'existe pas, et on retourne un JWT.
+ *
+ * Body : { idToken: "firebase_id_token_string" }
+ */
+router.post(
+  '/google',
+  [
+    body('idToken')
+      .notEmpty()
+      .withMessage('Le token Firebase est requis.')
+      .isString()
+      .isLength({ min: 10 })
+      .withMessage('Token invalide.'),
+  ],
+  async (req, res) => {
+    const validationError = handleValidation(req, res);
+    if (validationError) return;
+
+    const { idToken } = req.body;
+
+    try {
+      // Vérifier le token Firebase ID avec Firebase Admin SDK
+      let decodedToken;
+      try {
+        const admin = require('../firebase-admin/index');
+        decodedToken = await admin.auth().verifyIdToken(idToken);
+      } catch (verifyErr) {
+        logger.warn('Google Sign-In — token invalide', { error: verifyErr.message });
+        return res.status(401).json({
+          error: 'Token Google invalide ou expiré. Reconnectez-vous.',
+          code : 'INVALID_GOOGLE_TOKEN',
+        });
+      }
+
+      const { uid: googleUid, email, name: googleName, picture } = decodedToken;
+
+      if (!email) {
+        return res.status(400).json({
+          error: 'Email absent dans le token Google.',
+          code : 'MISSING_EMAIL',
+        });
+      }
+
+      const normalizedEmail = email.toLowerCase().trim();
+      const now = new Date().toISOString();
+
+      // Chercher si l'utilisateur existe déjà (par email ou googleUid)
+      let userId;
+      let userData;
+
+      const existingSnap = await db
+        .collection('users')
+        .where('email', '==', normalizedEmail)
+        .limit(1)
+        .get();
+
+      if (!existingSnap.empty) {
+        // Utilisateur existant — mettre à jour les infos Google
+        const existingDoc = existingSnap.docs[0];
+        userId   = existingDoc.id;
+        userData = existingDoc.data();
+
+        await db.collection('users').doc(userId).update({
+          googleUid  : googleUid,
+          provider   : 'google',
+          name       : userData.name || googleName || normalizedEmail.split('@')[0],
+          avatar     : picture || userData.avatar || null,
+          lastLoginAt: now,
+          updatedAt  : now,
+        });
+
+        userData = { ...userData, googleUid, provider: 'google' };
+        logger.info('Google Sign-In — compte existant mis à jour', { uid: userId });
+
+      } else {
+        // Nouvel utilisateur — créer le compte
+        const newUser = {
+          name        : googleName || normalizedEmail.split('@')[0],
+          email       : normalizedEmail,
+          googleUid   : googleUid,
+          avatar      : picture || null,
+          phone       : null,
+          password    : null,   // Pas de mot de passe pour les comptes Google
+          provider    : 'google',
+          isSubscribed: false,
+          credits     : 0,
+          createdAt   : now,
+          updatedAt   : now,
+          lastLoginAt : now,
+        };
+
+        const docRef = await db.collection('users').add(newUser);
+        userId   = docRef.id;
+        userData = newUser;
+
+        logger.info('Google Sign-In — nouveau compte créé', { uid: userId, email: normalizedEmail });
+      }
+
+      // Générer le JWT OmniSMS
+      const token = signToken({
+        uid  : userId,
+        email: normalizedEmail,
+        name : userData.name || googleName,
+      });
+
+      return res.status(200).json({
+        message : 'Connexion Google réussie.',
+        token,
+        user: {
+          id          : userId,
+          name        : userData.name || googleName,
+          email       : normalizedEmail,
+          avatar      : picture || userData.avatar || null,
+          isSubscribed: userData.isSubscribed || false,
+          credits     : userData.credits      || 0,
+          provider    : 'google',
+        },
+      });
+
+    } catch (err) {
+      logger.error('Erreur Google Sign-In', { error: err.message });
       return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
     }
   }

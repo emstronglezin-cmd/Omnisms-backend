@@ -10,6 +10,8 @@
  *  5. Rate limiting global + par route
  *  6. Slow-down (progressive delay avant rate-limit)
  *  7. Input sanitization (strip null bytes, contrôle dangereux)
+ *     ⚠️  FIX CRITIQUE : req.query est un getter-only dans Node/Express moderne.
+ *         On ne mute PLUS req.query — on attache req.cleanedQuery à la place.
  *  8. Content-Type enforcement sur les routes POST/PUT
  */
 
@@ -31,7 +33,7 @@ const helmetMiddleware = helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc : ["'self'"],
-      scriptSrc  : ["'self'", "'unsafe-inline'"],   // inline pour la page HTML /payment-success
+      scriptSrc  : ["'self'", "'unsafe-inline'"],
       styleSrc   : ["'self'", "'unsafe-inline'"],
       imgSrc     : ["'self'", 'data:', 'https:'],
       connectSrc : ["'self'"],
@@ -39,10 +41,10 @@ const helmetMiddleware = helmet({
       objectSrc  : ["'none'"],
     },
   },
-  crossOriginEmbedderPolicy : false,  // nécessaire pour WebView
+  crossOriginEmbedderPolicy : false,
   crossOriginResourcePolicy : { policy: 'cross-origin' },
   hsts: {
-    maxAge           : 31536000,  // 1 an
+    maxAge           : 31536000,
     includeSubDomains: true,
     preload          : true,
   },
@@ -50,12 +52,15 @@ const helmetMiddleware = helmet({
 
 // ── 2. CORS ───────────────────────────────────────────────────
 const corsMiddleware = cors({
-  origin      : allowedOrigins,
-  methods     : ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-key', 'x-api-key', 'x-request-id'],
+  origin        : allowedOrigins,
+  methods       : ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: [
+    'Content-Type', 'Authorization', 'x-admin-key',
+    'x-api-key', 'x-request-id', 'X-API-Key', 'X-API-Secret',
+  ],
   exposedHeaders: ['X-Request-Id', 'X-RateLimit-Limit', 'X-RateLimit-Remaining'],
-  credentials : true,
-  maxAge      : 86400,  // 24h preflight cache
+  credentials   : true,
+  maxAge        : 86400,
 });
 
 // ── 3. Compression gzip/br ────────────────────────────────────
@@ -69,29 +74,29 @@ const compressionMiddleware = compression({
 
 // ── 4. Rate limiters ─────────────────────────────────────────
 
-/** Global : 200 req / 15 min par IP */
+/** Global : 300 req / 15 min par IP */
 const globalLimiter = rateLimit({
   windowMs       : 15 * 60 * 1000,
-  max            : 200,
+  max            : 300,
   standardHeaders: true,
   legacyHeaders  : false,
-  skip           : (req) => req.path === '/health',   // health check non limité
+  skip           : (req) => req.path === '/health' || req.path === '/',
   message        : { error: 'Trop de requêtes. Réessayez dans 15 minutes.', code: 'RATE_LIMIT' },
 });
 
-/** Auth : 20 tentatives / 15 min par IP (brute-force login) */
+/** Auth : 30 tentatives / 15 min par IP (brute-force login) */
 const authLimiter = rateLimit({
   windowMs       : 15 * 60 * 1000,
-  max            : 20,
+  max            : 30,
   standardHeaders: true,
   legacyHeaders  : false,
   message        : { error: 'Trop de tentatives. Réessayez dans 15 minutes.', code: 'AUTH_RATE_LIMIT' },
 });
 
-/** Paiement confirm : 5 req / 5 min par IP */
+/** Paiement confirm : 10 req / 5 min par IP */
 const paymentConfirmLimiter = rateLimit({
   windowMs       : 5 * 60 * 1000,
-  max            : 5,
+  max            : 10,
   standardHeaders: true,
   legacyHeaders  : false,
   message        : { error: 'Trop de tentatives de confirmation. Attendez 5 minutes.', code: 'PAYMENT_RATE_LIMIT' },
@@ -116,17 +121,20 @@ const geniusPayLimiter = rateLimit({
 });
 
 // ── 5. Slow-down (délai progressif avant blocage) ─────────────
-/** Après 100 req, ajouter 200ms de délai par requête supplémentaire */
 const globalSlowDown = slowDown({
   windowMs         : 15 * 60 * 1000,
-  delayAfter       : 100,
-  delayMs          : (hits) => (hits - 100) * 200,
+  delayAfter       : 150,
+  delayMs          : (hits) => (hits - 150) * 200,
   maxDelayMs       : 5000,
-  skip             : (req) => req.path === '/health',
+  skip             : (req) => req.path === '/health' || req.path === '/',
 });
 
-// ── 6. Input sanitizer ────────────────────────────────────────
-/** Supprime les caractères de contrôle dangereux des strings */
+// ── 6. Input sanitizer (FIX CRITIQUE) ────────────────────────
+/**
+ * Supprime les caractères de contrôle dangereux des strings.
+ * Traite récursivement les objets et tableaux.
+ * Ne mute JAMAIS req.query directement (getter-only dans Express 5 / Node 18+).
+ */
 function deepSanitizeStrings(obj) {
   if (typeof obj === 'string') {
     // Supprimer null bytes et caractères de contrôle (sauf \n, \r, \t)
@@ -143,9 +151,52 @@ function deepSanitizeStrings(obj) {
   return obj;
 }
 
-function inputSanitizer(req, res, next) {
-  if (req.body)  req.body  = deepSanitizeStrings(req.body);
-  if (req.query) req.query = deepSanitizeStrings(req.query);
+/**
+ * Middleware de sanitization des inputs.
+ *
+ * ⚠️  IMPORTANT — req.query est un getter-only dans Node.js/Express 5 :
+ *     On ne peut PAS faire : req.query = {...}  → TypeError
+ *
+ * Stratégie corrigée :
+ *   - req.body        → muté directement (fonctionne, c'est une propriété normale)
+ *   - req.query       → copié dans req.cleanedQuery (immuable dans les routes)
+ *   - req.cleanedParams→ copié depuis req.params (idem)
+ *
+ * Dans les routes, lire la query via : req.cleanedQuery || req.query
+ */
+function inputSanitizer(req, _res, next) {
+  // Sanitiser le body (propriété mutable — OK)
+  if (req.body && typeof req.body === 'object') {
+    try {
+      req.body = deepSanitizeStrings(req.body);
+    } catch (_) {
+      // Silencieux — ne jamais bloquer sur la sanitization
+    }
+  }
+
+  // Sanitiser la query — SANS muter req.query
+  try {
+    const rawQuery = req.query; // lecture seule — getter
+    if (rawQuery && typeof rawQuery === 'object') {
+      req.cleanedQuery = deepSanitizeStrings({ ...rawQuery });
+    } else {
+      req.cleanedQuery = {};
+    }
+  } catch (_) {
+    req.cleanedQuery = {};
+  }
+
+  // Sanitiser les params de route (ex: :userId)
+  try {
+    if (req.params && typeof req.params === 'object') {
+      req.cleanedParams = deepSanitizeStrings({ ...req.params });
+    } else {
+      req.cleanedParams = {};
+    }
+  } catch (_) {
+    req.cleanedParams = {};
+  }
+
   next();
 }
 
@@ -153,11 +204,33 @@ function inputSanitizer(req, res, next) {
 function requireJson(req, res, next) {
   if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
     const ct = req.headers['content-type'] || '';
-    if (!ct.includes('application/json') && !ct.includes('application/x-www-form-urlencoded') && !ct.includes('multipart/form-data')) {
-      return res.status(415).json({ error: 'Content-Type non supporté.', code: 'UNSUPPORTED_MEDIA_TYPE' });
+    if (
+      !ct.includes('application/json') &&
+      !ct.includes('application/x-www-form-urlencoded') &&
+      !ct.includes('multipart/form-data')
+    ) {
+      return res.status(415).json({
+        error: 'Content-Type non supporté.',
+        code : 'UNSUPPORTED_MEDIA_TYPE',
+      });
     }
   }
   next();
+}
+
+// ── Helper pour les routes : lire la query sanitisée ─────────
+/**
+ * Lire un paramètre de query de façon sûre.
+ * Utilise req.cleanedQuery si disponible, sinon req.query en fallback.
+ *
+ * @param {object} req   - Requête Express
+ * @param {string} key   - Nom du paramètre
+ * @returns {string|undefined}
+ */
+function getQueryParam(req, key) {
+  const cleaned = req.cleanedQuery || {};
+  const raw     = req.query        || {};
+  return cleaned[key] !== undefined ? cleaned[key] : raw[key];
 }
 
 module.exports = {
@@ -173,4 +246,6 @@ module.exports = {
   geniusPayLimiter,
   inputSanitizer,
   requireJson,
+  getQueryParam,
+  deepSanitizeStrings,
 };

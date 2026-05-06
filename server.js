@@ -1,15 +1,15 @@
 'use strict';
 /**
  * ╔══════════════════════════════════════════════════════════╗
- * ║           OmniSMS Backend — v2.3                        ║
+ * ║           OmniSMS Backend — v2.4                        ║
  * ║  Production-ready · Sécurisé · Maintenable              ║
  * ╚══════════════════════════════════════════════════════════╝
  *
  * Architecture :
- *  💳 PAIEMENT  → Fusion Pay API (nouveau) + Fusion Link (conservé)
+ *  💳 PAIEMENT  → GeniusPay (primaire) + Fusion Pay API + Fusion Link
  *  📱 SMS       → Webhook universel (Africa's Talking / Twilio / Orange)
- *  👤 CONTACTS  → Carnet d'adresses Firestore + envoi SMS intelligent
- *  🔒 SÉCURITÉ  → Helmet + CORS + HPP + Rate-limit + Slow-down + Sanitize
+ *  👤 AUTH      → Email/Password + Google Sign-In (Firebase-backed JWT)
+ *  🔒 SÉCURITÉ  → Helmet · CORS · HPP · Rate-limit · Slow-down · Sanitize
  *  📊 LOGS      → JSON structurés + Request-ID propagé
  *  🔄 GRACEFUL  → Arrêt propre SIGTERM/SIGINT avec drain des connexions
  */
@@ -37,20 +37,6 @@ const {
 const { requestLogger, logger } = require('./middleware/logger');
 
 /* ============================================================
-   VALIDATION DES VARIABLES D'ENVIRONNEMENT CRITIQUES
-============================================================ */
-const REQUIRED_ENV = [];
-
-
-if (process.env.NODE_ENV === 'production') {
-  const missing = REQUIRED_ENV.filter(k => !process.env[k]);
-  if (missing.length > 0) {
-    logger.error('Variables d\'environnement manquantes', { missing });
-    process.exit(1);
-  }
-}
-
-/* ============================================================
    APPLICATION EXPRESS
 ============================================================ */
 const app  = express();
@@ -69,8 +55,10 @@ app.use(compressionMiddleware);
 // 2. Headers de sécurité HTTP
 app.use(helmetMiddleware);
 
-// 3. CORS
+// 3. CORS — doit être avant tout autre traitement
 app.use(corsMiddleware);
+// Répondre immédiatement aux preflight OPTIONS
+app.options('*', corsMiddleware);
 
 // 4. Logs structurés (injecte req.requestId)
 app.use(requestLogger);
@@ -78,15 +66,16 @@ app.use(requestLogger);
 // 5. Body parsers (limits strictes)
 // Capture du corps brut (rawBody) pour la vérification HMAC des webhooks GeniusPay
 app.use(express.json({
-  limit : '1mb',
+  limit : '2mb',
   verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
 }));
-app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
 // 6. Protection HTTP Parameter Pollution
 app.use(hppMiddleware);
 
 // 7. Sanitization des inputs (null bytes, chars de contrôle)
+//    ⚠️  FIX : n'écrit plus sur req.query (getter-only) — utilise req.cleanedQuery
 app.use(inputSanitizer);
 
 // 8. Rate limit global + slow-down
@@ -94,30 +83,87 @@ app.use(globalSlowDown);
 app.use(globalLimiter);
 
 /* ============================================================
-   ROUTES PRIORITAIRES — Aucun middleware bloquant
-   Enregistrées AVANT le rate-limit pour répondre immédiatement
+   HELPER — lire la query de façon sûre (req.cleanedQuery || req.query)
+============================================================ */
+function q(req, key) {
+  const cq = req.cleanedQuery || {};
+  return cq[key] !== undefined ? cq[key] : (req.query || {})[key];
+}
+
+/* ============================================================
+   ROUTES PRIORITAIRES — répondent avant tout rate-limit
 ============================================================ */
 
-// GET /health — Health check Render / monitoring
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status : 'ok',
-    app    : 'OmniSMS',
-    version: '1.0.0',
+// GET / — Status JSON (production-ready)
+app.get('/', (_req, res) => {
+  const gpConfigured = !!(
+    (process.env.GENIUSPAY_PUBLIC_KEY || process.env.GENIUSPAY_API_KEY) &&
+    (process.env.GENIUSPAY_SECRET_KEY || process.env.GENIUSPAY_API_SECRET)
+  );
+
+  let smsProvider = 'none';
+  try {
+    const { getProviderStatus } = require('./services/smsProvider');
+    smsProvider = getProviderStatus().activeProvider;
+  } catch (_) { /* non bloquant */ }
+
+  return res.status(200).json({
+    status  : 'ok',
+    service : 'OmniSMS Backend',
+    version : '2.4.0',
+    auth    : true,
+    payments: gpConfigured,
+    sms     : smsProvider !== 'none',
+    geniuspay: gpConfigured ? 'ACTIVE' : 'INACTIVE',
+    smsProvider,
+    env     : process.env.NODE_ENV || 'development',
+    time    : new Date().toISOString(),
   });
 });
 
-// GET / — Page d'accueil HTML
-app.get('/', (req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.status(200).send(
-    '<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
-    + '<title>OmniSMS API</title>'
-    + '<style>body{font-family:sans-serif;display:flex;align-items:center;'
-    + 'justify-content:center;min-height:100vh;margin:0;background:#0d1117;color:#f0f6fc;}'
-    + 'h1{font-size:2rem;}span{color:#3fb950;}</style></head>'
-    + '<body><h1>OmniSMS API &mdash; <span>Running</span></h1></body></html>'
+// GET /health — Diagnostics complets (Render health check)
+app.get('/health', async (_req, res) => {
+  const gpConfigured = !!(
+    (process.env.GENIUSPAY_PUBLIC_KEY || process.env.GENIUSPAY_API_KEY) &&
+    (process.env.GENIUSPAY_SECRET_KEY || process.env.GENIUSPAY_API_SECRET)
   );
+
+  let smsStatus = { activeProvider: 'none', twilio: {}, africastalking: {}, orange: {} };
+  try {
+    const { getProviderStatus } = require('./services/smsProvider');
+    smsStatus = getProviderStatus();
+  } catch (_) { /* non bloquant */ }
+
+  const firebaseOk = !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const jwtOk      = !!process.env.JWT_SECRET;
+
+  const healthy = firebaseOk; // minimum requis
+
+  return res.status(healthy ? 200 : 503).json({
+    status : healthy ? 'ok' : 'degraded',
+    service: 'OmniSMS Backend',
+    version: '2.4.0',
+    uptime : Math.round(process.uptime()),
+    time   : new Date().toISOString(),
+    checks : {
+      firebase : firebaseOk  ? 'ok' : 'MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON',
+      jwt      : jwtOk       ? 'ok' : 'MISSING — set JWT_SECRET',
+      geniuspay: gpConfigured ? 'ACTIVE' : 'INACTIVE — set GENIUSPAY_PUBLIC_KEY + GENIUSPAY_SECRET_KEY',
+      sms      : {
+        activeProvider: smsStatus.activeProvider,
+        status        : smsStatus.activeProvider !== 'none' ? 'ACTIVE' : 'INACTIVE — set Twilio/AfricasTalking/Orange env vars',
+        twilio        : smsStatus.twilio?.configured         ? 'configured' : 'not configured',
+        africastalking: smsStatus.africastalking?.configured ? 'configured' : 'not configured',
+        orange        : smsStatus.orange?.configured         ? 'configured' : 'not configured',
+      },
+    },
+    routes: {
+      auth    : ['POST /api/auth/register', 'POST /api/auth/login', 'POST /api/auth/google', 'GET /api/auth/me'],
+      payment : ['POST /api/payment/geniuspay', 'POST /api/payment/webhook', 'GET /api/user/status'],
+      sms     : ['POST /sms/incoming', 'POST /sms/hybrid/incoming'],
+      health  : ['GET /', 'GET /health', 'GET /api/status'],
+    },
+  });
 });
 
 /* ============================================================
@@ -133,18 +179,19 @@ const groupRoutes         = require('./routes/groups');
 const userRoutes          = require('./routes/users');
 const meRoutes            = require('./routes/me');
 const notifRoutes         = require('./routes/notifications');
-const statsRoutes          = require('./routes/statistics');
-const contactRoutes        = require('./routes/contacts');      // contacts + send-sms
-const geniusPayRoutes      = require('./routes/payment.geniuspay'); // Routes avancées GeniusPay
-const paymentRoutes        = require('./routes/payment');       // POST /api/payment/geniuspay
-const webhookRoutes        = require('./routes/webhook');       // POST /api/payment/webhook
-const smsHybridRoutes      = require('./routes/sms.hybrid');    // ★ Flow SMS hybride (NOUVEAU)
+const statsRoutes         = require('./routes/statistics');
+const contactRoutes       = require('./routes/contacts');
+const geniusPayRoutes     = require('./routes/payment.geniuspay');
+const paymentRoutes       = require('./routes/payment');
+const webhookRoutes       = require('./routes/webhook');
+const smsHybridRoutes     = require('./routes/sms.hybrid');
 
 // Chargement des routes optionnelles (pas bloquant si fichier absent)
 function loadOptional(routePath, mount) {
   try {
-    app.use(mount, require(routePath));
-    logger.info(`Route chargée : ${mount}`);
+    const mod = require(routePath);
+    app.use(mount, mod);
+    logger.info(`Route optionnelle chargée : ${mount}`);
   } catch (e) {
     if (e.code !== 'MODULE_NOT_FOUND') {
       logger.warn(`Route optionnelle erreur (${mount})`, { error: e.message });
@@ -157,44 +204,21 @@ function loadOptional(routePath, mount) {
    Rate-limit renforcé contre le brute-force
 ============================================================ */
 app.use('/api/auth', authLimiter, requireJson, authRoutes);
-app.use('/auth',     authLimiter, requireJson, authRoutes);  // alias rétrocompat
+app.use('/auth',     authLimiter, requireJson, authRoutes); // alias rétrocompat
 
 /* ============================================================
    SYSTÈME 1 : FUSION LINK (CONSERVÉ)
-   GET  /payment-success
-   POST /confirm-payment  ← rate-limit strict
-
 ============================================================ */
 app.use('/', paymentOnlineRoutes);
 app.use('/confirm-payment', paymentConfirmLimiter);
 
 /* ============================================================
    SYSTÈME 2 : FUSION PAY API (CONSERVÉ — PARALLÈLE)
-   POST /api/payment/fusion-pay
-   POST /api/payment/fusion-callback
-   GET  /api/payment/fusion-status/:token
-   GET  /api/payment/fusion-user/:userId
-   GET  /api/payment/fusion-return
-   GET  /api/payment/fusion-config
-   GET  /api/payment/fusion-link-url
 ============================================================ */
 app.use('/api/payment', paymentFusionRoutes);
 
 /* ============================================================
    SYSTÈME 3 : GENIUSPAY (PRIMAIRE)
-
-   Routes simples (nouvelles) :
-     POST /api/payment/geniuspay     → créer paiement, retourne checkout_url
-     POST /api/payment/webhook       → webhook GeniusPay (signature HMAC)
-
-   Routes avancées (existantes) :
-     POST /api/payment/geniuspay/create
-     POST /api/payment/geniuspay/webhook
-     GET  /api/payment/geniuspay/status/:paymentId
-     GET  /api/payment/geniuspay/user-status
-     GET  /api/payment/geniuspay/return
-     GET  /api/payment/geniuspay/config
-     GET  /api/payment/link
 ============================================================ */
 // Routes simples — POST /api/payment/geniuspay et POST /api/payment/webhook
 app.use('/api/payment', geniusPayLimiter, paymentRoutes);
@@ -202,24 +226,15 @@ app.use('/api/payment', webhookRoutes);
 
 // Routes avancées — /api/payment/geniuspay/*
 app.use('/api/payment/geniuspay', geniusPayLimiter, geniusPayRoutes);
-// GET /api/payment/link → défini dans geniusPayRoutes
 app.use('/api/payment', geniusPayRoutes);
 
 /* ============================================================
    SMS HYBRIDE (NOUVEAU — ADDITIONNEL)
-   POST /sms/hybrid/incoming  ← webhook universel hybride
-   GET  /sms/hybrid/aliases   ← lister les alias d'un utilisateur
-   GET  /sms/hybrid/status    ← statut du service
-   POST /sms/hybrid/test      ← test (non-production)
-   Priorité : flow hybride → fallback smsHandler existant
 ============================================================ */
 app.use('/sms/hybrid', smsHybridRoutes);
 
 /* ============================================================
    SMS WEBHOOKS (OFFLINE — EXISTANT — INCHANGÉ)
-   POST /sms/incoming
-   POST /sms/test
-   GET  /sms/commands
 ============================================================ */
 app.use('/sms', smsWebhookRoutes);
 
@@ -242,91 +257,85 @@ app.use('/admin', adminRoutes);
 /* ============================================================
    AUTRES ROUTES
 ============================================================ */
-app.use('/messages',     messageRoutes);
-app.use('/groups',       groupRoutes);
-app.use('/users',        userRoutes);
-app.use('/me',           meRoutes);
+app.use('/messages',      messageRoutes);
+app.use('/groups',        groupRoutes);
+app.use('/users',         userRoutes);
+app.use('/me',            meRoutes);
 app.use('/notifications', notifRoutes);
-app.use('/statistics',   statsRoutes);
+app.use('/statistics',    statsRoutes);
 
 /* ============================================================
    CONTACTS & ENVOI SMS
-   POST /add-contact
-   GET  /contacts/:userId
-   POST /send-sms
-   DELETE /contacts/:userId/:contactPhone
 ============================================================ */
 app.use('/', contactRoutes);
 
-loadOptional('./routes/audio',       '/audio');
-loadOptional('./routes/ads',         '/ads');
-loadOptional('./routes/companies',   '/companies');
-loadOptional('./routes/credits',     '/credits');
-loadOptional('./routes/smsCost',     '/sms-cost');
+loadOptional('./routes/audio',         '/audio');
+loadOptional('./routes/ads',           '/ads');
+loadOptional('./routes/companies',     '/companies');
+loadOptional('./routes/credits',       '/credits');
+loadOptional('./routes/smsCost',       '/sms-cost');
 loadOptional('./routes/transcription', '/transcription');
 loadOptional('./routes/subscriptions', '/subscriptions');
 
 /* ============================================================
    STATUT UTILISATEUR PREMIUM — GET /api/user/status
-   Retourne { premium: true/false } pour un userId donné.
-   Accessible sans authentification.
-   Utilise le controller paymentController (mémoire + Firestore).
 ============================================================ */
 const { getUserStatus } = require('./controllers/paymentController');
-app.get('/api/user/status', getUserStatus);
+app.get('/api/user/status', (req, res) => {
+  // Compatibilité req.cleanedQuery → patcher req.query temporairement si besoin
+  if (req.cleanedQuery && !req.query.userId && req.cleanedQuery.userId) {
+    // Injecter dans req.body en fallback si nécessaire
+    req._userId = req.cleanedQuery.userId;
+  }
+  return getUserStatus(req, res);
+});
 
 /* ============================================================
-   API STATUS
+   API STATUS — GET /api/status
 ============================================================ */
 app.get('/api/status', (req, res) => {
+  const gpConfigured = !!(
+    (process.env.GENIUSPAY_PUBLIC_KEY || process.env.GENIUSPAY_API_KEY) &&
+    (process.env.GENIUSPAY_SECRET_KEY || process.env.GENIUSPAY_API_SECRET)
+  );
+
+  let smsStatus = { activeProvider: 'none' };
+  try {
+    const { getProviderStatus } = require('./services/smsProvider');
+    smsStatus = getProviderStatus();
+  } catch (_) { /* non bloquant */ }
+
   res.json({
-    status : 'OmniSMS Backend v2.3 running',
-    port   : PORT,
-    env    : process.env.NODE_ENV || 'development',
-    payment: {
+    status  : 'OmniSMS Backend v2.4 running',
+    port    : PORT,
+    env     : process.env.NODE_ENV || 'development',
+    geniuspay: gpConfigured ? 'ACTIVE' : 'INACTIVE',
+    sms     : smsStatus.activeProvider !== 'none' ? `ACTIVE (${smsStatus.activeProvider})` : 'INACTIVE',
+    payment : {
       geniuspay: {
-        enabled: !!(process.env.GENIUSPAY_PUBLIC_KEY || process.env.GENIUSPAY_API_KEY),
+        enabled: gpConfigured,
+        status : gpConfigured ? 'ACTIVE' : 'INACTIVE (GENIUSPAY_PUBLIC_KEY / GENIUSPAY_SECRET_KEY manquants)',
         routes : [
-          'POST /api/payment/geniuspay      ← nouveau endpoint simple',
-          'POST /api/payment/webhook        ← nouveau webhook simple',
+          'POST /api/payment/geniuspay      ← créer paiement',
+          'POST /api/payment/webhook        ← webhook confirmation',
           'GET  /api/user/status?userId=XXX ← statut premium',
           'POST /api/payment/geniuspay/create',
-          'POST /api/payment/geniuspay/webhook',
-          'GET  /api/payment/geniuspay/status/:id',
           'GET  /api/payment/link',
         ],
-        status : (process.env.GENIUSPAY_PUBLIC_KEY || process.env.GENIUSPAY_API_KEY)
-          ? 'ACTIF' : 'INACTIF (GENIUSPAY_PUBLIC_KEY absent)',
       },
-      fusion_link: {
-        enabled: true,
-        routes : ['GET /payment-success', 'POST /confirm-payment'],
-        status : 'ACTIF',
-      },
-      fusion_pay: {
+      fusion_link: { enabled: true, status: 'ACTIVE' },
+      fusion_pay : {
         enabled: !!process.env.FUSION_PAY_API_URL,
-        routes : ['POST /api/payment/fusion-pay', 'POST /api/payment/fusion-callback', 'POST /api/payment/fusion-callback-api'],
-        status : process.env.FUSION_PAY_API_URL ? 'ACTIF' : 'INACTIF (FUSION_PAY_API_URL absent)',
+        status : process.env.FUSION_PAY_API_URL ? 'ACTIVE' : 'INACTIVE',
       },
-      sms_offline: { enabled: true },
     },
-    userStatus: 'GET /api/user/status?userId=XXX',
-    security: {
-      helmet      : true,
-      cors        : true,
-      rateLimit   : true,
-      slowDown    : true,
-      hpp         : true,
-      sanitize    : true,
-      compression : true,
-    },
+    smsProviders: smsStatus,
     time: new Date().toISOString(),
   });
 });
 
 /* ============================================================
    GESTIONNAIRE D'ERREURS GLOBAL
-   Ne jamais exposer les stack traces en production
 ============================================================ */
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
@@ -340,7 +349,6 @@ app.use((err, req, res, next) => {
     method : req.method,
   });
 
-  // Erreurs de validation du body JSON
   if (err.type === 'entity.too.large') {
     return res.status(413).json({ error: 'Corps de requête trop volumineux.', code: 'PAYLOAD_TOO_LARGE' });
   }
@@ -349,11 +357,11 @@ app.use((err, req, res, next) => {
     return res.status(400).json({ error: 'JSON invalide.', code: 'INVALID_JSON' });
   }
 
-  res.status(err.status || 500).json({
+  // Ne jamais exposer les stack traces en production
+  return res.status(err.status || 500).json({
     error    : 'Erreur interne du serveur.',
     code     : 'INTERNAL_ERROR',
     requestId,
-    // Stack uniquement en développement
     ...(process.env.NODE_ENV !== 'production' && { detail: err.message }),
   });
 });
@@ -373,46 +381,50 @@ app.use((req, res) => {
 ============================================================ */
 const server = http.createServer(app);
 
-// Timeouts pour éviter les connexions zombie
-server.keepAliveTimeout = 65000;   // > 60s (load balancer Render)
+server.keepAliveTimeout = 65000;
 server.headersTimeout   = 66000;
 
 server.listen(PORT, '0.0.0.0', () => {
-  logger.info('OmniSMS Backend démarré', {
-    port   : PORT,
-    env    : process.env.NODE_ENV || 'development',
-    node   : process.version,
-    fusionPay: !!process.env.FUSION_PAY_API_URL,
-  });
-
-  // Logs console lisibles pour Render
-  console.log('\n╔══════════════════════════════════════════════╗');
-  console.log('║       OmniSMS Backend v2.3 — Production     ║');
-  console.log('╚══════════════════════════════════════════════╝');
-  console.log(`🚀 Port    : ${PORT}`);
-  console.log(`🌍 ENV     : ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔥 Firebase : ${process.env.FIREBASE_SERVICE_ACCOUNT_JSON ? '✅ configuré' : '⚠️  absent'}`);
-  console.log(`💳 FusionPay: ${process.env.FUSION_PAY_API_URL ? '✅ actif' : '⏸  inactif'}`);
+  // Évaluer les statuts au démarrage
   const gpConfigured = !!(
     (process.env.GENIUSPAY_PUBLIC_KEY || process.env.GENIUSPAY_API_KEY) &&
     (process.env.GENIUSPAY_SECRET_KEY || process.env.GENIUSPAY_API_SECRET)
   );
-  console.log(`💰 GeniusPay: ${gpConfigured ? '✅ actif' : '⏸  inactif (GENIUSPAY_PUBLIC_KEY / GENIUSPAY_SECRET_KEY)'}`);
-  // Afficher le provider SMS actif
+
+  let smsProviderName = 'aucun';
   try {
     const { getProviderStatus } = require('./services/smsProvider');
     const sp = getProviderStatus();
-    console.log(`📱 SMS      : ${sp.activeProvider !== 'none' ? `✅ ${sp.activeProvider}` : '⚠️  aucun provider configuré'}`);
-  } catch { /* non bloquant */ }
-  console.log(`🔒 Sécurité : Helmet · CORS · Rate-limit · HPP · Sanitize`);
-  console.log(`👤 Contacts : POST /add-contact · GET /contacts/:id · POST /send-sms`);
-  console.log(`❤️  Health   : GET /health`);
+    smsProviderName = sp.activeProvider !== 'none' ? sp.activeProvider : 'aucun';
+  } catch (_) { /* non bloquant */ }
+
+  logger.info('OmniSMS Backend démarré', {
+    port      : PORT,
+    env       : process.env.NODE_ENV || 'development',
+    node      : process.version,
+    geniuspay : gpConfigured ? 'ACTIVE' : 'INACTIVE',
+    sms       : smsProviderName !== 'aucun' ? `ACTIVE (${smsProviderName})` : 'INACTIVE',
+  });
+
+  // Logs console lisibles pour Render
+  console.log('\n╔══════════════════════════════════════════════════╗');
+  console.log('║       OmniSMS Backend v2.4 — Production         ║');
+  console.log('╚══════════════════════════════════════════════════╝');
+  console.log(`🚀 Port      : ${PORT}`);
+  console.log(`🌍 ENV       : ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔥 Firebase  : ${process.env.FIREBASE_SERVICE_ACCOUNT_JSON ? '✅ configuré' : '❌ FIREBASE_SERVICE_ACCOUNT_JSON absent'}`);
+  console.log(`🔑 JWT       : ${process.env.JWT_SECRET ? '✅ configuré' : '❌ JWT_SECRET absent'}`);
+  console.log(`💰 GeniusPay : ${gpConfigured ? '✅ ACTIVE' : '⚠️  INACTIVE (GENIUSPAY_PUBLIC_KEY / GENIUSPAY_SECRET_KEY)'}`);
+  console.log(`📱 SMS       : ${smsProviderName !== 'aucun' ? `✅ ACTIVE (${smsProviderName})` : '⚠️  INACTIVE (Twilio / AfricasTalking / Orange)'}`);
+  console.log(`💳 FusionPay : ${process.env.FUSION_PAY_API_URL ? '✅ actif' : '⏸  inactif'}`);
+  console.log(`🔒 Sécurité  : Helmet · CORS · Rate-limit · HPP · Sanitize`);
+  console.log(`❤️  Health    : GET /health`);
+  console.log(`📊 Status    : GET /`);
   console.log('');
 });
 
 /* ============================================================
    GRACEFUL SHUTDOWN
-   Arrêt propre — termine les requêtes en cours avant de quitter
 ============================================================ */
 let isShuttingDown = false;
 
@@ -423,7 +435,6 @@ function gracefulShutdown(signal) {
   logger.info(`Signal ${signal} reçu — arrêt propre en cours…`);
   console.log(`\n🛑 ${signal} reçu. Arrêt propre...`);
 
-  // Arrêter d'accepter de nouvelles connexions
   server.close((err) => {
     if (err) {
       logger.error('Erreur durant le shutdown', { error: err.message });
@@ -434,7 +445,6 @@ function gracefulShutdown(signal) {
     process.exit(0);
   });
 
-  // Forcer l'arrêt après 30s si des connexions persistent
   setTimeout(() => {
     logger.warn('Shutdown forcé après 30s.');
     process.exit(1);
@@ -452,16 +462,11 @@ process.on('uncaughtException', (err) => {
     error: err.message,
     stack: err.stack,
   });
-  // Arrêt obligatoire — état indéterminé
   process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Promise rejetée non gérée', {
-    reason: String(reason),
-    promise: String(promise),
-  });
-  // Ne pas exit — loguer uniquement (peut être une lib tierce)
+process.on('unhandledRejection', (reason) => {
+  logger.error('Promise rejetée non gérée', { reason: String(reason) });
 });
 
 module.exports = app;

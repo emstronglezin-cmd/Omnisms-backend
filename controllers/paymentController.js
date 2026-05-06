@@ -460,7 +460,9 @@ async function handleSuccessfulPayment({ paymentId, userId, orderId, amount, sta
  * @param {express.Response} res
  */
 async function getUserStatus(req, res) {
-  const userId = (req.query.userId || req.body?.userId || '').trim();
+  // req.cleanedQuery = sanitized query (req.query is getter-only in Node/Express 5)
+  const cq = req.cleanedQuery || {};
+  const userId = (cq.userId || (req.query && req.query.userId) || req.body?.userId || req._userId || '').trim();
 
   if (!userId) {
     return res.status(400).json({

@@ -173,7 +173,8 @@ router.post('/incoming', async (req, res) => {
  * Réponse : { phone, aliases: [{alias, targetPhone, targetName, createdAt}] }
  */
 router.get('/aliases', async (req, res) => {
-  const { from } = req.query;
+  const cqH = req.cleanedQuery || {};
+  const from = cqH.from || (req.query && req.query.from);
 
   if (!from) {
     return res.status(400).json({
