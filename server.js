@@ -4,7 +4,7 @@
  * Production-ready · Express 4 · Firebase graceful · Infobip SMS
  */
 
-require('dotenv').config();
+require('dotenv').config({ path: process.env.NODE_ENV === 'production' ? '/etc/secrets/.env' : '.env' });
 
 const express = require('express');
 const http    = require('http');
@@ -35,7 +35,6 @@ app.use(compressionMiddleware);
 app.use(helmetMiddleware);
 app.use(corsMiddleware);
 
-// Preflight OPTIONS — use explicit path pattern (Express 4 compatible)
 app.options(/.*/, corsMiddleware);
 
 app.use(requestLogger);
@@ -47,7 +46,6 @@ app.use(express.json({
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use(hppMiddleware);
 
-// Input sanitization — writes req.cleanedQuery, never mutates req.query
 app.use(inputSanitizer);
 
 app.use(globalSlowDown);
@@ -95,7 +93,6 @@ app.get('/health', (_req, res) => {
   let smsStatus = { activeProvider: 'none', twilio: {}, africastalking: {}, orange: {} };
   try { smsStatus = require('./services/smsProvider').getProviderStatus(); } catch (_) {}
 
-  // Server is healthy even without Firebase — routes just return 503 until configured
   res.status(200).json({
     status  : 'ok',
     service : 'OmniSMS Backend',
@@ -236,12 +233,11 @@ app.get('/api/status', (_req, res) => {
 });
 
 /* ── Global error handler ────────────────────────────────── */
-// eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   const requestId = req.requestId || 'unknown';
   logger.error('Unhandled error', { requestId, message: err.message, path: req.path, method: req.method });
 
-  if (err.type === 'entity.too.large')   return res.status(413).json({ error: 'Payload too large.',  code: 'PAYLOAD_TOO_LARGE', requestId });
+  if (err.type === 'entity.too.large')    return res.status(413).json({ error: 'Payload too large.',  code: 'PAYLOAD_TOO_LARGE', requestId });
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON.',       code: 'INVALID_JSON',      requestId });
 
   return res.status(err.status || 500).json({
@@ -281,10 +277,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('╚══════════════════════════════════════════════════╝');
   console.log('🚀 Port      : ' + PORT);
   console.log('🌍 ENV       : ' + (process.env.NODE_ENV || 'development'));
-  console.log('🔥 Firebase  : ' + (firebaseOk ? '✅ configured' : '⚠️  FIREBASE_SERVICE_ACCOUNT_JSON missing (routes return 503)'));
+  console.log('🔥 Firebase  : ' + (firebaseOk ? '✅ configured' : '⚠️  FIREBASE_SERVICE_ACCOUNT_JSON missing'));
   console.log('🔑 JWT       : ' + (process.env.JWT_SECRET ? '✅ configured' : '❌ JWT_SECRET missing'));
   console.log('💰 GeniusPay : ' + (gpConfigured ? '✅ ACTIVE' : '⚠️  INACTIVE'));
-  console.log('📡 Infobip   : ' + (infobipOk    ? '✅ ACTIVE' : '⚠️  INACTIVE (set INFOBIP_API_KEY + INFOBIP_BASE_URL)'));
+  console.log('📡 Infobip   : ' + (infobipOk    ? '✅ ACTIVE' : '⚠️  INACTIVE'));
   console.log('📱 SMS       : ' + (smsName !== 'none' ? '✅ ACTIVE (' + smsName + ')' : '⚠️  INACTIVE'));
   console.log('🔒 Security  : Helmet · CORS · Rate-limit · HPP · Sanitize');
   console.log('❤️  Health    : GET /health');
