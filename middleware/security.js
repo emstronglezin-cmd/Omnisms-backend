@@ -23,10 +23,15 @@ const slowDown    = require('express-slow-down');
 const compression = require('compression');
 
 // ── Origines CORS autorisées ─────────────────────────────────
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-const allowedOrigins = CORS_ORIGIN === '*'
-  ? true
-  : CORS_ORIGIN.split(',').map(o => o.trim());
+const allowedOrigins = [
+  'https://omnisms.netlify.app',
+  'https://omnisms.web.app',
+  'http://localhost:3000',
+  'http://localhost:5000',
+  ...(process.env.CORS_ORIGIN
+    ? process.env.CORS_ORIGIN.split(',').map(o => o.trim())
+    : []),
+];
 
 // ── 1. Helmet — headers HTTP sécurisés ───────────────────────
 const helmetMiddleware = helmet({
@@ -52,7 +57,14 @@ const helmetMiddleware = helmet({
 
 // ── 2. CORS ───────────────────────────────────────────────────
 const corsMiddleware = cors({
-  origin        : allowedOrigins,
+  origin: (origin, callback) => {
+    // Autoriser les requêtes sans origine (mobile apps, Postman, curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('CORS non autorisé pour : ' + origin), false);
+  },
   methods       : ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: [
     'Content-Type', 'Authorization', 'x-admin-key',
@@ -130,14 +142,8 @@ const globalSlowDown = slowDown({
 });
 
 // ── 6. Input sanitizer (FIX CRITIQUE) ────────────────────────
-/**
- * Supprime les caractères de contrôle dangereux des strings.
- * Traite récursivement les objets et tableaux.
- * Ne mute JAMAIS req.query directement (getter-only dans Express 5 / Node 18+).
- */
 function deepSanitizeStrings(obj) {
   if (typeof obj === 'string') {
-    // Supprimer null bytes et caractères de contrôle (sauf \n, \r, \t)
     return obj.replace(/\x00/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
   }
   if (Array.isArray(obj)) return obj.map(deepSanitizeStrings);
@@ -151,32 +157,15 @@ function deepSanitizeStrings(obj) {
   return obj;
 }
 
-/**
- * Middleware de sanitization des inputs.
- *
- * ⚠️  IMPORTANT — req.query est un getter-only dans Node.js/Express 5 :
- *     On ne peut PAS faire : req.query = {...}  → TypeError
- *
- * Stratégie corrigée :
- *   - req.body        → muté directement (fonctionne, c'est une propriété normale)
- *   - req.query       → copié dans req.cleanedQuery (immuable dans les routes)
- *   - req.cleanedParams→ copié depuis req.params (idem)
- *
- * Dans les routes, lire la query via : req.cleanedQuery || req.query
- */
 function inputSanitizer(req, _res, next) {
-  // Sanitiser le body (propriété mutable — OK)
   if (req.body && typeof req.body === 'object') {
     try {
       req.body = deepSanitizeStrings(req.body);
-    } catch (_) {
-      // Silencieux — ne jamais bloquer sur la sanitization
-    }
+    } catch (_) {}
   }
 
-  // Sanitiser la query — SANS muter req.query
   try {
-    const rawQuery = req.query; // lecture seule — getter
+    const rawQuery = req.query;
     if (rawQuery && typeof rawQuery === 'object') {
       req.cleanedQuery = deepSanitizeStrings({ ...rawQuery });
     } else {
@@ -186,7 +175,6 @@ function inputSanitizer(req, _res, next) {
     req.cleanedQuery = {};
   }
 
-  // Sanitiser les params de route (ex: :userId)
   try {
     if (req.params && typeof req.params === 'object') {
       req.cleanedParams = deepSanitizeStrings({ ...req.params });
@@ -219,14 +207,6 @@ function requireJson(req, res, next) {
 }
 
 // ── Helper pour les routes : lire la query sanitisée ─────────
-/**
- * Lire un paramètre de query de façon sûre.
- * Utilise req.cleanedQuery si disponible, sinon req.query en fallback.
- *
- * @param {object} req   - Requête Express
- * @param {string} key   - Nom du paramètre
- * @returns {string|undefined}
- */
 function getQueryParam(req, key) {
   const cleaned = req.cleanedQuery || {};
   const raw     = req.query        || {};
