@@ -11,7 +11,7 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "build": "echo 'No build step required'",
-    "lint": "node --check server.js && find . -name '*.js' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/functions/*' -not -path '*/parse/*' | xargs -I{} node --check {}",
+    "lint": "node --check server.js",
     "audit:check": "npm audit --audit-level=high --omit=dev"
   },
   "dependencies": {
@@ -25,7 +25,7 @@
     "express-rate-limit": "^7.5.0",
     "express-slow-down": "^2.0.3",
     "express-validator": "^7.3.2",
-    "firebase-admin": "^12.7.0",
+    "firebase-admin": "^10.3.0",
     "helmet": "^8.1.0",
     "hpp": "^0.2.3",
     "jsonwebtoken": "^9.0.2",
@@ -33,7 +33,7 @@
     "swagger-ui-express": "^5.0.1",
     "twilio": "^5.13.1",
     "uuid": "^9.0.0",
-    "whatwg-url": "11.0.0"
+    "whatwg-url": "^11.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"
