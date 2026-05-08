@@ -21,18 +21,19 @@
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
-    "express": "^5.2.1",
-    "express-rate-limit": "^8.3.2",
-    "express-slow-down": "^3.1.0",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "express-slow-down": "^2.0.3",
     "express-validator": "^7.3.2",
-    "firebase-admin": "^10.3.0",
+    "firebase-admin": "^12.7.0",
     "helmet": "^8.1.0",
     "hpp": "^0.2.3",
     "jsonwebtoken": "^9.0.2",
-    "multer": "^2.1.1",
+    "multer": "^1.4.5-lts.1",
     "swagger-ui-express": "^5.0.1",
     "twilio": "^5.13.1",
-    "uuid": "^13.0.0"
+    "uuid": "^9.0.0",
+    "whatwg-url": "11.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"
