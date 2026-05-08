@@ -123,7 +123,6 @@ app.get('/health', (_req, res) => {
 
 /* ── Route imports ───────────────────────────────────────── */
 const authRoutes          = require('./routes/auth');
-const paymentOnlineRoutes = require('./routes/payment.online');
 const paymentFusionRoutes = require('./routes/payment.fusionpay');
 const smsWebhookRoutes    = require('./routes/sms.webhook');
 const adminRoutes         = require('./routes/admin');
@@ -152,15 +151,11 @@ function loadOptional(routePath, mount) {
   }
 }
 
-/* ── Auth routes ─────────────────────────────────────────── */
+/* ── Auth routes EN PREMIER ──────────────────────────────── */
 app.use('/api/auth', authLimiter, requireJson, authRoutes);
 app.use('/auth',     authLimiter, requireJson, authRoutes);
 
-/* ── Payment — Fusion Link (legacy, kept) ────────────────── */
-app.use('/', paymentOnlineRoutes);
-app.use('/confirm-payment', paymentConfirmLimiter);
-
-/* ── Payment — Fusion Pay API (parallel legacy) ──────────── */
+/* ── Payment — Fusion Pay API ────────────────────────────── */
 app.use('/api/payment', paymentFusionRoutes);
 
 /* ── Payment — GeniusPay (primary) ──────────────────────── */
@@ -169,13 +164,13 @@ app.use('/api/payment', webhookRoutes);
 app.use('/api/payment/geniuspay', geniusPayLimiter, geniusPayRoutes);
 app.use('/api/payment', geniusPayRoutes);
 
-/* ── SMS — Infobip (new) ─────────────────────────────────── */
+/* ── SMS — Infobip ───────────────────────────────────────── */
 app.use('/', infobipRoutes);
 
 /* ── SMS — Hybrid (alias flow) ───────────────────────────── */
 app.use('/sms/hybrid', smsHybridRoutes);
 
-/* ── SMS — Webhooks (Africa's Talking / Twilio / Orange) ─── */
+/* ── SMS — Webhooks ──────────────────────────────────────── */
 app.use('/sms', smsWebhookRoutes);
 
 app.post('/webhooks/africastalking', (req, res, next) => {
@@ -207,6 +202,9 @@ loadOptional('./routes/credits',       '/credits');
 loadOptional('./routes/smsCost',       '/sms-cost');
 loadOptional('./routes/transcription', '/transcription');
 loadOptional('./routes/subscriptions', '/subscriptions');
+loadOptional('./routes/payment.online','/payment-online');
+loadOptional('./routes/payments.start','/payments-start');
+loadOptional('./routes/offline.payment','/offline-payment');
 
 /* ── Premium user status ─────────────────────────────────── */
 const { getUserStatus } = require('./controllers/paymentController');
