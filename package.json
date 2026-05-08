@@ -11,8 +11,10 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "build": "echo 'No build step required'",
-    "lint": "node --check server.js",
     "audit:check": "npm audit --audit-level=high --omit=dev"
+  },
+  "overrides": {
+    "whatwg-url": "11.0.0"
   },
   "dependencies": {
     "africastalking": "^0.7.4",
@@ -33,7 +35,7 @@
     "swagger-ui-express": "^5.0.1",
     "twilio": "^5.13.1",
     "uuid": "^9.0.0",
-    "whatwg-url": "^11.0.0"
+    "whatwg-url": "11.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"
