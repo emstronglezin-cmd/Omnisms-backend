@@ -1,7 +1,7 @@
 {
   "name": "omnisms-backend",
-  "version": "2.2.0",
-  "description": "OmniSMS Backend — Production-ready Node.js Express API with Firebase + Fusion Pay",
+  "version": "4.0.0",
+  "description": "OmniSMS Backend — Production-ready Node.js/Express · Firebase · Socket.IO · Infobip · GeniusPay",
   "main": "server.js",
   "engines": {
     "node": ">=18.0.0",
@@ -17,9 +17,9 @@
     "whatwg-url": "11.0.0"
   },
   "dependencies": {
-    "africastalking": "^0.7.4",
     "axios": "^1.15.0",
     "bcrypt": "^6.0.0",
+    "bullmq": "^5.0.0",
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
@@ -28,12 +28,15 @@
     "express-slow-down": "^2.0.3",
     "express-validator": "^7.3.2",
     "firebase-admin": "^10.3.0",
+    "fluent-ffmpeg": "^2.1.3",
     "helmet": "^8.1.0",
     "hpp": "^0.2.3",
+    "ioredis": "^5.3.2",
     "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.1",
+    "phone": "^3.1.50",
+    "socket.io": "^4.8.1",
     "swagger-ui-express": "^5.0.1",
-    "twilio": "^5.13.1",
     "uuid": "^9.0.0",
     "whatwg-url": "11.0.0"
   },

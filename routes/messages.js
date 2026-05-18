@@ -34,14 +34,13 @@ router.post('/send', authenticate, async (req, res) => {
 
     const ref = await db.collection('messages').add(msgData);
 
-    // Envoi SMS via Africa's Talking si type 'text' et service disponible
+    // Notification temps réel via Socket.IO (non bloquant)
     if (type === 'text') {
       try {
-        const { sendSms } = require('../services/africasTalking');
-        await sendSms(receiverId, content);
-      } catch (smsErr) {
-        // Non bloquant — le message est sauvegardé même si SMS échoue
-        logger.warn('SMS Africa\'s Talking échoué', { error: smsErr.message, receiverId });
+        const { emitToUser } = require('../services/socketService');
+        emitToUser(receiverId, 'message:receive', { id: ref.id, ...msgData });
+      } catch (_) {
+        // Socket.IO peut ne pas être initialisé — non bloquant
       }
     }
 

@@ -26,18 +26,10 @@ const router = express.Router();
 // ─────────────────────────────────────────────────────────────
 let sendSmsFunc = null;
 try {
-  const africasTalking = require('../services/africasTalking');
-  sendSmsFunc = africasTalking.sendSms || africasTalking.sendSMS || null;
-} catch (e) {
-  // africasTalking non disponible — l'envoi SMS sera ignoré
-}
-if (!sendSmsFunc) {
-  try {
-    const smsProvider = require('../services/smsProvider');
-    sendSmsFunc = smsProvider.sendSMS || smsProvider.sendSms || null;
-  } catch (e) {
-    // smsProvider non disponible
-  }
+  const smsProvider = require('../services/smsProvider');
+  sendSmsFunc = smsProvider.sendSMS || smsProvider.sendSms || null;
+} catch (_) {
+  // smsProvider non disponible — l'envoi SMS sera ignoré
 }
 
 // ─────────────────────────────────────────────────────────────
