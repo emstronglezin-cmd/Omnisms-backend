@@ -30,8 +30,8 @@ function validate(req, res) {
   return null;
 }
 
-// Lien d'abonnement GeniusPay
-const SUBSCRIPTION_LINK = process.env.GENIUSPAY_PAYMENT_LINK
+// Lien d'abonnement LeekPay
+const SUBSCRIPTION_LINK = process.env.FRONTEND_URL
   || `${process.env.BACKEND_URL || 'https://omnisms-backend.onrender.com'}/api/payment/link`;
 
 // ─────────────────────────────────────────────────────────────

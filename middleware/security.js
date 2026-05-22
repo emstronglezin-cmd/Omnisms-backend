@@ -114,22 +114,13 @@ const paymentConfirmLimiter = rateLimit({
   message        : { error: 'Trop de tentatives de confirmation. Attendez 5 minutes.', code: 'PAYMENT_RATE_LIMIT' },
 });
 
-/** Fusion Pay initiation : 10 req / 1 min par IP */
-const fusionPayLimiter = rateLimit({
+/** LeekPay initiation : 10 req / 1 min par IP */
+const leekPayLimiter = rateLimit({
   windowMs       : 60 * 1000,
   max            : 10,
   standardHeaders: true,
   legacyHeaders  : false,
-  message        : { error: 'Trop de tentatives. Réessayez dans 1 minute.', code: 'FUSION_PAY_RATE_LIMIT' },
-});
-
-/** GeniusPay initiation : 10 req / 1 min par IP */
-const geniusPayLimiter = rateLimit({
-  windowMs       : 60 * 1000,
-  max            : 10,
-  standardHeaders: true,
-  legacyHeaders  : false,
-  message        : { error: 'Trop de tentatives GeniusPay. Réessayez dans 1 minute.', code: 'GENIUSPAY_RATE_LIMIT' },
+  message        : { error: 'Trop de tentatives de paiement. Réessayez dans 1 minute.', code: 'PAYMENT_RATE_LIMIT' },
 });
 
 // ── 5. Slow-down (délai progressif avant blocage) ─────────────
@@ -222,8 +213,7 @@ module.exports = {
   globalSlowDown,
   authLimiter,
   paymentConfirmLimiter,
-  fusionPayLimiter,
-  geniusPayLimiter,
+  leekPayLimiter,
   inputSanitizer,
   requireJson,
   getQueryParam,

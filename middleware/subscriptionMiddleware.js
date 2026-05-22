@@ -17,8 +17,8 @@
 const db = require('../config/firebase');
 const { logger } = require('./logger');
 
-const SUBSCRIPTION_LINK = process.env.GENIUSPAY_PAYMENT_LINK
-  || `${process.env.BACKEND_URL || 'https://omnisms-backend.onrender.com'}/api/payment/link`;
+const SUBSCRIPTION_LINK = process.env.FRONTEND_URL
+  || `${process.env.BACKEND_URL || 'https://omnisms-backend.onrender.com'}/api/payment/leekpay`;
 
 /**
  * Middleware — vérifie isSubscribed dans Firestore.

@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════════════
-# OmniSMS Backend — Configuration Render.com
+# OmniSMS Backend — Configuration Render.com — v4.1
 # ════════════════════════════════════════════════════════════════
 #
 # ⚙️  Setup initial :
@@ -9,12 +9,11 @@
 #  4. Ajoutez les variables d'environnement sensibles dans
 #     Dashboard → Service → Settings → Environment
 #
-# 🔄 Auto-deploy via GitHub Actions :
-#  → Créer un Deploy Hook dans Render :
-#     Dashboard → Service → Settings → Deploy Hook → Create Hook
-#  → Copier l'URL et l'ajouter dans GitHub :
-#     Repo → Settings → Secrets → Actions → RENDER_DEPLOY_HOOK_URL
-#  → Chaque push sur main déclenchera un déploiement automatique
+# 🔄 Auto-deploy : chaque push sur main déclenche un redéploiement
+#
+# 💳 Paiement : LeekPay.me (Mobile Money + Carte)
+#   Webhook URL : https://omnisms-backend.onrender.com/api/payment/webhook/leekpay
+#   Configurer dans : https://www.leekpay.me → Dashboard → Clés API
 #
 # 📊 Health check : GET /health
 # ════════════════════════════════════════════════════════════════
@@ -43,14 +42,16 @@ services:
       - key: LOG_LEVEL
         value: info     # debug | info | warn | error
 
-      # ── URL du backend ─────────────────────────────────────
-      # Render injecte RENDER_EXTERNAL_URL automatiquement.
-      # Sinon, mettre l'URL manuellement (ex: omnisms-backend.onrender.com)
+      # ── URLs ───────────────────────────────────────────────
       - key: BACKEND_URL
         fromService:
           type: web
           name: omnisms-backend
           property: host
+
+      # URL du frontend (redirection après paiement réussi/annulé)
+      - key: FRONTEND_URL
+        sync: false     # https://omnisms.netlify.app ou GitHub Pages
 
       # ── Variables sensibles (saisir manuellement dans Render) ──
 
@@ -69,68 +70,70 @@ services:
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
 
-      # ── SYSTÈME 3 : GeniusPay (PRIMAIRE) ──────────────────
-      # Clé publique GeniusPay (header X-API-Key)
-      - key: GENIUSPAY_PUBLIC_KEY
+      # ── LeekPay (Paiements — Mobile Money & Carte) ─────────
+      # Créez votre compte : https://www.leekpay.me/register
+      # Dashboard → Clés API → Nouvelle clé API
+
+      # Clé publique (pk_live_xxx) — aussi utilisée pour signature webhook
+      - key: LEEKPAY_API_KEY
         sync: false
 
-      # Clé secrète GeniusPay (header X-API-Secret) — JAMAIS côté client
-      - key: GENIUSPAY_SECRET_KEY
+      # Clé secrète (sk_live_xxx) — JAMAIS exposée côté client
+      - key: LEEKPAY_SECRET_KEY
         sync: false
 
-      # Optionnel mais recommandé : secret HMAC pour valider les webhooks
-      # Configurer aussi dans le dashboard GeniusPay
-      - key: GENIUSPAY_WEBHOOK_SECRET
+      # URL base API LeekPay (ne pas modifier sauf sandbox)
+      - key: LEEKPAY_BASE_URL
+        value: https://leekpay.fr
+
+      # Secret webhook optionnel (si vide, LEEKPAY_API_KEY est utilisée)
+      - key: LEEKPAY_WEBHOOK_SECRET
         sync: false
 
-      # Aliases pour compatibilité (acceptés aussi par le backend)
-      - key: GENIUSPAY_API_KEY
+      # Montant abonnement Premium (défaut 2000)
+      - key: LEEKPAY_PREMIUM_AMOUNT
+        value: "2000"
+
+      # Devise (XOF | EUR | USD)
+      - key: LEEKPAY_PREMIUM_CURRENCY
+        value: XOF
+
+      # ── Redis (BullMQ + Async Jobs) ──────────────────────────
+      # Render → Add-ons → Redis (plan gratuit disponible)
+      - key: REDIS_URL
         sync: false
 
-      - key: GENIUSPAY_API_SECRET
+      # ── Infobip SMS ─────────────────────────────────────────
+      - key: INFOBIP_API_KEY
         sync: false
 
-      # ── SYSTÈME 2 : Fusion Pay API (CONSERVÉ — PARALLÈLE) ─────
-      - key: FUSION_PAY_API_URL
+      - key: INFOBIP_BASE_URL
         sync: false
 
-      - key: FUSION_PAY_API_KEY
-        sync: false
-
-      - key: FUSION_PAY_APP_ID
+      - key: INFOBIP_SENDER_ID
         value: OmniSMS
 
-      - key: FUSION_PAY_WEBHOOK_SECRET
-        sync: false     # Optionnel — pour valider les signatures webhook
-
-      # ── SMS Providers (optionnels) ─────────────────────────
-      - key: AFRICASTALKING_API_KEY
+      # ── Transcription Audio (Faster-Whisper) ─────────────────
+      - key: WHISPER_SERVICE_URL
         sync: false
 
-      - key: AFRICASTALKING_USERNAME
+      - key: WHISPER_MODEL
+        value: small
+
+      - key: WHISPER_LANGUAGE
+        value: fr
+
+      - key: WHISPER_DEVICE
+        value: cpu
+
+      # ── Téléphonie ───────────────────────────────────────────
+      - key: DEFAULT_PHONE_COUNTRY
+        value: BF
+
+      # UIDs Firebase des admins (séparés par virgule)
+      - key: ADMIN_UIDS
         sync: false
-
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-
-      - key: TWILIO_PHONE
-        sync: false
-
-      - key: TWILIO_PHONE_NUMBER
-        sync: false     # Alias pour TWILIO_PHONE (compatibilité smsProvider.js)
-
-      - key: ORANGE_CLIENT_ID
-        sync: false
-
-      - key: ORANGE_CLIENT_SECRET
-        sync: false
-
-      - key: ORANGE_SENDER_ID
-        sync: false     # Optionnel — numéro expéditeur Orange
 
       # ── CORS ───────────────────────────────────────────────
       - key: CORS_ORIGIN
-        value: "*"      # Remplacer par l'URL Flutter/frontend en production
+        value: "https://omnisms.netlify.app,https://omnisms.web.app"
