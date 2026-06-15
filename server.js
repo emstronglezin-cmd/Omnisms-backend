@@ -1,14 +1,16 @@
 'use strict';
 /**
- * OmniSMS Backend — v4.1
+ * OmniSMS Backend — v4.2
  *
  * Production-ready · Express · Socket.IO · Firebase graceful degradation
- * Payments  : LeekPay.me (Mobile Money + Carte)
- * SMS       : Infobip only
- * Realtime  : Socket.IO (messages, typing, online, seen)
- * Audio     : Upload + Streaming + Transcription Faster-Whisper
- * Queue     : BullMQ + Redis (inline fallback si Redis absent)
- * Auth      : Firebase verifyIdToken + JWT fallback
+ * Payments      : LeekPay.me (Mobile Money + Carte)
+ * SMS Outbound  : Infobip POST /api/sms/send
+ * SMS Inbound   : Infobip Webhook POST /api/webhooks/infobip/inbound → Firestore + Socket.IO
+ * Messages      : GET /api/messages (conversations), GET /api/messages/:id, POST /api/messages/send
+ * Transcription : POST /api/transcription (Faster-Whisper async BullMQ)
+ * Realtime      : Socket.IO v4 (new_message, message:receive, transcription:update)
+ * Queue         : BullMQ + Redis (inline fallback si Redis absent)
+ * Auth          : Firebase verifyIdToken + JWT fallback
  */
 
 require('dotenv').config({
@@ -101,7 +103,7 @@ app.get('/', (_req, res) => {
   res.status(200).json({
     status   : 'ok',
     service  : 'OmniSMS Backend',
-    version  : '4.1.0',
+    version  : '4.2.0',
     auth     : true,
     payments : lpOk,
     sms      : infobipOk,
@@ -126,7 +128,7 @@ app.get('/health', (_req, res) => {
   res.status(200).json({
     status  : 'ok',
     service : 'OmniSMS Backend',
-    version : '4.1.0',
+    version : '4.2.0',
     uptime  : Math.round(process.uptime()),
     time    : new Date().toISOString(),
     checks  : {
@@ -139,34 +141,55 @@ app.get('/health', (_req, res) => {
     },
     queue   : queueStatus,
     routes  : {
-      auth       : ['POST /api/auth/register', 'POST /api/auth/login', 'POST /api/auth/google', 'GET /api/auth/me'],
-      contacts   : ['POST /api/contacts/sync', 'POST /api/contacts/add', 'GET /api/contacts', 'DELETE /api/contacts/:phone', 'GET /api/contacts/check/:phone'],
-      messages   : ['POST /api/messages/send', 'GET /api/messages/conversation/:uid', 'GET /api/messages/conversations', 'PUT /api/messages/:id/read', 'DELETE /api/messages/:id'],
-      audio      : ['POST /api/audio/upload', 'POST /api/audio/transcribe/:id', 'GET /api/audio/stream/:filename', 'GET /api/audio/:id'],
-      payment    : [
+      auth          : ['POST /api/auth/register', 'POST /api/auth/login', 'POST /api/auth/google', 'GET /api/auth/me'],
+      contacts      : ['POST /api/contacts/sync', 'POST /api/contacts/add', 'GET /api/contacts', 'DELETE /api/contacts/:phone', 'GET /api/contacts/check/:phone'],
+      messages      : [
+        'GET  /api/messages                     → liste conversations (paginé)',
+        'GET  /api/messages/:conversationId      → historique conversation',
+        'POST /api/messages/send                 → envoyer message (+ SMS Infobip si sendSms=true)',
+        'GET  /api/messages/conversations        → alias',
+        'GET  /api/messages/conversation/:uid    → rétrocompat',
+        'PUT  /api/messages/:id/read',
+        'DELETE /api/messages/:id',
+      ],
+      transcription : [
+        'POST /api/transcription                 → upload + transcription async (BullMQ)',
+        'GET  /api/transcription/:id             → statut + résultat',
+        'GET  /api/transcription/service/status  → état Faster-Whisper',
+      ],
+      audio         : ['POST /api/audio/upload', 'POST /api/audio/transcribe/:id', 'GET /api/audio/stream/:filename', 'GET /api/audio/:id'],
+      sms           : [
+        'POST /api/sms/send                           → envoi SMS sortant',
+        'POST /api/webhooks/infobip/inbound           → SMS entrants (webhook Infobip)',
+        'GET  /api/webhooks/infobip/inbound/status    → état du webhook',
+        'POST /webhooks/infobip                       → rétrocompat',
+        'GET  /api/sms/infobip/status',
+      ],
+      payment       : [
         'POST /api/payment/leekpay',
         'POST /api/payment/webhook/leekpay',
         'GET  /api/payment/status/:transactionId',
         'GET  /api/payment/user-status',
       ],
-      sms        : ['POST /api/sms/send', 'POST /webhooks/infobip', 'GET /api/sms/infobip/status'],
-      realtime   : ['ws:// Socket.IO — connect with { auth: { token } }'],
-      health     : ['GET /', 'GET /health', 'GET /api/status'],
+      realtime      : ['ws:// Socket.IO — events: new_message, message:receive, transcription:update, sms:inbound'],
+      health        : ['GET /', 'GET /health', 'GET /api/status'],
     },
   });
 });
 
 /* ── Route imports ───────────────────────────────────────── */
-const authRoutes      = require('./routes/auth');
-const leekPayRoutes   = require('./routes/payment.leekpay');
-const webhookRoutes   = require('./routes/webhook');
-const infobipRoutes   = require('./routes/sms.infobip');
-const adminRoutes     = require('./routes/admin');
-const groupRoutes     = require('./routes/groups');
-const userRoutes      = require('./routes/users');
-const meRoutes        = require('./routes/me');
-const notifRoutes     = require('./routes/notifications');
-const statsRoutes     = require('./routes/statistics');
+const authRoutes         = require('./routes/auth');
+const leekPayRoutes      = require('./routes/payment.leekpay');
+const webhookRoutes      = require('./routes/webhook');
+const infobipRoutes      = require('./routes/sms.infobip');
+const infobipInboundRoutes = require('./routes/infobip.inbound');
+const transcriptionRoutes  = require('./routes/transcription.v2');
+const adminRoutes        = require('./routes/admin');
+const groupRoutes        = require('./routes/groups');
+const userRoutes         = require('./routes/users');
+const meRoutes           = require('./routes/me');
+const notifRoutes        = require('./routes/notifications');
+const statsRoutes        = require('./routes/statistics');
 
 // v2 — nouvelles routes
 const contactsV2Routes = require('./routes/contacts.v2');
@@ -198,6 +221,12 @@ app.use('/api/messages', messagesV2Routes);
 
 /* ── Audio v2 ────────────────────────────────────────────── */
 app.use('/api/audio', audioV2Routes);
+
+/* ── Transcription v2 (Faster-Whisper) ──────────────────── */
+app.use('/api/transcription', transcriptionRoutes);
+
+/* ── Infobip webhooks entrants ───────────────────────────── */
+app.use('/api/webhooks', infobipInboundRoutes);
 
 /* ── LeekPay payments ─────────────────────────────────────── */
 app.use('/api/payment', leekPayLimiter, leekPayRoutes);
@@ -238,8 +267,8 @@ app.get('/api/status', (_req, res) => {
   try { queue = require('./services/queueService').getQueueStatus(); } catch (_) {}
 
   res.json({
-    status   : 'OmniSMS Backend v4.1 running',
-    version  : '4.1.0',
+    status   : 'OmniSMS Backend v4.2 running',
+    version  : '4.2.0',
     port     : PORT,
     env      : process.env.NODE_ENV || 'development',
     leekpay  : lpOk      ? 'ACTIVE' : 'INACTIVE',
@@ -321,14 +350,14 @@ server.listen(PORT, '0.0.0.0', () => {
   const firebaseOk = checkFirebase();
   const redisOk    = checkRedis();
 
-  logger.info('OmniSMS Backend v4.1 started', {
+  logger.info('OmniSMS Backend v4.2 started', {
     port: PORT,
     env : process.env.NODE_ENV || 'development',
     node: process.version,
   });
 
   console.log('\n╔══════════════════════════════════════════════════════╗');
-  console.log('║       OmniSMS Backend v4.1 — Production             ║');
+  console.log('║       OmniSMS Backend v4.2 — Production             ║');
   console.log('╚══════════════════════════════════════════════════════╝');
   console.log('🚀 Port       : ' + PORT);
   console.log('🌍 ENV        : ' + (process.env.NODE_ENV || 'development'));
@@ -343,7 +372,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('🔔 Webhook    : POST /api/payment/webhook/leekpay');
   console.log('🎙️  Audio      : POST /api/audio/upload  GET /api/audio/stream/:file');
   console.log('📇 Contacts   : POST /api/contacts/sync');
-  console.log('💬 Messages   : POST /api/messages/send');
+  console.log('💬 Messages   : GET /api/messages · GET /api/messages/:id · POST /api/messages/send');
+  console.log('🎙️  Transcription: POST /api/transcription · GET /api/transcription/:id');
+  console.log('📨 SMS Entrants: POST /api/webhooks/infobip/inbound');
   console.log('❤️  Health     : GET /health');
   console.log('');
 });

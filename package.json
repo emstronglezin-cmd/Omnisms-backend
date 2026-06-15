@@ -1,7 +1,7 @@
 {
   "name": "omnisms-backend",
-  "version": "4.1.0",
-  "description": "OmniSMS Backend — Production-ready Node.js/Express · Firebase · Socket.IO · Infobip · LeekPay",
+  "version": "4.2.0",
+  "description": "OmniSMS Backend — Messages, Transcription Faster-Whisper, SMS Infobip (inbound/outbound), LeekPay, Socket.IO, BullMQ",
   "main": "server.js",
   "engines": {
     "node": ">=18.0.0",
