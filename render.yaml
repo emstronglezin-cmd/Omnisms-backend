@@ -113,7 +113,16 @@ services:
       - key: INFOBIP_SENDER_ID
         value: OmniSMS
 
-      # ── Transcription Audio (Faster-Whisper) ─────────────────
+      # ── Transcription Audio ───────────────────────────────────
+      # OPTION 1 (recommandée) : Groq Whisper API — gratuit, ultra-rapide
+      # Créez une clé GRATUITE sur https://console.groq.com
+      - key: GROQ_API_KEY
+        sync: false
+
+      - key: GROQ_WHISPER_MODEL
+        value: whisper-large-v3-turbo
+
+      # OPTION 2 : Faster-Whisper service Python séparé (optionnel)
       - key: WHISPER_SERVICE_URL
         sync: false
 

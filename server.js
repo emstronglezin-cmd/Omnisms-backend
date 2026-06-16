@@ -94,6 +94,14 @@ function checkFirebase() {
 function checkRedis() {
   return !!process.env.REDIS_URL;
 }
+function checkTranscription() {
+  // Groq est la méthode recommandée sur Render
+  if (process.env.GROQ_API_KEY) return { ok: true, engine: 'groq-whisper', detail: 'ACTIVE' };
+  if (process.env.WHISPER_SERVICE_URL && process.env.WHISPER_SERVICE_URL !== 'http://localhost:9000') {
+    return { ok: true, engine: 'faster-whisper-http', detail: 'CONFIGURED' };
+  }
+  return { ok: false, engine: 'none', detail: 'INACTIVE — configurez GROQ_API_KEY (gratuit: https://console.groq.com)' };
+}
 
 /* ── Health & status ─────────────────────────────────────── */
 app.get('/', (_req, res) => {
@@ -103,7 +111,7 @@ app.get('/', (_req, res) => {
   res.status(200).json({
     status   : 'ok',
     service  : 'OmniSMS Backend',
-    version  : '4.2.0',
+    version  : '4.3.0',
     auth     : true,
     payments : lpOk,
     sms      : infobipOk,
@@ -116,11 +124,12 @@ app.get('/', (_req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  const lpOk      = checkLeekPay();
-  const firebaseOk = checkFirebase();
-  const jwtOk      = !!process.env.JWT_SECRET;
-  const infobipOk  = checkInfobip();
-  const redisOk    = checkRedis();
+  const lpOk         = checkLeekPay();
+  const firebaseOk   = checkFirebase();
+  const jwtOk        = !!process.env.JWT_SECRET;
+  const infobipOk    = checkInfobip();
+  const redisOk      = checkRedis();
+  const transcrCheck = checkTranscription();
 
   let queueStatus = {};
   try { queueStatus = require('./services/queueService').getQueueStatus(); } catch (_) {}
@@ -128,16 +137,19 @@ app.get('/health', (_req, res) => {
   res.status(200).json({
     status  : 'ok',
     service : 'OmniSMS Backend',
-    version : '4.2.0',
+    version : '4.3.0',
     uptime  : Math.round(process.uptime()),
     time    : new Date().toISOString(),
     checks  : {
-      firebase : firebaseOk ? 'ok' : 'MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON',
-      jwt      : jwtOk      ? 'ok' : 'MISSING — set JWT_SECRET',
-      leekpay  : lpOk       ? 'ACTIVE' : 'INACTIVE — set LEEKPAY_API_KEY + LEEKPAY_SECRET_KEY',
-      infobip  : infobipOk  ? 'ACTIVE' : 'INACTIVE — set INFOBIP_API_KEY + INFOBIP_BASE_URL',
-      redis    : redisOk    ? 'CONFIGURED' : 'MISSING — using memory fallback (set REDIS_URL)',
-      socketio : 'ACTIVE',
+      firebase      : firebaseOk      ? 'ok' : 'MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON',
+      jwt           : jwtOk           ? 'ok' : 'MISSING — set JWT_SECRET',
+      leekpay       : lpOk            ? 'ACTIVE' : 'INACTIVE — set LEEKPAY_API_KEY + LEEKPAY_SECRET_KEY',
+      infobip       : infobipOk       ? 'ACTIVE' : 'INACTIVE — set INFOBIP_API_KEY + INFOBIP_BASE_URL',
+      redis         : redisOk         ? 'CONFIGURED' : 'MISSING — using memory fallback (set REDIS_URL)',
+      socketio      : 'ACTIVE',
+      transcription : transcrCheck.ok
+        ? `ACTIVE via ${transcrCheck.engine}`
+        : transcrCheck.detail,
     },
     queue   : queueStatus,
     routes  : {
@@ -267,8 +279,8 @@ app.get('/api/status', (_req, res) => {
   try { queue = require('./services/queueService').getQueueStatus(); } catch (_) {}
 
   res.json({
-    status   : 'OmniSMS Backend v4.2 running',
-    version  : '4.2.0',
+    status   : 'OmniSMS Backend v4.3 running',
+    version  : '4.3.0',
     port     : PORT,
     env      : process.env.NODE_ENV || 'development',
     leekpay  : lpOk      ? 'ACTIVE' : 'INACTIVE',
@@ -350,14 +362,14 @@ server.listen(PORT, '0.0.0.0', () => {
   const firebaseOk = checkFirebase();
   const redisOk    = checkRedis();
 
-  logger.info('OmniSMS Backend v4.2 started', {
+  logger.info('OmniSMS Backend v4.3 started', {
     port: PORT,
     env : process.env.NODE_ENV || 'development',
     node: process.version,
   });
 
   console.log('\n╔══════════════════════════════════════════════════════╗');
-  console.log('║       OmniSMS Backend v4.2 — Production             ║');
+  console.log('║       OmniSMS Backend v4.3 — Production             ║');
   console.log('╚══════════════════════════════════════════════════════╝');
   console.log('🚀 Port       : ' + PORT);
   console.log('🌍 ENV        : ' + (process.env.NODE_ENV || 'development'));
