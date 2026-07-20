@@ -24,14 +24,23 @@ const compression = require('compression');
 
 // ── Origines CORS autorisées ─────────────────────────────────
 const allowedOrigins = [
+  // Netlify / Firebase
   'https://omnisms.netlify.app',
   'https://omnisms.web.app',
+  // Vercel — URL principale + previews
+  'https://omnisms-frontend.vercel.app',
+  'https://omnisms-frontend-qx1u5k6h9-emmanuel-lezin.vercel.app',
+  // Dev local
   'http://localhost:3000',
   'http://localhost:5000',
+  'http://localhost:8080',
   ...(process.env.CORS_ORIGIN
     ? process.env.CORS_ORIGIN.split(',').map(o => o.trim())
     : []),
 ];
+
+// Regex pour autoriser tous les sous-domaines vercel.app du projet
+const vercelPattern = /^https:\/\/omnisms-frontend(-[a-z0-9]+-emmanuel-lezin)?(\.vercel\.app)$/;
 
 // ── 1. Helmet — headers HTTP sécurisés ───────────────────────
 const helmetMiddleware = helmet({
@@ -60,9 +69,12 @@ const corsMiddleware = cors({
   origin: (origin, callback) => {
     // Autoriser les requêtes sans origine (mobile apps, Postman, curl)
     if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
+    // Origines explicites
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Tous les déploiements Vercel du projet (preview + production)
+    if (vercelPattern.test(origin)) return callback(null, true);
+    // Log pour debug
+    console.warn('[CORS] Origine rejetée:', origin);
     return callback(new Error('CORS non autorisé pour : ' + origin), false);
   },
   methods       : ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
