@@ -63,8 +63,8 @@ router.get('/:userId', authenticate, async (req, res) => {
 
   try {
     const [sent, received] = await Promise.all([
-      db.collection('messages').where('senderId', '==', userId).orderBy('createdAt', 'desc').limit(100).get(),
-      db.collection('messages').where('receiverId', '==', userId).orderBy('createdAt', 'desc').limit(100).get(),
+      db.collection('messages').where('senderId', '==', userId).limit(100).get(),
+      db.collection('messages').where('receiverId', '==', userId).limit(100).get(),
     ]);
 
     const messages = [

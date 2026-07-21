@@ -75,9 +75,11 @@ router.get('/', auth, async (req, res) => {
       });
     }
 
+    // Note: orderBy('createdAt') requires a composite Firestore index.
+    // Sorting is done in-memory to avoid index errors on new projects.
     const [sent, received] = await Promise.all([
-      db.collection('messages').where('senderId',   '==', uid).orderBy('createdAt', 'desc').limit(limit * 4).get(),
-      db.collection('messages').where('receiverId', '==', uid).orderBy('createdAt', 'desc').limit(limit * 4).get(),
+      db.collection('messages').where('senderId',   '==', uid).limit(limit * 4).get(),
+      db.collection('messages').where('receiverId', '==', uid).limit(limit * 4).get(),
     ]);
 
     const convMap = new Map();
@@ -181,15 +183,15 @@ router.get(
         }
       }
 
+      // orderBy without composite index — sort in-memory
       let q = db.collection('messages')
         .where('conversationId', '==', conversationId)
-        .orderBy('createdAt', 'desc')
-        .limit(limit);
-
-      if (before) q = q.startAfter(before);
+        .limit(limit * 2);
 
       const snap     = await q.get();
-      const messages = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      let messages   = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      messages.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+      messages = messages.slice(0, limit);
 
       // Marquer comme lus les messages reçus non lus
       const unread = messages.filter(m => m.receiverId === uid && m.status !== 'seen');
@@ -382,14 +384,12 @@ router.get(
 
       const cId = convId(uid, targetUid);
 
+      // orderBy without composite index — sort in-memory
       let q = db.collection('messages')
         .where('conversationId', '==', cId)
-        .orderBy('createdAt', 'desc')
-        .limit(limit);
+        .limit(limit * 2);
 
-      if (before) {
-        q = q.startAfter(before);
-      }
+      // before cursor not used in memory-sort mode
 
       const snap = await q.get();
       const messages = snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -448,8 +448,8 @@ router.get('/conversations', auth, async (req, res) => {
 
     // Récupérer le dernier message de chaque conversation
     const [sent, received] = await Promise.all([
-      db.collection('messages').where('senderId',   '==', uid).orderBy('createdAt', 'desc').limit(limit * 2).get(),
-      db.collection('messages').where('receiverId', '==', uid).orderBy('createdAt', 'desc').limit(limit * 2).get(),
+      db.collection('messages').where('senderId',   '==', uid).limit(limit * 2).get(),
+      db.collection('messages').where('receiverId', '==', uid).limit(limit * 2).get(),
     ]);
 
     // Regrouper par conversationId
