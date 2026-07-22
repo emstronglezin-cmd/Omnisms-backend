@@ -45,10 +45,13 @@ router.get('/', authenticate, async (req, res) => {
     const snap = await db
       .collection('groups')
       .where('members', 'array-contains', req.user.uid)
-      .orderBy('createdAt', 'desc')
       .get();
 
-    const groups = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Sort in-memory (avoids composite index requirement)
+    const groups = snap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
     return res.status(200).json(groups);
   } catch (err) {
     logger.error('Erreur liste groupes', { error: err.message });
