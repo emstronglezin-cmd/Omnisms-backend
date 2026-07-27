@@ -306,15 +306,37 @@ router.post(
         // Socket.IO peut ne pas être initialisé — non bloquant
       }
 
-      // ── Envoi SMS Infobip optionnel ──────────────────────────
-      // Déclenché si : sendSms=true ET phone fourni ET type=text
+      // ── Fallback SMS Infobip automatique ─────────────────────
+      // Logique : si le destinataire n'a PAS de compte OmniSMS vérifié
+      //           → envoyer un SMS Infobip automatiquement
+      // Le frontend n'a RIEN à décider — il envoie juste { receiverId, content }
       let smsResult = null;
-      if (sendSms && phone && type === 'text' && content && infobip) {
+      if (type === 'text' && content && infobip) {
         try {
-          if (infobip.isConfigured()) {
+          // 1. Chercher le destinataire dans Firestore pour vérifier son statut OmniSMS
+          let recipientPhone = phone || null;  // phone peut venir du frontend (override optionnel)
+          let recipientIsOmniSms = false;
+
+          if (db) {
+            const recipientSnap = await db.collection('users').doc(receiverId).get();
+            if (recipientSnap.exists) {
+              const recipientData = recipientSnap.data();
+              // Considéré comme utilisateur OmniSMS si phoneVerified OU pas de flag phoneVerified
+              // (comptes legacy créés avant l'introduction du flag)
+              recipientIsOmniSms = recipientData.phoneVerified !== false;
+              // Récupérer le numéro du destinataire si on doit envoyer un SMS
+              if (!recipientPhone) recipientPhone = recipientData.phone || null;
+            } else {
+              // Utilisateur inconnu dans Firestore → SMS fallback si on a un numéro
+              recipientIsOmniSms = false;
+            }
+          }
+
+          // 2. Si le destinataire n'est PAS sur OmniSMS, envoyer un SMS classique
+          if (!recipientIsOmniSms && recipientPhone && infobip.isConfigured()) {
             const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
             smsResult = await infobip.sendSMS({
-              to       : phone,
+              to       : recipientPhone,
               text     : content.trim(),
               from     : smsFrom || process.env.INFOBIP_SENDER || process.env.INFOBIP_SENDER_ID || 'OmniSMS',
               notifyUrl: deliveryUrl,
@@ -324,25 +346,25 @@ router.post(
             if (db && smsResult.success) {
               await db.collection('messages').add({
                 ...msg,
-                id        : `sms-${smsResult.messageId || Date.now()}`,
-                channel   : 'sms',
-                phone,
-                smsMessageId: smsResult.messageId,
-                status    : 'sent',
-                createdAt : now,
-                updatedAt : now,
+                id           : `sms-${smsResult.messageId || Date.now()}`,
+                channel      : 'sms',
+                phone        : recipientPhone,
+                smsMessageId : smsResult.messageId,
+                status       : 'sent',
+                createdAt    : now,
+                updatedAt    : now,
               });
             }
 
-            logger.info('[Messages] SMS envoyé via Infobip', {
-              to: phone, messageId: smsResult.messageId, status: smsResult.status,
+            logger.info('[Messages] SMS Infobip automatique (destinataire non-OmniSMS)', {
+              to: recipientPhone, messageId: smsResult.messageId, status: smsResult.status,
             });
-          } else {
-            smsResult = { success: false, error: 'Infobip non configuré.' };
-            logger.warn('[Messages] Infobip non configuré — SMS non envoyé');
+          } else if (!recipientIsOmniSms && !recipientPhone) {
+            logger.warn('[Messages] SMS fallback impossible : numéro inconnu pour le destinataire', { receiverId });
           }
+          // Si recipientIsOmniSms === true → message in-app suffit, pas de SMS
         } catch (smsErr) {
-          logger.error('[Messages] Infobip SMS error', { error: smsErr.message });
+          logger.error('[Messages] Erreur SMS fallback automatique', { error: smsErr.message });
           smsResult = { success: false, error: smsErr.message };
         }
       }

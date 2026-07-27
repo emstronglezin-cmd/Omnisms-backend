@@ -40,6 +40,7 @@ function handleValidation(req, res) {
 
 // ─────────────────────────────────────────────────────────────
 // POST /api/auth/register
+// Identité principale : numéro de téléphone (email optionnel)
 // ─────────────────────────────────────────────────────────────
 router.post(
   '/register',
@@ -48,7 +49,14 @@ router.post(
       .trim()
       .isLength({ min: 2, max: 100 })
       .withMessage('Le nom doit contenir entre 2 et 100 caractères.'),
+    body('phone')
+      .trim()
+      .notEmpty()
+      .withMessage('Le numéro de téléphone est requis.')
+      .matches(/^\+?[0-9\s\-().]{7,20}$/)
+      .withMessage('Numéro de téléphone invalide.'),
     body('email')
+      .optional({ checkFalsy: true })
       .trim()
       .isEmail()
       .normalizeEmail()
@@ -56,69 +64,81 @@ router.post(
     body('password')
       .isLength({ min: 8, max: 128 })
       .withMessage('Le mot de passe doit contenir entre 8 et 128 caractères.'),
-    body('phone')
-      .optional()
-      .trim()
-      .matches(/^\+?[0-9\s\-().]{7,20}$/)
-      .withMessage('Numéro de téléphone invalide.'),
   ],
   async (req, res) => {
     const validationError = handleValidation(req, res);
     if (validationError) return;
 
     const { name, email, password, phone } = req.body;
+    const normalizedPhone = phone.trim();
+    const normalizedEmail = email ? email.toLowerCase().trim() : null;
 
     try {
-      // Vérifier si l'email existe déjà
-      const existing = await db
+      // Vérifier si le numéro de téléphone existe déjà
+      const existingPhone = await db
         .collection('users')
-        .where('email', '==', email.toLowerCase())
+        .where('phone', '==', normalizedPhone)
         .limit(1)
         .get();
 
-      if (!existing.empty) {
+      if (!existingPhone.empty) {
         return res.status(409).json({
-          error: 'Un compte avec cet email existe déjà.',
-          code : 'EMAIL_EXISTS',
+          error: 'Un compte avec ce numéro de téléphone existe déjà.',
+          code : 'PHONE_EXISTS',
         });
+      }
+
+      // Vérifier si l'email existe déjà (si fourni)
+      if (normalizedEmail) {
+        const existingEmail = await db
+          .collection('users')
+          .where('email', '==', normalizedEmail)
+          .limit(1)
+          .get();
+
+        if (!existingEmail.empty) {
+          return res.status(409).json({
+            error: 'Un compte avec cet email existe déjà.',
+            code : 'EMAIL_EXISTS',
+          });
+        }
       }
 
       const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
       const now = new Date().toISOString();
 
       const userData = {
-        name        : name.trim(),
-        email       : email.toLowerCase().trim(),
-        password    : hashedPassword,
-        phone       : phone ? phone.trim() : null,
-        isSubscribed: false,
-        credits     : 0,
-        provider    : 'email',
-        createdAt   : now,
-        updatedAt   : now,
+        name          : name.trim(),
+        phone         : normalizedPhone,
+        email         : normalizedEmail,
+        password      : hashedPassword,
+        phoneVerified : false,   // Doit être vérifié via OTP avant utilisation complète
+        isSubscribed  : false,
+        credits       : 0,
+        provider      : 'phone',
+        createdAt     : now,
+        updatedAt     : now,
       };
 
       const docRef = await db.collection('users').add(userData);
 
-      // Générer un JWT immédiatement après l'inscription
-      const token = signToken({
-        uid  : docRef.id,
-        email: userData.email,
-        name : userData.name,
-      });
+      logger.info('Utilisateur créé (en attente OTP)', { uid: docRef.id, phone: normalizedPhone });
 
-      logger.info('Utilisateur créé', { uid: docRef.id, email: userData.email });
-
+      // Ne pas générer de JWT avant la vérification OTP
+      // Le frontend doit envoyer un OTP et valider avant d'obtenir un token
       return res.status(201).json({
-        message : 'Compte créé avec succès.',
-        userId  : docRef.id,
-        token,
+        message      : 'Compte créé. Vérifiez votre numéro via OTP.',
+        userId       : docRef.id,
+        requiresOtp  : true,
+        phone        : normalizedPhone,
         user: {
-          id          : docRef.id,
-          name        : userData.name,
-          email       : userData.email,
-          isSubscribed: false,
-          credits     : 0,
+          id           : docRef.id,
+          name         : userData.name,
+          phone        : normalizedPhone,
+          email        : normalizedEmail,
+          phoneVerified: false,
+          isSubscribed : false,
+          credits      : 0,
         },
       });
     } catch (err) {
@@ -206,9 +226,21 @@ router.post(
         });
       }
 
+      // Bloquer la connexion si le numéro n'est pas vérifié
+      // Exception : comptes Google et comptes legacy (sans flag phoneVerified)
+      if (user.provider !== 'google' && user.phoneVerified === false) {
+        return res.status(403).json({
+          error        : 'Numéro de téléphone non vérifié. Validez votre OTP pour activer votre compte.',
+          code         : 'PHONE_NOT_VERIFIED',
+          requiresOtp  : true,
+          phone        : user.phone || null,
+          userId       : user.id,
+        });
+      }
+
       const token = signToken({
         uid  : user.id,
-        email: user.email,
+        email: user.email || user.phone,
         name : user.name,
       });
 
@@ -222,11 +254,13 @@ router.post(
         message : 'Connexion réussie.',
         token,
         user: {
-          id          : user.id,
-          name        : user.name,
-          email       : user.email,
-          isSubscribed: user.isSubscribed || false,
-          credits     : user.credits      || 0,
+          id           : user.id,
+          name         : user.name,
+          email        : user.email        || null,
+          phone        : user.phone        || null,
+          phoneVerified: user.phoneVerified !== false,
+          isSubscribed : user.isSubscribed || false,
+          credits      : user.credits      || 0,
         },
       });
     } catch (err) {

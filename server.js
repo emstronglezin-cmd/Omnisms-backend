@@ -191,6 +191,7 @@ app.get('/health', (_req, res) => {
 
 /* ── Route imports ───────────────────────────────────────── */
 const authRoutes         = require('./routes/auth');
+const otpRoutes          = require('./routes/otp');
 const leekPayRoutes      = require('./routes/payment.leekpay');
 const webhookRoutes      = require('./routes/webhook');
 const infobipRoutes      = require('./routes/sms.infobip');
@@ -223,6 +224,7 @@ function loadOptional(routePath, mount) {
 
 /* ── Auth ────────────────────────────────────────────────── */
 app.use('/api/auth', authLimiter, requireJson, authRoutes);
+app.use('/api/auth', authLimiter, requireJson, otpRoutes);   // OTP : send-otp + verify-otp
 app.use('/auth',     authLimiter, requireJson, authRoutes);  // retrocompat
 
 /* ── Contacts v2 ─────────────────────────────────────────── */

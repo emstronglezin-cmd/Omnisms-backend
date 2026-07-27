@@ -101,67 +101,93 @@ router.post(
 
       if (db) {
         const phones = validContacts.map(c => c.normalized);
-        const BATCH_SIZE = 30;
+        const BATCH_SIZE = 10;  // Firestore `in` operator limite
 
+        // Rechercher dans la collection `users` par numéro de téléphone vérifié
         for (let i = 0; i < phones.length; i += BATCH_SIZE) {
           const batch = phones.slice(i, i + BATCH_SIZE);
           try {
+            // Chercher les utilisateurs OmniSMS dont le téléphone est vérifié
             const snap = await db
-              .collection('users_sms')
-              .where('__name__', 'in', batch)
+              .collection('users')
+              .where('phone', 'in', batch)
               .get();
 
             snap.forEach(doc => {
               const data = doc.data();
+              // Ignorer les comptes dont phoneVerified est explicitement false (non activés)
+              if (data.phoneVerified === false) return;
               // Trouver le nom donné par cet utilisateur dans ses contacts
-              const contact = validContacts.find(c => c.normalized === doc.id);
+              const contact = validContacts.find(c => c.normalized === data.phone);
+              // Éviter les doublons
+              if (registeredContacts.some(r => r.userId === doc.id)) return;
               registeredContacts.push({
-                phone      : doc.id,
-                name       : contact?.name || data.name || '',
-                avatar     : data.avatar   || null,
-                isOnOmniSms: true,
-                uid        : doc.id,  // Le phone est le UID dans users_sms
+                phone           : data.phone,
+                name            : contact?.name || data.name || '',
+                avatar          : data.avatar   || null,
+                isOnOmniSms     : true,
+                userId          : doc.id,        // UID Firestore réel
+                registeredUserId: doc.id,        // Alias frontend
               });
             });
           } catch (batchErr) {
-            logger.warn('[Contacts] Batch query failed', { error: batchErr.message, batch: i });
+            logger.warn('[Contacts] Batch query users failed', { error: batchErr.message, batchIndex: i });
           }
         }
       }
 
-      // 3. Sauvegarder les contacts synchronisés en Firestore
+      // 3. Construire la liste complète : OmniSMS + SMS uniquement
+      // AUCUN contact ne disparaît — tous restent visibles
+      const registeredPhones = new Set(registeredContacts.map(r => r.phone));
+      const smsOnlyContacts = validContacts
+        .filter(c => !registeredPhones.has(c.normalized))
+        .map(c => ({
+          phone           : c.normalized,
+          name            : c.name || '',
+          avatar          : null,
+          isOnOmniSms     : false,
+          userId          : null,
+          registeredUserId: null,
+        }));
+
+      const allContacts = [...registeredContacts, ...smsOnlyContacts];
+
+      // 4. Sauvegarder les contacts synchronisés en Firestore (non bloquant)
       if (db && uid) {
         try {
-          await db.collection('users_sms').doc(normalizePhone(uid)).update({
-            contacts_synced: validContacts.map(c => ({
-              name      : c.name || '',
-              phone     : c.normalized,
-              original  : c.original,
-              isOnOmniSms: registeredContacts.some(r => r.phone === c.normalized),
+          await db.collection('users').doc(uid).update({
+            contacts_synced    : allContacts.map(c => ({
+              name        : c.name || '',
+              phone       : c.phone,
+              isOnOmniSms : c.isOnOmniSms,
+              userId      : c.userId || null,
             })),
             contacts_synced_at: new Date().toISOString(),
           });
         } catch (_) {
-          // Non bloquant
+          // Non bloquant — l'utilisateur n'a peut-être pas encore de doc users
         }
       }
 
       logger.info('[Contacts] Sync done', {
         uid,
-        total   : contacts.length,
-        valid   : validContacts.length,
-        found   : registeredContacts.length,
-        invalid : invalid.length,
+        total      : contacts.length,
+        valid      : validContacts.length,
+        omnisms    : registeredContacts.length,
+        smsOnly    : smsOnlyContacts.length,
+        invalid    : invalid.length,
       });
 
       return res.status(200).json({
-        success           : true,
-        total             : contacts.length,
-        valid             : validContacts.length,
-        invalid           : invalid.length,
-        registeredOnOmniSms: registeredContacts.length,
-        contacts          : registeredContacts,
-        invalidSamples    : invalid.slice(0, 5).map(c => ({
+        success              : true,
+        total                : contacts.length,
+        valid                : validContacts.length,
+        invalid              : invalid.length,
+        registeredOnOmniSms  : registeredContacts.length,
+        smsOnly              : smsOnlyContacts.length,
+        // contacts inclut TOUS : OmniSMS + SMS (avec isOnOmniSms pour distinguer)
+        contacts             : allContacts,
+        invalidSamples       : invalid.slice(0, 5).map(c => ({
           original: c.original,
           reason  : 'Numéro invalide ou non reconnu',
         })),
@@ -325,14 +351,17 @@ router.get(
       const db = getDb();
       if (!db) return res.status(200).json({ phone, registered: false, reason: 'db_unavailable' });
 
-      const snap = await db.collection('users_sms').doc(phone).get();
+      // Chercher dans la collection `users` par numéro de téléphone
+      const snap = await db.collection('users').where('phone', '==', phone).limit(1).get();
+      const found = !snap.empty && snap.docs[0].data().phoneVerified !== false;
 
       return res.status(200).json({
         phone,
-        registered: snap.exists,
-        user      : snap.exists ? {
-          name  : snap.data().name   || null,
-          avatar: snap.data().avatar || null,
+        registered: found,
+        user      : found ? {
+          userId: snap.docs[0].id,
+          name  : snap.docs[0].data().name   || null,
+          avatar: snap.docs[0].data().avatar || null,
         } : null,
       });
 
