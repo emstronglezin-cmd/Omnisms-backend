@@ -152,20 +152,22 @@ router.post(
 
       const allContacts = [...registeredContacts, ...smsOnlyContacts];
 
-      // 4. Sauvegarder les contacts synchronisés en Firestore (non bloquant)
+      // 4. Sauvegarder les contacts synchronisés en Firestore
       if (db && uid) {
         try {
-          await db.collection('users').doc(uid).update({
+          await db.collection('users').doc(uid).set({
             contacts_synced    : allContacts.map(c => ({
-              name        : c.name || '',
-              phone       : c.phone,
-              isOnOmniSms : c.isOnOmniSms,
-              userId      : c.userId || null,
+              name             : c.name || '',
+              phone            : c.phone,
+              isOnOmniSms      : c.isOnOmniSms,
+              userId           : c.userId           || null,
+              registeredUserId : c.registeredUserId || null,
+              avatar           : c.avatar           || null,
             })),
             contacts_synced_at: new Date().toISOString(),
-          });
-        } catch (_) {
-          // Non bloquant — l'utilisateur n'a peut-être pas encore de doc users
+          }, { merge: true });
+        } catch (saveErr) {
+          logger.warn('[Contacts] sync save error (non bloquant)', { error: saveErr.message });
         }
       }
 
@@ -234,19 +236,33 @@ router.post(
         return res.status(503).json({ error: 'Firestore non disponible.', code: 'DB_UNAVAILABLE' });
       }
 
-      const userRef  = db.collection('users_sms').doc(ownerNorm);
-      const snap     = await userRef.get();
-      const userData = snap.exists ? snap.data() : {};
-      const contacts = userData.contacts || [];
+      // Stocker dans la collection `users` directement (pas users_sms)
+      const userSnap  = await db.collection('users').doc(uid).get();
+      const userData  = userSnap.exists ? userSnap.data() : {};
+      const contacts  = userData.contacts_manual || [];
 
       // Vérifier si déjà présent
       const exists = contacts.some(c => c.phone === contactNorm);
 
-      const contact = { name, phone: contactNorm, addedAt: new Date().toISOString() };
+      const contact = { name, phone: contactNorm, isOnOmniSms: false, addedAt: new Date().toISOString() };
 
       if (!exists) {
+        // Vérifier si ce numéro est sur OmniSMS
+        try {
+          const omniSnap = await db.collection('users').where('phone', '==', contactNorm).limit(1).get();
+          if (!omniSnap.empty) {
+            const omniUser = omniSnap.docs[0];
+            contact.isOnOmniSms      = true;
+            contact.userId           = omniUser.id;
+            contact.registeredUserId = omniUser.id;
+          }
+        } catch (_) {}
+
         contacts.push(contact);
-        await userRef.set({ contacts, updatedAt: new Date().toISOString() }, { merge: true });
+        await db.collection('users').doc(uid).set(
+          { contacts_manual: contacts, contacts_updated_at: new Date().toISOString() },
+          { merge: true }
+        );
       }
 
       return res.status(exists ? 200 : 201).json({
@@ -265,29 +281,37 @@ router.post(
 
 /* ─────────────────────────────────────────────────────────────
    GET /api/contacts
-   Lister mes contacts
+   Lister mes contacts (depuis la collection users)
    ─────────────────────────────────────────────────────────── */
 router.get('/', auth, async (req, res) => {
-  const uid      = req.user.uid;
-  const ownNorm  = normalizePhone(uid);
+  const uid = req.user.uid;
 
   try {
     const db = getDb();
     if (!db) {
-      return res.status(503).json({ error: 'Firestore non disponible.', code: 'DB_UNAVAILABLE' });
+      return res.status(200).json({ contacts: [], count: 0 });
     }
 
-    const snap = await db.collection('users_sms').doc(ownNorm).get();
+    const snap = await db.collection('users').doc(uid).get();
     if (!snap.exists) {
       return res.status(200).json({ contacts: [], count: 0 });
     }
 
-    const data     = snap.data();
-    const contacts = data.contacts || data.contacts_synced || [];
+    const data = snap.data();
+    // Fusionner les contacts manuels et ceux issus de la sync VCF
+    const manual  = data.contacts_manual  || [];
+    const synced  = data.contacts_synced  || [];
+
+    // Dédupliquer par numéro de téléphone (manual prime sur synced)
+    const phoneSet = new Set(manual.map(c => c.phone));
+    const combined = [
+      ...manual,
+      ...synced.filter(c => !phoneSet.has(c.phone)),
+    ];
 
     return res.status(200).json({
-      count   : contacts.length,
-      contacts,
+      count   : combined.length,
+      contacts: combined,
     });
 
   } catch (err) {
@@ -313,16 +337,20 @@ router.delete(
         return res.status(503).json({ error: 'Firestore non disponible.', code: 'DB_UNAVAILABLE' });
       }
 
-      const userRef  = db.collection('users_sms').doc(ownerNorm);
-      const snap     = await userRef.get();
+      const snap = await db.collection('users').doc(uid).get();
       if (!snap.exists) {
         return res.status(404).json({ error: 'Utilisateur non trouvé.', code: 'NOT_FOUND' });
       }
 
-      const data     = snap.data();
-      const contacts = (data.contacts || []).filter(c => c.phone !== contactPhone);
+      const data = snap.data();
+      const contacts_manual = (data.contacts_manual || []).filter(c => c.phone !== contactPhone);
+      const contacts_synced = (data.contacts_synced  || []).filter(c => c.phone !== contactPhone);
 
-      await userRef.update({ contacts, updatedAt: new Date().toISOString() });
+      await db.collection('users').doc(uid).update({
+        contacts_manual,
+        contacts_synced,
+        contacts_updated_at: new Date().toISOString(),
+      });
 
       return res.status(200).json({ success: true, message: 'Contact supprimé.' });
 
@@ -390,10 +418,13 @@ router.post(
       const db = getDb();
       if (!db) return res.status(503).json({ error: 'DB unavailable.', code: 'DB_UNAVAILABLE' });
 
-      await db.collection('users_sms').doc(ownerNorm).set({
-        blocked      : db.FieldValue ? db.FieldValue.arrayUnion(blockPhone) : [blockPhone],
-        updatedAt    : new Date().toISOString(),
-      }, { merge: true });
+      const bSnap = await db.collection('users').doc(uid).get();
+      const blocked = bSnap.exists ? (bSnap.data().blocked || []) : [];
+      if (!blocked.includes(blockPhone)) blocked.push(blockPhone);
+      await db.collection('users').doc(uid).set(
+        { blocked, updatedAt: new Date().toISOString() },
+        { merge: true }
+      );
 
       return res.status(200).json({ success: true, blocked: blockPhone });
 
@@ -414,7 +445,7 @@ router.get('/blocked', auth, async (req, res) => {
     const db = getDb();
     if (!db) return res.status(200).json({ blocked: [] });
 
-    const snap = await db.collection('users_sms').doc(ownerNorm).get();
+    const snap = await db.collection('users').doc(uid).get();
     const blocked = snap.exists ? (snap.data().blocked || []) : [];
 
     return res.status(200).json({ count: blocked.length, blocked });

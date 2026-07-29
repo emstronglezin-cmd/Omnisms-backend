@@ -191,7 +191,7 @@ app.get('/health', (_req, res) => {
 
 /* ── Route imports ───────────────────────────────────────── */
 const authRoutes         = require('./routes/auth');
-const otpRoutes          = require('./routes/otp');
+// OTP routes supprimées — inscription directe sans OTP
 const leekPayRoutes      = require('./routes/payment.leekpay');
 const webhookRoutes      = require('./routes/webhook');
 const infobipRoutes      = require('./routes/sms.infobip');
@@ -224,7 +224,6 @@ function loadOptional(routePath, mount) {
 
 /* ── Auth ────────────────────────────────────────────────── */
 app.use('/api/auth', authLimiter, requireJson, authRoutes);
-app.use('/api/auth', authLimiter, requireJson, otpRoutes);   // OTP : send-otp + verify-otp
 app.use('/auth',     authLimiter, requireJson, authRoutes);  // retrocompat
 
 /* ── Contacts v2 ─────────────────────────────────────────── */
@@ -258,6 +257,7 @@ app.use('/admin',         adminRoutes);
 app.use('/groups',        groupRoutes);
 app.use('/users',         userRoutes);
 app.use('/me',            meRoutes);
+app.use('/api/me',        meRoutes);   // API prefix pour profil + avatar
 app.use('/notifications', notifRoutes);
 app.use('/statistics',    statsRoutes);
 

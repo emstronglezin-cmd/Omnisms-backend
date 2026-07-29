@@ -37,10 +37,25 @@ if (bullmqAvailable && REDIS_URL) {
     redisConnection = new Redis(REDIS_URL, {
       maxRetriesPerRequest: null, // requis par BullMQ
       enableReadyCheck    : false,
+      lazyConnect         : false,
+      retryStrategy(times) {
+        if (times >= 3) return null; // stoppe après 3 tentatives
+        return Math.min(times * 500, 2000);
+      },
     });
-    redisConnection.on('error', (err) =>
-      logger.error('[Queue] Redis error', { msg: err.message })
-    );
+    let _queueFallback = false;
+    redisConnection.on('error', (err) => {
+      if (_queueFallback) return;
+      const isFatal = err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED' || err.code === 'EAI_AGAIN';
+      if (isFatal) {
+        _queueFallback = true;
+        logger.warn(`[Queue] Redis DNS/network error (${err.code}) — switching to inline execution.`);
+        redisConnection = null;
+        try { redisConnection && redisConnection.disconnect(); } catch (_) {}
+      } else {
+        logger.error('[Queue] Redis error', { msg: err.message });
+      }
+    });
     logger.info('[Queue] BullMQ connected to Redis.');
   } catch (err) {
     logger.error('[Queue] Redis connection failed', { error: err.message });

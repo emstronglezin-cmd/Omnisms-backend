@@ -94,14 +94,20 @@ router.get('/', auth, async (req, res) => {
       // Filtre par type de canal si demandé
       if (type && msg.channel && msg.channel !== type) return;
 
-      if (!convMap.has(cId) || new Date(msg.createdAt) > new Date(convMap.get(cId).lastMessage.createdAt)) {
+      const existing = convMap.get(cId);
+      if (!existing || new Date(msg.createdAt) > new Date(existing.lastMessageAt || 0)) {
         const otherUid = msg.senderId === uid ? msg.receiverId : msg.senderId;
         convMap.set(cId, {
-          id          : cId,
-          otherUserId : otherUid,
-          channel     : msg.channel || 'app',
-          lastMessage : msg,
-          unreadCount : 0,
+          id                 : cId,
+          otherUserId        : otherUid,
+          channel            : msg.channel || 'app',
+          lastMessage        : msg.content || msg.text || (msg.type === 'audio' ? '🎤 Message vocal' : msg.type === 'image' ? '📷 Image' : ''),
+          lastMessageContent : msg.content || msg.text || '',
+          lastMessageAt      : msg.createdAt,
+          lastMessageTime    : msg.createdAt,
+          lastMessageType    : msg.type    || 'text',
+          lastMessageSenderId: msg.senderId,
+          unreadCount        : 0,
         });
       }
     });
@@ -115,8 +121,36 @@ router.get('/', auth, async (req, res) => {
       }
     });
 
+    // Enrichir les conversations avec le nom de l'autre utilisateur
+    if (db) {
+      const otherUids = [...new Set([...convMap.values()].map(c => c.otherUserId).filter(Boolean))];
+      const userCache = new Map();
+      // Batch lookup par lot de 10
+      for (let i = 0; i < otherUids.length; i += 10) {
+        const batch = otherUids.slice(i, i + 10);
+        try {
+          const userDocs = await Promise.all(batch.map(u => db.collection('users').doc(u).get()));
+          userDocs.forEach((doc, idx) => {
+            if (doc.exists) {
+              const d = doc.data();
+              userCache.set(batch[idx], { name: d.name, avatar: d.avatar || null, phone: d.phone });
+            }
+          });
+        } catch (_) {}
+      }
+      convMap.forEach((conv) => {
+        const info = userCache.get(conv.otherUserId);
+        if (info) {
+          conv.otherUserName  = info.name  || conv.otherUserName  || conv.otherUserId;
+          conv.otherUserAvatar= info.avatar|| conv.otherUserAvatar|| null;
+          conv.otherUserPhone = info.phone || conv.otherUserPhone || null;
+          conv.contactName    = info.name  || conv.contactName    || conv.otherUserId;
+        }
+      });
+    }
+
     const allConvs = [...convMap.values()]
-      .sort((a, b) => new Date(b.lastMessage.createdAt) - new Date(a.lastMessage.createdAt));
+      .sort((a, b) => new Date(b.lastMessageAt || b.lastMessageTime || 0) - new Date(a.lastMessageAt || a.lastMessageTime || 0));
 
     // Pagination manuelle
     const totalCount = allConvs.length;

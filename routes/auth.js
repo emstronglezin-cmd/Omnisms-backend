@@ -112,7 +112,7 @@ router.post(
         phone         : normalizedPhone,
         email         : normalizedEmail,
         password      : hashedPassword,
-        phoneVerified : false,   // Doit être vérifié via OTP avant utilisation complète
+        phoneVerified : true,    // Activé directement — pas d'OTP requis
         isSubscribed  : false,
         credits       : 0,
         provider      : 'phone',
@@ -121,22 +121,26 @@ router.post(
       };
 
       const docRef = await db.collection('users').add(userData);
+      const userId = docRef.id;
 
-      logger.info('Utilisateur créé (en attente OTP)', { uid: docRef.id, phone: normalizedPhone });
+      logger.info('Utilisateur créé', { uid: userId, phone: normalizedPhone });
 
-      // Ne pas générer de JWT avant la vérification OTP
-      // Le frontend doit envoyer un OTP et valider avant d'obtenir un token
+      // Générer le JWT immédiatement — pas d'OTP
+      const token = signToken({
+        uid  : userId,
+        email: normalizedEmail || normalizedPhone,
+        name : userData.name,
+      });
+
       return res.status(201).json({
-        message      : 'Compte créé. Vérifiez votre numéro via OTP.',
-        userId       : docRef.id,
-        requiresOtp  : true,
-        phone        : normalizedPhone,
+        message : 'Compte créé avec succès.',
+        token,
         user: {
-          id           : docRef.id,
+          id           : userId,
           name         : userData.name,
           phone        : normalizedPhone,
           email        : normalizedEmail,
-          phoneVerified: false,
+          phoneVerified: true,
           isSubscribed : false,
           credits      : 0,
         },
@@ -226,18 +230,7 @@ router.post(
         });
       }
 
-      // Bloquer la connexion si le numéro n'est pas vérifié
-      // Exception : comptes Google et comptes legacy (sans flag phoneVerified)
-      if (user.provider !== 'google' && user.phoneVerified === false) {
-        return res.status(403).json({
-          error        : 'Numéro de téléphone non vérifié. Validez votre OTP pour activer votre compte.',
-          code         : 'PHONE_NOT_VERIFIED',
-          requiresOtp  : true,
-          phone        : user.phone || null,
-          userId       : user.id,
-        });
-      }
-
+      // Plus de blocage OTP — tous les comptes sont autorisés à se connecter
       const token = signToken({
         uid  : user.id,
         email: user.email || user.phone,
