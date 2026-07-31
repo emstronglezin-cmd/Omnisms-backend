@@ -3,348 +3,260 @@
  * OmniSMS — LeekPay Controller
  * ═══════════════════════════════════════════════════════════════
  *
- * Logique métier pour le système de paiement LeekPay.
- *
- * Routes gérées (via routes/payment.leekpay.js) :
- *   POST /api/payment/leekpay                  → initier paiement
- *   POST /api/payment/webhook/leekpay          → webhook LeekPay
- *   GET  /api/payment/status/:transactionId    → statut transaction
+ * Documentation officielle LeekPay : https://leekpay.fr/docs
  *
  * Flux paiement :
- *   1. Frontend POST /api/payment/leekpay  { userId, amount?, phone?, email?, name? }
- *   2. Backend crée checkout LeekPay  → retourne { success, checkout_url }
- *   3. Frontend redirige vers checkout_url
- *   4. LeekPay appelle POST /api/payment/webhook/leekpay
- *   5. Backend valide signature → active premium Firebase
+ *   1. POST /api/payment/leekpay  { userId, amount?, currency?, phone?, email?, name? }
+ *   2. Backend → POST https://leekpay.fr/api/v1/checkout → { data: { id, payment_url } }
+ *   3. Frontend ouvre data.payment_url
+ *   4. LeekPay → POST /api/payment/webhook/leekpay { event: "payment.completed", data: { status: "paid" } }
+ *   5. Si aucun webhook → polling GET /api/v1/checkout/:id jusqu'à status = "paid"
  *
- * Sécurité :
- *   - Anti replay : Redis (processingPayments Set + processedCheckouts Set)
- *   - Signature HMAC webhook via services/leekpay.verifyWebhookSignature()
- *   - Validation montant + devise
- *   - userId validé Firebase
- *   - Logs structurés sans données sensibles
- *
- * Firebase Firestore :
- *   Collection leekpay_payments/<checkoutId>  → état du paiement
- *   Collection users/<userId>                 → { isSubscribed, subscribedAt, ... }
- *   Collection subscriptions/<auto>          → historique
+ * Activation premium : Firestore users/<userId>.isSubscribed = true
  */
 
-const leekpay      = require('../services/leekpay');
-const { logger }   = require('../middleware/logger');
+const leekpay    = require('../services/leekpay');
+const { logger } = require('../middleware/logger');
 
-// ══════════════════════════════════════════════════════════════
-//  ANTI-REPLAY — Redis ou Map mémoire
-// ══════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
+   Anti-replay (mémoire + Firestore)
+══════════════════════════════════════════════════════════════════ */
+const processedCheckouts = new Set();   // checkoutId déjà activés
+const processingPayments = new Set();   // en cours (anti-concurrent)
 
-/**
- * Set en mémoire des checkoutId déjà traités (fallback si Redis absent).
- * Purgé au restart — Redis est la solution durable.
- * @type {Set<string>}
- */
-const processedCheckouts = new Set();
-
-/**
- * Set en mémoire des webhooks en cours de traitement (évite double processing).
- * @type {Set<string>}
- */
-const processingPayments = new Set();
-
-/**
- * Vérifier si un checkout a déjà été traité (idempotence).
- * Vérifie Firestore ET la Map mémoire.
- *
- * @param {string} checkoutId
- * @returns {Promise<boolean>}
- */
 async function isAlreadyProcessed(checkoutId) {
-  // 1. Check mémoire
   if (processedCheckouts.has(checkoutId)) return true;
-
-  // 2. Check Firestore
   try {
     const db   = require('../config/firebase');
     const snap = await db.collection('leekpay_payments').doc(checkoutId).get();
     if (snap.exists && snap.data()?.premiumActivated === true) {
-      processedCheckouts.add(checkoutId); // Sync mémoire
+      processedCheckouts.add(checkoutId);
       return true;
     }
-  } catch { /* Firestore non dispo — continuer */ }
-
+  } catch (_) {}
   return false;
 }
 
-// ══════════════════════════════════════════════════════════════
-//  HELPERS FIRESTORE
-// ══════════════════════════════════════════════════════════════
-
-/**
- * Sauvegarder/mettre à jour un paiement LeekPay dans Firestore.
- * Non bloquant — les erreurs sont loguées.
- *
- * @param {string} checkoutId
- * @param {object} data
- */
-async function savePayment(checkoutId, data) {
+/* ═══════════════════════════════════════════════════════════════
+   Helpers Firestore
+══════════════════════════════════════════════════════════════════ */
+async function savePayment(docId, data) {
+  if (!docId) return;
   try {
     const db = require('../config/firebase');
-    await db
-      .collection('leekpay_payments')
-      .doc(checkoutId)
-      .set(
-        { ...data, updatedAt: new Date().toISOString() },
-        { merge: true }
-      );
+    await db.collection('leekpay_payments').doc(String(docId)).set(
+      { ...data, updatedAt: new Date().toISOString() },
+      { merge: true }
+    );
   } catch (err) {
-    logger.warn('[LeekPay] Impossible de sauvegarder paiement Firestore', {
-      checkoutId,
-      error: err.message,
-    });
+    logger.warn('[LeekPay] Firestore savePayment error', { docId, error: err.message });
   }
 }
 
-/**
- * Lire le statut premium d'un utilisateur depuis Firestore.
- * @param {string} userId
- * @returns {Promise<boolean|null>}
- */
 async function isPremiumUser(userId) {
   try {
     const db   = require('../config/firebase');
     const snap = await db.collection('users').doc(userId).get();
-    if (!snap.exists) return false;
-    return snap.data()?.isSubscribed === true;
-  } catch {
-    return null;
-  }
+    return snap.exists ? snap.data()?.isSubscribed === true : false;
+  } catch { return false; }
 }
 
-/**
- * Activer le statut premium dans Firestore.
- * Met à jour users/<userId> ET ajoute à subscriptions/.
- *
- * @param {string} userId
- * @param {object} opts
- */
-async function activatePremiumFirestore(userId, {
-  checkoutId,
-  transactionId,
-  amount,
-  currency,
-  paymentMethod,
-  paidAt,
-}) {
+async function activatePremiumFirestore(userId, { checkoutId, transactionId, amount, currency, paymentMethod, paidAt }) {
   const now = new Date().toISOString();
-
   try {
     const db = require('../config/firebase');
 
-    // Mise à jour document utilisateur
-    await db.collection('users').doc(userId).set(
-      {
-        isSubscribed   : true,
-        premium        : true,
-        subscribedAt   : paidAt || now,
-        paymentMethod  : 'leekpay',
-        paymentProvider: 'leekpay',
-        transactionId  : transactionId || checkoutId,
-        checkoutId     : checkoutId,
-        updatedAt      : now,
-      },
-      { merge: true }
-    );
+    await db.collection('users').doc(userId).set({
+      isSubscribed    : true,
+      premium         : true,
+      subscribedAt    : paidAt || now,
+      paymentMethod   : 'leekpay',
+      paymentProvider : 'leekpay',
+      transactionId   : transactionId || checkoutId,
+      checkoutId,
+      updatedAt       : now,
+    }, { merge: true });
 
-    // Historique des abonnements
     await db.collection('subscriptions').add({
       userId,
-      isSubscribed   : true,
-      subscribedAt   : paidAt || now,
-      paymentMethod  : 'leekpay',
-      paymentProvider: 'leekpay',
-      transactionId  : transactionId || checkoutId,
+      isSubscribed  : true,
+      subscribedAt  : paidAt || now,
+      paymentMethod : 'leekpay',
+      transactionId : transactionId || checkoutId,
       checkoutId,
-      amount         : amount    || leekpay.PREMIUM_AMOUNT,
-      currency       : currency  || leekpay.PREMIUM_CURRENCY,
-      paymentMobile  : paymentMethod === 'mobile_money',
-      app            : 'OmniSMS',
-      createdAt      : now,
+      amount        : amount   || leekpay.PREMIUM_AMOUNT,
+      currency      : currency || leekpay.PREMIUM_CURRENCY,
+      app           : 'OmniSMS',
+      createdAt     : now,
     });
 
-    logger.info('[LeekPay] ✅ Firestore premium activé', {
-      userId,
-      checkoutId,
-      transactionId,
-      amount,
-      currency,
-    });
-
+    logger.info('[LeekPay] ✅ Premium activé', { userId, checkoutId, transactionId });
   } catch (err) {
-    logger.error('[LeekPay] Erreur activation premium Firestore', {
-      userId,
-      checkoutId,
-      error: err.message,
-    });
-    // Ne pas propager — le paiement est confirmé, on log et on continue
+    logger.error('[LeekPay] Erreur activation premium Firestore', { userId, checkoutId, error: err.message });
   }
 }
 
-// ══════════════════════════════════════════════════════════════
-//  GÉNÉRATION orderId
-// ══════════════════════════════════════════════════════════════
-
-/**
- * Générer un orderId unique OmniSMS pour traçabilité.
- * Format : OMNI-LP-<timestamp>-<5 chars random>
- * @returns {string}
- */
 function generateOrderId() {
   return `OMNI-LP-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 }
 
-// ══════════════════════════════════════════════════════════════
-//  ACTION 1 : CRÉER UN PAIEMENT LeekPay
-// ══════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
+   POLLING — vérifier le statut après retour frontend
+   Appelé si aucun webhook reçu (fallback officiel)
+   Utilise GET /api/v1/checkout/:id jusqu'à status = "paid"
+══════════════════════════════════════════════════════════════════ */
+async function pollCheckoutStatus(checkoutId, userId, orderId, maxAttempts = 10, intervalMs = 5000) {
+  let attempts = 0;
 
-/**
- * POST /api/payment/leekpay
- *
- * Body JSON :
- *   {
- *     "userId"  : "firebase_uid",     (requis)
- *     "amount"  : 2000,               (optionnel — défaut PREMIUM_AMOUNT)
- *     "currency": "XOF",              (optionnel — défaut XOF)
- *     "phone"   : "+22670123456",     (optionnel — Mobile Money)
- *     "email"   : "user@example.com", (optionnel)
- *     "name"    : "Jean Dupont"       (optionnel)
- *   }
- *
- * Réponse succès (200) :
- *   { "success": true, "checkout_url": "https://leekpay.me/pay_xxx", "checkout_id": "checkout_xxx", ... }
- */
+  const poll = async () => {
+    attempts++;
+    if (attempts > maxAttempts) {
+      logger.warn('[LeekPay] Polling max attempts atteint', { checkoutId, userId });
+      return;
+    }
+
+    try {
+      const statusData = await leekpay.getCheckoutStatus(checkoutId);
+      logger.info('[LeekPay] Polling statut', { checkoutId, status: statusData.status, attempt: attempts });
+
+      if (statusData.isPaid || statusData.status === 'paid') {
+        // Paiement confirmé → activer le premium
+        const alreadyDone = await isAlreadyProcessed(checkoutId);
+        if (!alreadyDone) {
+          await handleSuccessfulPayment({
+            checkoutId,
+            transactionId: statusData.checkoutId,
+            userId,
+            orderId,
+            amount       : statusData.amount,
+            currency     : statusData.currency,
+            paymentMethod: statusData.paymentMethod,
+            paidAt       : statusData.paidAt,
+            customer     : statusData.customer || {},
+          });
+        }
+        return;  // polling terminé
+      }
+
+      if (['failed', 'cancelled', 'expired'].includes(statusData.status)) {
+        logger.info('[LeekPay] Polling : paiement échoué/annulé', { checkoutId, status: statusData.status });
+        await savePayment(checkoutId, { status: statusData.status, userId, pollEnded: true });
+        return;
+      }
+
+      // Encore en cours → réessayer
+      setTimeout(poll, intervalMs);
+
+    } catch (err) {
+      logger.error('[LeekPay] Erreur polling', { checkoutId, attempt: attempts, error: err.message });
+      if (attempts < maxAttempts) setTimeout(poll, intervalMs * 2);
+    }
+  };
+
+  setTimeout(poll, intervalMs);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ACTION 1 — Créer un paiement
+   POST /api/payment/leekpay
+══════════════════════════════════════════════════════════════════ */
 async function createPayment(req, res) {
   const { userId, amount, currency, phone, email, name } = req.body || {};
 
-  // ── Validation userId ──────────────────────────────────────
   if (!userId || typeof userId !== 'string' || userId.trim().length < 3) {
     return res.status(400).json({
       success: false,
-      error  : 'userId est requis (minimum 3 caractères).',
+      error  : 'userId requis.',
       code   : 'MISSING_USER_ID',
     });
   }
 
-  const cleanUserId = userId.trim();
-
-  // ── Vérification configuration LeekPay ────────────────────
   if (!leekpay.isConfigured()) {
-    logger.error('[LeekPay] Service non configuré — LEEKPAY_API_KEY ou LEEKPAY_SECRET_KEY manquante');
+    logger.error('[LeekPay] Non configuré — LEEKPAY_SECRET_KEY ou LEEKPAY_API_KEY manquante');
     return res.status(503).json({
       success: false,
-      error  : 'Service de paiement non disponible. Contactez l\'administrateur.',
+      error  : 'Service de paiement non disponible.',
       code   : 'LEEKPAY_NOT_CONFIGURED',
     });
   }
 
-  // ── Validation montant/devise ──────────────────────────────
+  const cleanUserId = userId.trim();
   const payAmount   = Number(amount)   || leekpay.PREMIUM_AMOUNT;
   const payCurrency = (currency || leekpay.PREMIUM_CURRENCY).toUpperCase();
 
-  try {
-    leekpay.validateAmount(payAmount, payCurrency);
-  } catch (err) {
+  try { leekpay.validateAmount(payAmount, payCurrency); }
+  catch (err) {
+    return res.status(400).json({ success: false, error: err.message, code: 'INVALID_AMOUNT' });
+  }
+
+  // Vérifier si déjà premium
+  if (await isPremiumUser(cleanUserId)) {
     return res.status(400).json({
-      success: false,
-      error  : err.message,
-      code   : 'INVALID_AMOUNT',
+      success          : false,
+      error            : 'Utilisateur déjà abonné OmniSMS Premium.',
+      code             : 'ALREADY_SUBSCRIBED',
+      alreadySubscribed: true,
     });
   }
 
-  // ── Anti double-paiement : vérifier si déjà premium ───────
-  try {
-    const alreadyPremium = await isPremiumUser(cleanUserId);
-    if (alreadyPremium === true) {
-      logger.info('[LeekPay] Utilisateur déjà premium', { userId: cleanUserId });
-      return res.status(400).json({
-        success          : false,
-        error            : 'Cet utilisateur est déjà abonné OmniSMS Premium.',
-        code             : 'ALREADY_SUBSCRIBED',
-        alreadySubscribed: true,
-      });
-    }
-  } catch (err) {
-    logger.warn('[LeekPay] Impossible de vérifier statut premium', { error: err.message });
-    // Continuer — mieux vaut laisser passer
-  }
+  const orderId      = generateOrderId();
+  const backendUrl   = (process.env.BACKEND_URL   || 'https://omnisms-backend.onrender.com').replace(/\/$/, '');
+  const frontendUrl  = (process.env.FRONTEND_URL  || 'https://omnisms-frontend.vercel.app').replace(/\/$/, '');
 
-  // ── Construire les URLs ────────────────────────────────────
-  const orderId    = generateOrderId();
-  const backendUrl = (process.env.BACKEND_URL || 'https://omnisms-backend.onrender.com').replace(/\/$/, '');
-  const frontendUrl = (process.env.FRONTEND_URL || 'https://omnisms.netlify.app').replace(/\/$/, '');
+  const returnUrl    = `${frontendUrl}/payment/success?orderId=${encodeURIComponent(orderId)}&userId=${encodeURIComponent(cleanUserId)}`;
+  const cancelUrl    = `${frontendUrl}/payment/cancel?orderId=${encodeURIComponent(orderId)}`;
+  const webhookUrl   = `${backendUrl}/api/payment/webhook/leekpay`;
 
-  const returnUrl = `${frontendUrl}/payment/success?orderId=${encodeURIComponent(orderId)}&userId=${encodeURIComponent(cleanUserId)}`;
-  const cancelUrl = `${frontendUrl}/payment/cancel?orderId=${encodeURIComponent(orderId)}`;
-
-  // ── Sauvegarder état pending ───────────────────────────────
+  // Sauvegarder état pending avant l'appel API
   await savePayment(orderId, {
-    checkoutId   : null, // sera mis à jour après l'appel LeekPay
     orderId,
-    userId       : cleanUserId,
-    status       : 'pending',
-    amount       : payAmount,
-    currency     : payCurrency,
-    phone        : phone  || null,
-    email        : email  || null,
-    name         : name   || null,
-    createdAt    : new Date().toISOString(),
-    ip           : req.ip || '0.0.0.0',
-    source       : 'api',
+    userId     : cleanUserId,
+    status     : 'pending',
+    amount     : payAmount,
+    currency   : payCurrency,
+    phone      : phone || null,
+    email      : email || null,
+    name       : name  || null,
+    createdAt  : new Date().toISOString(),
     premiumActivated: false,
   });
 
-  // ── Appeler l'API LeekPay ─────────────────────────────────
+  // Appeler l'API LeekPay → POST /api/v1/checkout
   let checkout;
   try {
     checkout = await leekpay.createCheckout({
       amount       : payAmount,
       currency     : payCurrency,
-      description  : `OmniSMS Premium — abonnement (${cleanUserId.substring(0, 8)}…)`,
+      description  : `OmniSMS Premium — ${cleanUserId.substring(0, 8)}`,
       returnUrl,
       cancelUrl,
       customerEmail: email  || undefined,
       customerName : name   || undefined,
       customerPhone: phone  || undefined,
-      metadata     : {
+      metadata: {
         userId    : cleanUserId,
         orderId,
         app       : 'OmniSMS',
-        source    : 'backend-api',
+        webhookUrl,
       },
     });
   } catch (err) {
-    // Mettre à jour Firestore avec l'erreur
     await savePayment(orderId, { status: 'error', errorMessage: err.message });
-
-    logger.error('[LeekPay] Erreur création checkout', {
-      userId : cleanUserId,
-      orderId,
-      error  : err.message,
-      status : err.response?.status,
-    });
-
+    logger.error('[LeekPay] Erreur création checkout', { userId: cleanUserId, orderId, error: err.message });
     return res.status(502).json({
       success: false,
-      error  : 'Impossible de contacter le service de paiement. Réessayez dans quelques instants.',
+      error  : 'Impossible de contacter le service de paiement. Réessayez.',
       code   : 'LEEKPAY_API_ERROR',
-      ...(process.env.NODE_ENV !== 'production' && { detail: err.message }),
+      detail : process.env.NODE_ENV !== 'production' ? err.message : undefined,
     });
   }
 
-  // ── Mettre à jour Firestore avec le checkoutId ─────────────
+  // Sauvegarder le checkoutId
   await savePayment(checkout.checkoutId, {
     checkoutId  : checkout.checkoutId,
     orderId,
     userId      : cleanUserId,
-    paymentUrl  : checkout.paymentUrl,
+    paymentUrl  : checkout.paymentUrl,   // data.payment_url
     status      : 'pending',
     amount      : payAmount,
     currency    : payCurrency,
@@ -353,57 +265,45 @@ async function createPayment(req, res) {
     premiumActivated: false,
   });
 
-  logger.info('[LeekPay] Paiement initié ✅', {
-    userId     : cleanUserId,
+  logger.info('[LeekPay] Checkout créé ✅', {
+    userId    : cleanUserId,
     orderId,
-    checkoutId : checkout.checkoutId,
-    amount     : payAmount,
-    currency   : payCurrency,
+    checkoutId: checkout.checkoutId,
+    paymentUrl: checkout.paymentUrl,
   });
 
-  // ── Réponse frontend ───────────────────────────────────────
+  // Lancer le polling en background (fallback si webhook non reçu)
+  // Polling commence après 30s, max 12 tentatives toutes les 10s
+  setTimeout(() => {
+    pollCheckoutStatus(checkout.checkoutId, cleanUserId, orderId, 12, 10000);
+  }, 30000);
+
+  // Réponse au frontend
+  // Le frontend doit ouvrir checkout.paymentUrl (data.payment_url)
   return res.status(200).json({
-    success       : true,
-    checkout_url  : checkout.paymentUrl,   // Spec frontend exacte
-    checkoutUrl   : checkout.paymentUrl,   // Alias camelCase
-    checkout_id   : checkout.checkoutId,
-    checkoutId    : checkout.checkoutId,
+    success      : true,
+    // Champ officiel de la documentation LeekPay
+    payment_url  : checkout.paymentUrl,   // ← data.payment_url
+    // Aliases pour compatibilité frontend
+    checkout_url : checkout.paymentUrl,
+    checkoutUrl  : checkout.paymentUrl,
+    // Identifiants
+    checkout_id  : checkout.checkoutId,
+    checkoutId   : checkout.checkoutId,
     orderId,
-    amount        : payAmount,
-    currency      : payCurrency,
-    expiresAt     : checkout.expiresAt,
-    message       : 'Redirigez l\'utilisateur vers checkout_url pour finaliser le paiement.',
+    // Montant
+    amount       : payAmount,
+    currency     : payCurrency,
+    expiresAt    : checkout.expiresAt,
+    message      : 'Ouvrez payment_url pour finaliser le paiement.',
   });
 }
 
-// ══════════════════════════════════════════════════════════════
-//  ACTION 2 : WEBHOOK LeekPay
-// ══════════════════════════════════════════════════════════════
-
-/**
- * POST /api/payment/webhook/leekpay
- *
- * Headers LeekPay :
- *   X-LeekPay-Event    : payment.completed
- *   X-LeekPay-Delivery : <delivery_id>
- *   X-LeekPay-Signature: <hmac_sha256_hex>
- *
- * Corps JSON :
- *   {
- *     "event": "payment.completed",
- *     "data": {
- *       "transaction_id": "TXN_xxx",
- *       "checkout_id"   : "checkout_xxx",
- *       "amount"        : 2000,
- *       "currency"      : "XOF",
- *       "status"        : "paid",
- *       "payment_method": "mobile_money",
- *       "customer"      : { email, name, phone },
- *       "metadata"      : { userId, orderId, ... },
- *       "paid_at"       : "2026-01-15T10:30:00+00:00"
- *     }
- *   }
- */
+/* ═══════════════════════════════════════════════════════════════
+   ACTION 2 — Webhook LeekPay
+   POST /api/payment/webhook/leekpay
+   Event : payment.completed
+══════════════════════════════════════════════════════════════════ */
 async function handleWebhook(req, res) {
   const rawBody   = req.rawBody || JSON.stringify(req.body || {});
   const signature = req.headers['x-leekpay-signature'] || '';
@@ -411,122 +311,70 @@ async function handleWebhook(req, res) {
   const delivery  = req.headers['x-leekpay-delivery']  || '';
   const body      = req.body || {};
 
-  // ── Log immédiat de la réception ──────────────────────────
   logger.info('[LeekPay Webhook] Réception', {
-    ip        : req.ip,
     event,
     delivery,
-    signature : signature ? signature.substring(0, 16) + '…' : 'absent',
-    status    : body.data?.status,
-    checkoutId: body.data?.checkout_id,
-    amount    : body.data?.amount,
+    status    : body.data?.status || body.status,
+    checkoutId: body.data?.checkout_id || body.data?.id,
   });
 
-  // ── Réponse 200 immédiate (évite les timeouts LeekPay) ────
-  // Le traitement se fait en setImmediate
+  // Répondre 200 immédiatement (évite timeout LeekPay)
   res.status(200).json({ received: true, timestamp: new Date().toISOString() });
 
-  // ── Traitement asynchrone ─────────────────────────────────
+  // Traitement asynchrone
   setImmediate(async () => {
     try {
       await processWebhookPayload(body, rawBody, signature, event);
     } catch (err) {
-      logger.error('[LeekPay Webhook] Erreur traitement asynchrone', {
-        error   : err.message,
-        event,
-        delivery,
-      });
+      logger.error('[LeekPay Webhook] Erreur traitement', { error: err.message, event, delivery });
     }
   });
 }
 
-/**
- * Traiter le payload webhook LeekPay.
- * Séparé de handleWebhook pour faciliter les tests unitaires.
- *
- * @param {object} body      - Corps JSON décodé
- * @param {string} rawBody   - Corps brut (pour HMAC)
- * @param {string} signature - Header X-LeekPay-Signature
- * @param {string} event     - Type d'événement
- */
 async function processWebhookPayload(body, rawBody, signature, event) {
-  // ── 1. Validation signature HMAC ──────────────────────────
+  // Vérification signature HMAC
   if (!leekpay.verifyWebhookSignature(rawBody, signature)) {
-    logger.error('[LeekPay Webhook] Signature invalide — ignoré', {
-      signature: signature ? signature.substring(0, 16) + '…' : 'absent',
-    });
+    logger.error('[LeekPay Webhook] Signature invalide — ignoré');
     return;
   }
 
-  // ── 2. Extraire les données ────────────────────────────────
-  const data          = body.data     || body;
-  const status        = (data.status  || '').toLowerCase();
-  const transactionId = data.transaction_id  || data.checkout_id || null;
-  const checkoutId    = data.checkout_id     || transactionId    || null;
-  const amount        = Number(data.amount)  || 0;
-  const currency      = data.currency        || leekpay.PREMIUM_CURRENCY;
-  const paymentMethod = data.payment_method  || null;
-  const paidAt        = data.paid_at         || null;
-  const metadata      = data.metadata        || {};
-  const customer      = data.customer        || {};
+  // Extraire les données
+  const data          = body.data || body;
+  const status        = (data.status || '').toLowerCase();
+  // checkout_id peut être dans data.checkout_id ou data.id
+  const checkoutId    = data.checkout_id || data.id || null;
+  const transactionId = data.transaction_id || checkoutId;
+  const amount        = Number(data.amount) || 0;
+  const currency      = data.currency       || leekpay.PREMIUM_CURRENCY;
+  const paymentMethod = data.payment_method || null;
+  const paidAt        = data.paid_at        || null;
+  const metadata      = data.metadata       || {};
+  const customer      = data.customer       || {};
 
-  // userId depuis metadata (mis lors de la création du checkout)
-  const userId = metadata.userId || data.userId || null;
-  const orderId = metadata.orderId || null;
+  // userId dans metadata (envoyé lors de la création du checkout)
+  const userId  = metadata.userId  || data.userId  || null;
+  const orderId = metadata.orderId || data.orderId || null;
 
-  logger.info('[LeekPay Webhook] Payload décodé', {
-    event,
-    status,
-    checkoutId,
-    transactionId,
-    userId,
-    orderId,
-    amount,
-    currency,
-    paymentMethod,
+  logger.info('[LeekPay Webhook] Payload', {
+    event, status, checkoutId, transactionId, userId, amount, currency,
   });
 
-  // ── 3. Router selon le statut ─────────────────────────────
-  const isPaid    = status === 'paid';
-  const isFailed  = ['failed', 'cancelled', 'expired'].includes(status);
-  const isPending = ['pending', 'processing'].includes(status);
-
-  if (isPaid) {
+  if (status === 'paid') {
     await handleSuccessfulPayment({
-      checkoutId,
-      transactionId,
-      userId,
-      orderId,
-      amount,
-      currency,
-      paymentMethod,
-      paidAt,
-      customer,
-      metadata,
-      rawBody: body,
+      checkoutId, transactionId, userId, orderId,
+      amount, currency, paymentMethod, paidAt, customer,
     });
 
-  } else if (isFailed) {
-    logger.info('[LeekPay Webhook] Paiement ÉCHOUÉ/ANNULÉ', { checkoutId, status, userId });
+  } else if (['failed', 'cancelled', 'expired'].includes(status)) {
+    logger.info('[LeekPay Webhook] Paiement ÉCHOUÉ', { checkoutId, status, userId });
     if (checkoutId) {
-      await savePayment(checkoutId, {
-        status       : 'failed',
-        transactionId,
-        userId,
-        failedAt     : new Date().toISOString(),
-        webhookStatus: status,
-      });
+      await savePayment(checkoutId, { status, transactionId, userId, failedAt: new Date().toISOString() });
     }
 
-  } else if (isPending) {
+  } else if (['pending', 'processing'].includes(status)) {
     logger.info('[LeekPay Webhook] Paiement EN COURS', { checkoutId, status });
     if (checkoutId) {
-      await savePayment(checkoutId, {
-        status       : 'processing',
-        transactionId,
-        userId,
-        webhookStatus: status,
-      });
+      await savePayment(checkoutId, { status: 'processing', transactionId, userId });
     }
 
   } else {
@@ -534,93 +382,51 @@ async function processWebhookPayload(body, rawBody, signature, event) {
   }
 }
 
-/**
- * Gérer un paiement confirmé (status: paid).
- * Activation premium — idempotente via Redis + Firestore.
- *
- * @param {object} params
- */
-async function handleSuccessfulPayment({
-  checkoutId,
-  transactionId,
-  userId,
-  orderId,
-  amount,
-  currency,
-  paymentMethod,
-  paidAt,
-  customer,
-  metadata,
-  rawBody,
-}) {
-  logger.info('[LeekPay Webhook] Paiement CONFIRMÉ ✅', {
-    checkoutId,
-    transactionId,
-    userId,
-    amount,
-    currency,
-    paymentMethod,
-  });
+async function handleSuccessfulPayment({ checkoutId, transactionId, userId, orderId, amount, currency, paymentMethod, paidAt, customer }) {
+  logger.info('[LeekPay] Paiement confirmé (paid) ✅', { checkoutId, transactionId, userId, amount, currency });
 
-  // ── 1. Anti-replay : vérifier si déjà traité ──────────────
-  if (checkoutId) {
-    // Protection contre les doubles processing simultanés
-    if (processingPayments.has(checkoutId)) {
-      logger.info('[LeekPay Webhook] Paiement en cours de traitement (concurrent) — ignoré', { checkoutId });
-      return;
-    }
-
-    const alreadyDone = await isAlreadyProcessed(checkoutId);
-    if (alreadyDone) {
-      logger.info('[LeekPay Webhook] Paiement déjà traité (idempotence)', { checkoutId });
-      return;
-    }
-
-    processingPayments.add(checkoutId);
+  // Anti-concurrent
+  if (checkoutId && processingPayments.has(checkoutId)) {
+    logger.info('[LeekPay] Traitement concurrent — ignoré', { checkoutId });
+    return;
   }
 
+  // Anti-replay
+  if (checkoutId && await isAlreadyProcessed(checkoutId)) {
+    logger.info('[LeekPay] Déjà traité (idempotence)', { checkoutId });
+    return;
+  }
+
+  if (checkoutId) processingPayments.add(checkoutId);
+
   try {
-    // ── 2. Mettre à jour Firestore — statut paid ─────────────
     if (checkoutId) {
       await savePayment(checkoutId, {
-        status         : 'paid',
+        status          : 'paid',
         transactionId,
         userId,
         orderId,
         amount,
         currency,
         paymentMethod,
-        paidAt         : paidAt || new Date().toISOString(),
+        paidAt          : paidAt || new Date().toISOString(),
         customer,
-        webhookStatus  : 'paid',
-        webhookReceived: new Date().toISOString(),
-        rawWebhook     : rawBody,
-        premiumActivated: false, // sera mis à true après activation
+        webhookReceived : new Date().toISOString(),
+        premiumActivated: false,
       });
     }
 
-    // ── 3. Vérifier userId ────────────────────────────────────
     if (!userId) {
-      logger.warn('[LeekPay Webhook] Paiement confirmé mais userId absent dans metadata', {
-        checkoutId,
-        transactionId,
-        hint: 'Vérifiez que metadata.userId est bien envoyé lors de la création du checkout.',
-        customer: customer?.email || 'inconnu',
+      logger.warn('[LeekPay] userId absent dans metadata — activation impossible', {
+        checkoutId, hint: 'Vérifier metadata.userId dans createCheckout()',
       });
       return;
     }
 
-    // ── 4. Activer le premium Firebase ───────────────────────
     await activatePremiumFirestore(userId, {
-      checkoutId,
-      transactionId,
-      amount,
-      currency,
-      paymentMethod,
-      paidAt,
+      checkoutId, transactionId, amount, currency, paymentMethod, paidAt,
     });
 
-    // ── 5. Marquer comme traité (idempotence) ────────────────
     if (checkoutId) {
       processedCheckouts.add(checkoutId);
       await savePayment(checkoutId, {
@@ -629,103 +435,61 @@ async function handleSuccessfulPayment({
       });
     }
 
-    // ── 6. Notifier via Socket.IO (si disponible) ─────────────
+    // Notifier via Socket.IO
     try {
       const { emitToUser } = require('../services/socketService');
       emitToUser(userId, 'payment:success', {
-        checkoutId,
-        transactionId,
-        amount,
-        currency,
-        premium    : true,
+        checkoutId, transactionId, amount, currency, premium: true,
         activatedAt: new Date().toISOString(),
       });
-      logger.info('[LeekPay Webhook] Socket.IO notification envoyée', { userId });
-    } catch { /* Socket.IO optionnel */ }
+    } catch (_) {}
 
-    logger.info('[LeekPay Webhook] Activation premium terminée ✅', {
-      userId,
-      checkoutId,
-      transactionId,
-    });
+    logger.info('[LeekPay] Activation terminée ✅', { userId, checkoutId });
 
   } finally {
-    // Toujours libérer le verrou
     if (checkoutId) processingPayments.delete(checkoutId);
   }
 }
 
-// ══════════════════════════════════════════════════════════════
-//  ACTION 3 : STATUT TRANSACTION
-// ══════════════════════════════════════════════════════════════
-
-/**
- * GET /api/payment/status/:transactionId
- *
- * Vérifier le statut d'un paiement LeekPay.
- * Cherche dans Firestore d'abord, puis appelle l'API LeekPay si nécessaire.
- *
- * Paramètre URL : :transactionId = checkoutId ou orderId
- *
- * Réponse :
- *   {
- *     "success"      : true,
- *     "checkoutId"   : "checkout_xxx",
- *     "status"       : "paid" | "pending" | "failed" | ...,
- *     "amount"       : 2000,
- *     "currency"     : "XOF",
- *     "premiumActive": true,
- *     "paidAt"       : "2026-01-15T10:30:00Z"
- *   }
- */
+/* ═══════════════════════════════════════════════════════════════
+   ACTION 3 — Statut d'un paiement
+   GET /api/payment/status/:transactionId
+══════════════════════════════════════════════════════════════════ */
 async function getPaymentStatus(req, res) {
   const { transactionId } = req.params;
-
-  if (!transactionId || typeof transactionId !== 'string') {
-    return res.status(400).json({
-      success: false,
-      error  : 'transactionId requis.',
-      code   : 'MISSING_TRANSACTION_ID',
-    });
+  if (!transactionId) {
+    return res.status(400).json({ success: false, error: 'transactionId requis.', code: 'MISSING_ID' });
   }
 
   const cleanId = transactionId.trim();
 
-  // ── 1. Chercher dans Firestore ─────────────────────────────
+  // 1. Chercher dans Firestore
   try {
     const db   = require('../config/firebase');
     const snap = await db.collection('leekpay_payments').doc(cleanId).get();
-
     if (snap.exists) {
-      const data = snap.data();
+      const d = snap.data();
       return res.status(200).json({
         success         : true,
         source          : 'firestore',
-        checkoutId      : data.checkoutId      || cleanId,
-        orderId         : data.orderId         || null,
-        status          : data.status          || 'unknown',
-        amount          : data.amount          || 0,
-        currency        : data.currency        || leekpay.PREMIUM_CURRENCY,
-        premiumActivated: data.premiumActivated || false,
-        paidAt          : data.paidAt          || null,
-        expiresAt       : data.expiresAt       || null,
-        paymentMethod   : data.paymentMethod   || null,
-        createdAt       : data.createdAt       || null,
-        updatedAt       : data.updatedAt       || null,
+        checkoutId      : d.checkoutId   || cleanId,
+        orderId         : d.orderId      || null,
+        status          : d.status       || 'unknown',
+        amount          : d.amount       || 0,
+        currency        : d.currency     || leekpay.PREMIUM_CURRENCY,
+        premiumActivated: d.premiumActivated || false,
+        paidAt          : d.paidAt       || null,
+        paymentMethod   : d.paymentMethod || null,
+        updatedAt       : d.updatedAt    || null,
       });
     }
   } catch (err) {
     logger.warn('[LeekPay] Firestore indisponible pour statut', { error: err.message, transactionId: cleanId });
   }
 
-  // ── 2. Appeler l'API LeekPay directement ──────────────────
+  // 2. Appeler GET /api/v1/checkout/:id
   if (!leekpay.isConfigured()) {
-    return res.status(404).json({
-      success: false,
-      error  : 'Transaction introuvable.',
-      code   : 'NOT_FOUND',
-      transactionId: cleanId,
-    });
+    return res.status(404).json({ success: false, error: 'Transaction introuvable.', code: 'NOT_FOUND' });
   }
 
   try {
@@ -737,45 +501,29 @@ async function getPaymentStatus(req, res) {
       status          : statusData.status,
       amount          : statusData.amount,
       currency        : statusData.currency,
-      premiumActivated: false, // L'API ne le sait pas directement
+      premiumActivated: false,
       paidAt          : statusData.paidAt,
       paymentMethod   : statusData.paymentMethod,
-      metadata        : statusData.metadata,
+      isPaid          : statusData.isPaid,
     });
   } catch (err) {
-    logger.error('[LeekPay] Erreur vérification statut API', {
-      transactionId: cleanId,
-      error        : err.message,
-    });
-
     return res.status(404).json({
       success: false,
-      error  : 'Transaction introuvable ou service indisponible.',
-      code   : 'TRANSACTION_NOT_FOUND',
+      error  : 'Transaction introuvable.',
+      code   : 'NOT_FOUND',
       transactionId: cleanId,
     });
   }
 }
 
-// ══════════════════════════════════════════════════════════════
-//  ACTION 4 : STATUT PREMIUM UTILISATEUR
-// ══════════════════════════════════════════════════════════════
-
-/**
- * GET /api/payment/user-status?userId=xxx
- *
- * Vérifier si un utilisateur est premium.
- * Lit depuis Firestore users/<userId>.
- */
+/* ═══════════════════════════════════════════════════════════════
+   ACTION 4 — Statut premium utilisateur
+   GET /api/payment/user-status?userId=xxx
+══════════════════════════════════════════════════════════════════ */
 async function getUserPremiumStatus(req, res) {
   const userId = (req.query?.userId || req.body?.userId || '').trim();
-
   if (!userId) {
-    return res.status(400).json({
-      success: false,
-      error  : 'userId requis (?userId=xxx)',
-      code   : 'MISSING_USER_ID',
-    });
+    return res.status(400).json({ success: false, error: 'userId requis.', code: 'MISSING_USER_ID' });
   }
 
   try {
@@ -784,11 +532,7 @@ async function getUserPremiumStatus(req, res) {
 
     if (!snap.exists) {
       return res.status(200).json({
-        success      : true,
-        userId,
-        premium      : false,
-        isSubscribed : false,
-        source       : 'firestore_not_found',
+        success: true, userId, premium: false, isSubscribed: false, source: 'not_found',
       });
     }
 
@@ -800,33 +544,78 @@ async function getUserPremiumStatus(req, res) {
       userId,
       premium,
       isSubscribed   : premium,
-      subscribedAt   : user.subscribedAt    || null,
-      paymentMethod  : user.paymentMethod   || null,
-      paymentProvider: user.paymentProvider || null,
-      transactionId  : user.transactionId   || null,
+      subscribedAt   : user.subscribedAt   || null,
+      paymentMethod  : user.paymentMethod  || null,
+      transactionId  : user.transactionId  || null,
       source         : 'firestore',
     });
 
   } catch (err) {
-    logger.error('[LeekPay] Erreur statut premium utilisateur', { userId, error: err.message });
+    logger.error('[LeekPay] Erreur statut premium', { userId, error: err.message });
     return res.status(200).json({
-      success     : true,
-      userId,
-      premium     : false,
-      isSubscribed: false,
-      source      : 'error_fallback',
+      success: true, userId, premium: false, isSubscribed: false, source: 'error',
     });
   }
 }
 
-// ══════════════════════════════════════════════════════════════
-//  EXPORTS
-// ══════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
+   ACTION 5 — Polling manuel (appelé depuis le frontend après retour)
+   POST /api/payment/poll/:checkoutId
+══════════════════════════════════════════════════════════════════ */
+async function pollPayment(req, res) {
+  const { checkoutId } = req.params;
+  const { userId }     = req.body || {};
+
+  if (!checkoutId) {
+    return res.status(400).json({ success: false, error: 'checkoutId requis.' });
+  }
+
+  if (!leekpay.isConfigured()) {
+    return res.status(503).json({ success: false, error: 'LeekPay non configuré.' });
+  }
+
+  try {
+    const statusData = await leekpay.getCheckoutStatus(checkoutId);
+    const isPaid     = statusData.isPaid || statusData.status === 'paid';
+
+    if (isPaid && userId) {
+      const alreadyDone = await isAlreadyProcessed(checkoutId);
+      if (!alreadyDone) {
+        await handleSuccessfulPayment({
+          checkoutId,
+          transactionId: statusData.checkoutId,
+          userId,
+          orderId      : null,
+          amount       : statusData.amount,
+          currency     : statusData.currency,
+          paymentMethod: statusData.paymentMethod,
+          paidAt       : statusData.paidAt,
+          customer     : statusData.customer || {},
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success : true,
+      status  : statusData.status,
+      isPaid,
+      premium : isPaid,
+      checkoutId,
+    });
+
+  } catch (err) {
+    logger.error('[LeekPay] Erreur poll payment', { checkoutId, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+/* ── Exports ─────────────────────────────────────────────────── */
 module.exports = {
   createPayment,
   handleWebhook,
   getPaymentStatus,
   getUserPremiumStatus,
-  processWebhookPayload,    // Export pour tests
-  processedCheckouts,       // Export pour inspection
+  pollPayment,
+  processWebhookPayload,  // pour tests
+  processedCheckouts,
 };

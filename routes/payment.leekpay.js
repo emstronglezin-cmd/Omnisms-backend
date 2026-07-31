@@ -173,4 +173,11 @@ router.get('/status/:transactionId', controller.getPaymentStatus);
  */
 router.get('/user-status', controller.getUserPremiumStatus);
 
+// ══════════════════════════════════════════════════════════════
+//  ROUTE 5 : POST /api/payment/poll/:checkoutId
+//  Polling manuel — vérifier le statut et activer si "paid"
+//  Utilisé par le frontend si aucun webhook n'est reçu
+// ══════════════════════════════════════════════════════════════
+router.post('/poll/:checkoutId', controller.pollPayment);
+
 module.exports = router;
