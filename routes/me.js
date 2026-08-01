@@ -45,15 +45,16 @@ router.get('/', auth, async (req, res) => {
 /* ── PUT /me/profile ──────────────────────────────────────── */
 router.put('/profile', auth, async (req, res) => {
   const uid = req.user.uid;
-  const { name, email, phone, bio, password } = req.body;
+  const { name, email, phone, bio, password, username } = req.body;
 
   try {
     const updates = { updatedAt: new Date().toISOString() };
 
-    if (name  !== undefined && name  !== null) updates.name  = String(name).trim();
-    if (email !== undefined && email !== null) updates.email = String(email).toLowerCase().trim();
-    if (phone !== undefined && phone !== null) updates.phone = String(phone).trim();
-    if (bio   !== undefined && bio   !== null) updates.bio   = String(bio).trim();
+    if (name     !== undefined && name     !== null) updates.name     = String(name).trim();
+    if (email    !== undefined && email    !== null) updates.email    = String(email).toLowerCase().trim();
+    if (phone    !== undefined && phone    !== null) updates.phone    = String(phone).trim();
+    if (bio      !== undefined && bio      !== null) updates.bio      = String(bio).trim();
+    if (username !== undefined && username !== null) updates.username = String(username).toLowerCase().trim();
 
     if (password && password.length >= 8) {
       updates.password = await bcrypt.hash(password, 12);

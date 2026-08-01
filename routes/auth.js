@@ -49,6 +49,12 @@ router.post(
       .trim()
       .isLength({ min: 2, max: 100 })
       .withMessage('Le nom doit contenir entre 2 et 100 caractères.'),
+    body('username')
+      .optional({ checkFalsy: true })
+      .trim()
+      .isLength({ min: 2, max: 50 })
+      .matches(/^[a-zA-Z0-9_.-]+$/)
+      .withMessage('Le nom d\'utilisateur ne peut contenir que des lettres, chiffres, _ . -'),
     body('phone')
       .trim()
       .notEmpty()
@@ -69,9 +75,13 @@ router.post(
     const validationError = handleValidation(req, res);
     if (validationError) return;
 
-    const { name, email, password, phone } = req.body;
-    const normalizedPhone = phone.trim();
-    const normalizedEmail = email ? email.toLowerCase().trim() : null;
+    const { name, email, password, phone, username } = req.body;
+    const normalizedPhone    = phone.trim();
+    const normalizedEmail    = email ? email.toLowerCase().trim() : null;
+    // Générer un username par défaut si non fourni
+    const normalizedUsername = username
+      ? username.trim().toLowerCase()
+      : (normalizedPhone.replace(/[^a-z0-9]/gi, '').slice(-8) || `user${Date.now().toString().slice(-6)}`);
 
     try {
       // Vérifier si le numéro de téléphone existe déjà
@@ -109,6 +119,7 @@ router.post(
 
       const userData = {
         name          : name.trim(),
+        username      : normalizedUsername,
         phone         : normalizedPhone,
         email         : normalizedEmail,
         password      : hashedPassword,
@@ -138,6 +149,7 @@ router.post(
         user: {
           id           : userId,
           name         : userData.name,
+          username     : normalizedUsername,
           phone        : normalizedPhone,
           email        : normalizedEmail,
           phoneVerified: true,
@@ -249,11 +261,13 @@ router.post(
         user: {
           id           : user.id,
           name         : user.name,
+          username     : user.username     || null,
           email        : user.email        || null,
           phone        : user.phone        || null,
           phoneVerified: user.phoneVerified !== false,
           isSubscribed : user.isSubscribed || false,
           credits      : user.credits      || 0,
+          needsPhone   : !user.phone,   // flag pour forcer la saisie du téléphone
         },
       });
     } catch (err) {

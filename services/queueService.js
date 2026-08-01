@@ -34,28 +34,49 @@ let redisConnection = null;
 if (bullmqAvailable && REDIS_URL) {
   try {
     const Redis = require('ioredis');
-    redisConnection = new Redis(REDIS_URL, {
-      maxRetriesPerRequest: null, // requis par BullMQ
+    let _queueFallback = false;
+
+    const conn = new Redis(REDIS_URL, {
+      maxRetriesPerRequest: null,   // requis par BullMQ
       enableReadyCheck    : false,
       lazyConnect         : false,
+      connectTimeout      : 8000,
+      commandTimeout      : 5000,
       retryStrategy(times) {
-        if (times >= 3) return null; // stoppe après 3 tentatives
-        return Math.min(times * 500, 2000);
+        if (_queueFallback) return null;  // ne plus réessayer après fallback
+        if (times >= 2) return null;      // max 2 tentatives avant abandon
+        return Math.min(times * 1000, 2000);
       },
     });
-    let _queueFallback = false;
-    redisConnection.on('error', (err) => {
-      if (_queueFallback) return;
-      const isFatal = err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED' || err.code === 'EAI_AGAIN';
+
+    conn.on('error', (err) => {
+      if (_queueFallback) return;   // log unique — plus rien ensuite
+      const isFatal = (
+        err.code === 'ENOTFOUND' ||
+        err.code === 'ECONNREFUSED' ||
+        err.code === 'EAI_AGAIN' ||
+        err.code === 'ETIMEDOUT'
+      );
       if (isFatal) {
         _queueFallback = true;
         logger.warn(`[Queue] Redis DNS/network error (${err.code}) — switching to inline execution.`);
         redisConnection = null;
-        try { redisConnection && redisConnection.disconnect(); } catch (_) {}
+        // Tenter une déconnexion propre sans spam
+        try { conn.disconnect(false); } catch (_) {}
       } else {
         logger.error('[Queue] Redis error', { msg: err.message });
       }
     });
+
+    conn.on('end', () => {
+      if (!_queueFallback) {
+        logger.warn('[Queue] Redis connection closed — switching to inline execution.');
+        _queueFallback = true;
+        redisConnection = null;
+      }
+    });
+
+    redisConnection = conn;
     logger.info('[Queue] BullMQ connected to Redis.');
   } catch (err) {
     logger.error('[Queue] Redis connection failed', { error: err.message });

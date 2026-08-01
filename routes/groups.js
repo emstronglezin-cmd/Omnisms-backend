@@ -155,6 +155,76 @@ router.post('/:id/messages', authenticate, async (req, res) => {
   }
 });
 
+// ── PUT /groups/:id — Modifier un groupe (nom, image, icône) ─
+router.put('/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { name, image, icon, description } = req.body;
+
+  try {
+    const ref  = db.collection('groups').doc(id);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+    }
+
+    if (snap.data().ownerId !== req.user.uid) {
+      return res.status(403).json({ error: 'Seul le propriétaire peut modifier le groupe.', code: 'FORBIDDEN' });
+    }
+
+    const updates = { updatedAt: new Date().toISOString() };
+    if (name        !== undefined) updates.name        = String(name).trim();
+    if (image       !== undefined) updates.image       = image;
+    if (icon        !== undefined) updates.icon        = icon;
+    if (description !== undefined) updates.description = String(description).trim();
+
+    if (Object.keys(updates).length === 1) {
+      return res.status(400).json({ error: 'Aucun champ à mettre à jour.', code: 'NO_FIELDS' });
+    }
+
+    await ref.update(updates);
+    const updated = await ref.get();
+
+    logger.info('Groupe mis à jour', { groupId: id, owner: req.user.uid });
+    return res.status(200).json({ id: updated.id, ...updated.data() });
+  } catch (err) {
+    logger.error('Erreur mise à jour groupe', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
+
+// ── POST /groups/:id/avatar — Upload image de groupe ─────────
+let groupImageUpload = null;
+let groupBuildFileUrl = null;
+try {
+  const uploadService  = require('../services/uploadService');
+  groupImageUpload     = uploadService.imageUpload;
+  groupBuildFileUrl    = uploadService.buildFileUrl;
+} catch (_) {}
+
+if (groupImageUpload && groupBuildFileUrl) {
+  router.post('/:id/avatar', authenticate, groupImageUpload.single('image'), async (req, res) => {
+    const { id } = req.params;
+    if (!req.file) {
+      return res.status(400).json({ error: 'Aucun fichier fourni.', code: 'NO_FILE' });
+    }
+    try {
+      const ref  = db.collection('groups').doc(id);
+      const snap = await ref.get();
+      if (!snap.exists) return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+      if (snap.data().ownerId !== req.user.uid) {
+        return res.status(403).json({ error: 'Seul le propriétaire peut modifier l\'image.', code: 'FORBIDDEN' });
+      }
+      const imageUrl = groupBuildFileUrl('images', req.file.filename);
+      await ref.update({ image: imageUrl, updatedAt: new Date().toISOString() });
+      return res.status(200).json({ success: true, imageUrl });
+    } catch (err) {
+      logger.error('Erreur upload image groupe', { error: err.message });
+      return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+    }
+  });
+}
+
 // ── GET /groups/:id/messages — Récupérer les messages ───────
 router.get('/:id/messages', authenticate, async (req, res) => {
   const { id } = req.params;
