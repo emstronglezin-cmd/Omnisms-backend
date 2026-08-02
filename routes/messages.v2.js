@@ -20,6 +20,9 @@ const firebaseAuth = require('../middleware/firebaseAuth');
 const { normalizePhone } = require('../services/phoneNormalizer');
 const { emitToUser }    = require('../services/socketService');
 const { logger }        = require('../middleware/logger');
+/* ── Transcription auto pour messages vocaux ─────────────── */
+let addTranscriptionJob = null;
+try { ({ addTranscriptionJob } = require('../services/queueService')); } catch (_) {}
 
 /* ── Infobip (optionnel — non bloquant si non configuré) ───── */
 let infobip = null;
@@ -123,11 +126,16 @@ router.get('/', auth, async (req, res) => {
 
     // Enrichir les conversations avec le nom de l'autre utilisateur
     if (db) {
-      const otherUids = [...new Set([...convMap.values()].map(c => c.otherUserId).filter(Boolean))];
+      // Séparer les UIDs Firestore des numéros de téléphone
+      const otherUids   = [...new Set([...convMap.values()].map(c => c.otherUserId).filter(Boolean))];
+      const phoneOthers = otherUids.filter(u => /^\+?[0-9\s\-()+]{7,20}$/.test(u) && !u.includes('-'));
+      const uidOthers   = otherUids.filter(u => !phoneOthers.includes(u));
+
       const userCache = new Map();
-      // Batch lookup par lot de 10
-      for (let i = 0; i < otherUids.length; i += 10) {
-        const batch = otherUids.slice(i, i + 10);
+
+      // 1. Lookup des vrais UIDs Firestore
+      for (let i = 0; i < uidOthers.length; i += 10) {
+        const batch = uidOthers.slice(i, i + 10);
         try {
           const userDocs = await Promise.all(batch.map(u => db.collection('users').doc(u).get()));
           userDocs.forEach((doc, idx) => {
@@ -138,6 +146,27 @@ router.get('/', auth, async (req, res) => {
           });
         } catch (_) {}
       }
+
+      // 2. Pour les numéros de téléphone : chercher le nom dans les contacts de l'utilisateur
+      if (phoneOthers.length > 0) {
+        try {
+          const mySnap = await db.collection('users').doc(uid).get();
+          if (mySnap.exists) {
+            const myData = mySnap.data();
+            const allContacts = [
+              ...(myData.contacts_manual || []),
+              ...(myData.contacts_synced || []),
+            ];
+            phoneOthers.forEach(phone => {
+              const match = allContacts.find(c => c.phone === phone || c.phone === phone.replace(/\s/g,''));
+              if (match && match.name) {
+                userCache.set(phone, { name: match.name, avatar: match.avatar || null, phone });
+              }
+            });
+          }
+        } catch (_) {}
+      }
+
       convMap.forEach((conv) => {
         const info = userCache.get(conv.otherUserId);
         if (info) {
@@ -145,6 +174,10 @@ router.get('/', auth, async (req, res) => {
           conv.otherUserAvatar= info.avatar|| conv.otherUserAvatar|| null;
           conv.otherUserPhone = info.phone || conv.otherUserPhone || null;
           conv.contactName    = info.name  || conv.contactName    || conv.otherUserId;
+        } else {
+          // Fallback : utiliser otherUserId comme displayName
+          if (!conv.otherUserName) conv.otherUserName = conv.otherUserId;
+          if (!conv.contactName)   conv.contactName   = conv.otherUserId;
         }
       });
     }
@@ -340,6 +373,28 @@ router.post(
         // Socket.IO peut ne pas être initialisé — non bloquant
       }
 
+      // ── Auto-transcription pour messages vocaux ───────────────
+      if (type === 'audio' && audioUrl && addTranscriptionJob) {
+        try {
+          // Extraire le nom de fichier depuis l'URL audio
+          const path  = require('path');
+          const fs    = require('fs');
+          const fname = audioUrl.split('/').pop();
+          const audioPath = path.join(__dirname, '..', 'uploads', 'audio', fname);
+          if (fs.existsSync(audioPath)) {
+            await addTranscriptionJob({
+              audioPath,
+              messageId: docId,
+              userId   : uid,
+              language : 'fr',
+            });
+            logger.info('[Messages] Transcription job lancé auto', { msgId: docId });
+          }
+        } catch (transcErr) {
+          logger.warn('[Messages] Échec lancement transcription auto', { error: transcErr.message });
+        }
+      }
+
       // ── Fallback SMS Infobip automatique ─────────────────────
       // Logique : si le destinataire n'a PAS de compte OmniSMS vérifié
       //           → envoyer un SMS Infobip automatiquement
@@ -351,26 +406,35 @@ router.post(
           let recipientPhone = phone || null;  // phone peut venir du frontend (override optionnel)
           let recipientIsOmniSms = false;
 
-          if (db) {
+          // Détecter si receiverId est un numéro de téléphone (non-OmniSMS direct)
+          const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
+
+          if (looksLikePhone) {
+            // receiverId EST un numéro de téléphone → toujours SMS
+            recipientIsOmniSms = false;
+            if (!recipientPhone) recipientPhone = receiverId;
+          } else if (db) {
+            // receiverId est un UID Firestore → chercher dans users
             const recipientSnap = await db.collection('users').doc(receiverId).get();
             if (recipientSnap.exists) {
               const recipientData = recipientSnap.data();
               // Considéré comme utilisateur OmniSMS si phoneVerified OU pas de flag phoneVerified
-              // (comptes legacy créés avant l'introduction du flag)
               recipientIsOmniSms = recipientData.phoneVerified !== false;
               // Récupérer le numéro du destinataire si on doit envoyer un SMS
               if (!recipientPhone) recipientPhone = recipientData.phone || null;
             } else {
-              // Utilisateur inconnu dans Firestore → SMS fallback si on a un numéro
+              // UID Firestore introuvable → SMS fallback si on a un numéro
               recipientIsOmniSms = false;
             }
           }
 
           // 2. Si le destinataire n'est PAS sur OmniSMS, envoyer un SMS classique
           if (!recipientIsOmniSms && recipientPhone && infobip.isConfigured()) {
+            // Normaliser en E.164 pour Infobip
+            const normalizedRecipient = normalizePhone(recipientPhone) || recipientPhone;
             const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
             smsResult = await infobip.sendSMS({
-              to       : recipientPhone,
+              to       : normalizedRecipient,
               text     : content.trim(),
               from     : smsFrom || process.env.INFOBIP_SENDER || process.env.INFOBIP_SENDER_ID || 'OmniSMS',
               notifyUrl: deliveryUrl,

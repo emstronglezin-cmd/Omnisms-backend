@@ -36,7 +36,7 @@ if (bullmqAvailable && REDIS_URL) {
     const Redis = require('ioredis');
     let _queueFallback = false;
 
-    const conn = new Redis(REDIS_URL, {
+    const queueOpts = {
       maxRetriesPerRequest: null,   // requis par BullMQ
       enableReadyCheck    : false,
       lazyConnect         : false,
@@ -47,7 +47,12 @@ if (bullmqAvailable && REDIS_URL) {
         if (times >= 2) return null;      // max 2 tentatives avant abandon
         return Math.min(times * 1000, 2000);
       },
-    });
+    };
+    // TLS requis pour Upstash (rediss:// ou URL contient "upstash")
+    if (REDIS_URL.startsWith('rediss://') || REDIS_URL.includes('upstash')) {
+      queueOpts.tls = {};
+    }
+    const conn = new Redis(REDIS_URL, queueOpts);
 
     conn.on('error', (err) => {
       if (_queueFallback) return;   // log unique — plus rien ensuite

@@ -255,4 +255,43 @@ router.get('/:id/messages', authenticate, async (req, res) => {
   }
 });
 
+// ── PUT /groups/:id/admin — Changer l'administrateur ────────
+router.put('/:id/admin', authenticate, async (req, res) => {
+  const { id }      = req.params;
+  const { newOwner } = req.body;
+
+  if (!newOwner) {
+    return res.status(400).json({ error: 'newOwner est requis.', code: 'MISSING_FIELDS' });
+  }
+
+  try {
+    const ref  = db.collection('groups').doc(id);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+    }
+
+    const data = snap.data();
+    if (data.ownerId !== req.user.uid) {
+      return res.status(403).json({ error: 'Seul le propriétaire peut changer l\'admin.', code: 'FORBIDDEN' });
+    }
+
+    if (!data.members.includes(newOwner)) {
+      return res.status(400).json({ error: 'Le nouvel admin doit être membre du groupe.', code: 'NOT_MEMBER' });
+    }
+
+    await ref.update({
+      ownerId  : newOwner,
+      updatedAt: new Date().toISOString(),
+    });
+
+    logger.info('Admin groupe changé', { groupId: id, from: req.user.uid, to: newOwner });
+    return res.status(200).json({ success: true, groupId: id, newOwner });
+  } catch (err) {
+    logger.error('Erreur changement admin groupe', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
+
 module.exports = router;
