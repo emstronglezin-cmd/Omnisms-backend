@@ -45,12 +45,29 @@ function infobipRequest(method, path, payload) {
       return reject(new Error('Infobip not configured: set INFOBIP_API_KEY and INFOBIP_BASE_URL'));
     }
 
-    const parsed  = url.parse(baseUrl);
+    // ── CRITICAL FIX: normalise baseUrl — prepend https:// if missing ──
+    // Without this, url.parse("x196k3.api.infobip.com") returns hostname=null
+    // and the entire HTTP request silently fails.
+    let normalizedBaseUrl = baseUrl.trim();
+    if (normalizedBaseUrl && !normalizedBaseUrl.match(/^https?:\/\//i)) {
+      normalizedBaseUrl = 'https://' + normalizedBaseUrl;
+      logger.warn('[Infobip] baseUrl was missing https:// prefix — auto-corrected', {
+        original   : baseUrl,
+        normalized : normalizedBaseUrl,
+      });
+    }
+
+    const parsed  = url.parse(normalizedBaseUrl);
     const isHttps = parsed.protocol === 'https:';
     const host    = parsed.hostname;
     const port    = parsed.port
       ? parseInt(parsed.port, 10)
       : (isHttps ? 443 : 80);
+
+    // Guard: if host is still null after normalization, reject immediately
+    if (!host) {
+      return reject(new Error(`Infobip baseUrl invalid — could not parse hostname from: "${baseUrl}"`));
+    }
 
     const body = payload ? JSON.stringify(payload) : null;
 
@@ -67,6 +84,10 @@ function infobipRequest(method, path, payload) {
       },
     };
 
+    logger.info('[Infobip] Request', {
+      method, host, port, path, isHttps,
+    });
+
     const transport = isHttps ? https : http;
     const req = transport.request(options, (res) => {
       let data = '';
@@ -75,11 +96,25 @@ function infobipRequest(method, path, payload) {
         let parsedBody;
         try   { parsedBody = JSON.parse(data); }
         catch (_) { parsedBody = { raw: data }; }
+        logger.info('[Infobip] Response', {
+          statusCode: res.statusCode,
+          body      : JSON.stringify(parsedBody).slice(0, 500),
+        });
         resolve({ statusCode: res.statusCode, body: parsedBody });
       });
     });
 
-    req.on('error', reject);
+    req.on('error', (err) => {
+      logger.error('[Infobip] HTTP request error', {
+        host, port, path, method,
+        error : err.message,
+        code  : err.code,
+        hint  : host === null
+          ? 'INFOBIP_BASE_URL env var is malformed — set to e.g. https://XXXXX.api.infobip.com'
+          : 'Check network/firewall or INFOBIP_BASE_URL value',
+      });
+      reject(err);
+    });
     req.setTimeout(15000, () => {
       req.destroy(new Error('Infobip request timed out after 15s'));
     });
@@ -121,14 +156,25 @@ async function sendSMS({ to, text, from, notifyUrl } = {}) {
     ],
   };
 
-  logger.info('[Infobip] Sending SMS', { to, from: from || senderId, textLength: text.length });
+  const { baseUrl: bUrl } = getConfig();
+  logger.info('[Infobip] Sending SMS', {
+    to, from: from || senderId, textLength: text.length,
+    baseUrl : bUrl,
+    configured: isConfigured(),
+  });
 
   let response;
   try {
     response = await infobipRequest('POST', '/sms/2/text/advanced', payload);
   } catch (err) {
-    logger.error('[Infobip] HTTP error', { error: err.message });
-    return { success: false, error: err.message };
+    logger.error('[Infobip] HTTP error during sendSMS', {
+      error  : err.message,
+      code   : err.code,
+      to,
+      baseUrl: bUrl,
+      hint   : 'Check INFOBIP_BASE_URL and INFOBIP_API_KEY environment variables on Render',
+    });
+    return { success: false, error: err.message, code: err.code };
   }
 
   const { statusCode, body } = response;
@@ -138,15 +184,27 @@ async function sendSMS({ to, text, from, notifyUrl } = {}) {
     const messageId = msg?.messageId || msg?.message_id || null;
     const status    = msg?.status?.name || msg?.status?.groupName || 'SENT';
 
-    logger.info('[Infobip] SMS sent', { to, messageId, status });
+    logger.info('[Infobip] SMS sent successfully', { to, messageId, status, statusCode });
     return { success: true, messageId, status, raw: body };
   }
 
+  // Verbose failure logging — never mask the actual Infobip API response
   const errMsg = body?.requestError?.serviceException?.text
+    || body?.requestError?.serviceException?.messageId
     || body?.error
     || JSON.stringify(body);
 
-  logger.error('[Infobip] SMS send failed', { to, statusCode, error: errMsg });
+  logger.error('[Infobip] SMS send FAILED', {
+    to, statusCode,
+    error    : errMsg,
+    fullBody : JSON.stringify(body).slice(0, 800),
+    apiKeySet: !!getConfig().apiKey,
+    baseUrl  : bUrl,
+    hint     : statusCode === 401 ? 'Invalid API key — check INFOBIP_API_KEY'
+             : statusCode === 400 ? 'Bad request — check phone format (E.164) and sender ID'
+             : statusCode === 403 ? 'Forbidden — check account credits / sender permissions on Infobip'
+             : 'Check Infobip dashboard for details',
+  });
   return { success: false, error: errMsg, statusCode, raw: body };
 }
 

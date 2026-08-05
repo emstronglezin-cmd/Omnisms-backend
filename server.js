@@ -134,10 +134,24 @@ app.get('/health', (_req, res) => {
   let queueStatus = {};
   try { queueStatus = require('./services/queueService').getQueueStatus(); } catch (_) {}
 
+  // Expose full Infobip config details for diagnostics
+  let infobipDetails = {};
+  try {
+    const ibStatus = require('./services/infobip').getStatus();
+    const rawUrl   = process.env.INFOBIP_BASE_URL || '';
+    const hasHttps = rawUrl.match(/^https?:\/\//i);
+    infobipDetails = {
+      ...ibStatus,
+      rawBaseUrl     : rawUrl,
+      hasHttpsPrefix : !!hasHttps,
+      normalizedUrl  : hasHttps ? rawUrl : (rawUrl ? 'https://' + rawUrl : null),
+    };
+  } catch (_) {}
+
   res.status(200).json({
     status  : 'ok',
     service : 'OmniSMS Backend',
-    version : '4.3.0',
+    version : '3.2.0',
     uptime  : Math.round(process.uptime()),
     time    : new Date().toISOString(),
     checks  : {
@@ -151,6 +165,7 @@ app.get('/health', (_req, res) => {
         ? `ACTIVE via ${transcrCheck.engine}`
         : transcrCheck.detail,
     },
+    infobipDetails,
     queue   : queueStatus,
     routes  : {
       auth          : ['POST /api/auth/register', 'POST /api/auth/login', 'POST /api/auth/google', 'GET /api/auth/me'],
