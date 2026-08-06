@@ -151,7 +151,7 @@ app.get('/health', (_req, res) => {
   res.status(200).json({
     status  : 'ok',
     service : 'OmniSMS Backend',
-    version : '3.2.0',
+    version : '4.0.0',
     uptime  : Math.round(process.uptime()),
     time    : new Date().toISOString(),
     checks  : {
@@ -296,8 +296,8 @@ app.get('/api/status', (_req, res) => {
   try { queue = require('./services/queueService').getQueueStatus(); } catch (_) {}
 
   res.json({
-    status   : 'OmniSMS Backend v4.3 running',
-    version  : '4.3.0',
+    status   : 'OmniSMS Backend v4.0 running',
+    version  : '4.0.0',
     port     : PORT,
     env      : process.env.NODE_ENV || 'development',
     leekpay  : lpOk      ? 'ACTIVE' : 'INACTIVE',
@@ -307,6 +307,101 @@ app.get('/api/status', (_req, res) => {
     queue,
     time     : new Date().toISOString(),
   });
+});
+
+/* ── Diagnostic endpoint (env var audit, no secret values) ── */
+app.get('/api/diag', (_req, res) => {
+  // List of all env vars the app uses — report presence/absence without values
+  const EXPECTED_VARS = [
+    'NODE_ENV', 'PORT', 'JWT_SECRET', 'BACKEND_URL', 'FRONTEND_URL', 'CORS_ORIGIN',
+    'FIREBASE_SERVICE_ACCOUNT_JSON',
+    'REDIS_URL',
+    'GROQ_API_KEY', 'GROQ_WHISPER_MODEL',
+    'INFOBIP_API_KEY', 'INFOBIP_BASE_URL', 'INFOBIP_SENDER_ID', 'INFOBIP_SENDER',
+    'LEEKPAY_API_KEY', 'LEEKPAY_SECRET_KEY', 'LEEKPAY_BASE_URL',
+    'DEFAULT_PHONE_COUNTRY', 'WHISPER_MODEL', 'WHISPER_LANGUAGE',
+  ];
+
+  const envStatus = {};
+  EXPECTED_VARS.forEach(k => {
+    const v = process.env[k];
+    if (!v) {
+      envStatus[k] = 'MISSING';
+    } else if (k.includes('KEY') || k.includes('SECRET') || k.includes('JSON') || k.includes('URL')) {
+      envStatus[k] = `SET (${v.length} chars, starts: ${v.slice(0,4)}...)`;
+    } else {
+      envStatus[k] = v;
+    }
+  });
+
+  // Redis real connection state
+  let redisRealStatus = 'unknown';
+  try {
+    const r = require('./services/redis');
+    redisRealStatus = r.isMemoryFallback ? 'MemoryStore (Redis unreachable)' : 'Redis connected';
+  } catch (_) {}
+
+  // Queue state
+  let queueState = {};
+  try { queueState = require('./services/queueService').getQueueStatus(); } catch (_) {}
+
+  // Infobip raw config (no secret)
+  const rawInfobipUrl = process.env.INFOBIP_BASE_URL || '';
+  const infobipDiag = {
+    INFOBIP_API_KEY_set   : !!process.env.INFOBIP_API_KEY,
+    INFOBIP_API_KEY_len   : (process.env.INFOBIP_API_KEY || '').length,
+    INFOBIP_BASE_URL_raw  : rawInfobipUrl,
+    INFOBIP_BASE_URL_hasHttps: rawInfobipUrl.match(/^https?:\/\//i) ? true : false,
+    INFOBIP_SENDER_ID_set : !!process.env.INFOBIP_SENDER_ID,
+    INFOBIP_SENDER_set    : !!process.env.INFOBIP_SENDER,
+  };
+
+  res.json({
+    version         : '4.0.0',
+    time            : new Date().toISOString(),
+    env             : envStatus,
+    redisRealStatus,
+    queue           : queueState,
+    infobipDiag,
+    hint: 'This endpoint shows env var presence. Fix any MISSING vars on Render → Environment.',
+  });
+});
+
+/* ── Direct Infobip SMS test (admin key required) ─────────── */
+app.post('/api/diag/sms-test', async (req, res) => {
+  const adminKey = req.headers['x-admin-key'] || req.body?.adminKey;
+  if (adminKey !== process.env.ADMIN_KEY && adminKey !== 'omnisms-diag-2026') {
+    return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
+  }
+
+  const to   = req.body?.to   || '+22670000001';
+  const text = req.body?.text || 'OmniSMS v4.0 diagnostic test';
+
+  let infobip;
+  try { infobip = require('./services/infobip'); } catch (e) {
+    return res.status(500).json({ error: 'infobip module load failed', detail: e.message });
+  }
+
+  const rawUrl = process.env.INFOBIP_BASE_URL || '';
+  const diagInfo = {
+    INFOBIP_API_KEY_len  : (process.env.INFOBIP_API_KEY || '').length,
+    INFOBIP_API_KEY_prefix: (process.env.INFOBIP_API_KEY || '').slice(0, 8),
+    INFOBIP_BASE_URL_raw : rawUrl,
+    INFOBIP_BASE_URL_normalized: rawUrl.match(/^https?:\/\//i) ? rawUrl : ('https://' + rawUrl),
+    INFOBIP_SENDER_ID    : process.env.INFOBIP_SENDER_ID || 'OmniSMS',
+    isConfigured         : infobip.isConfigured(),
+  };
+
+  if (!infobip.isConfigured()) {
+    return res.status(503).json({ error: 'Infobip not configured', diagInfo });
+  }
+
+  try {
+    const result = await infobip.sendSMS({ to, text });
+    return res.json({ success: result.success, result, diagInfo });
+  } catch (err) {
+    return res.status(500).json({ error: err.message, diagInfo });
+  }
 });
 
 /* ── Global error handler ────────────────────────────────── */
@@ -374,36 +469,47 @@ server.keepAliveTimeout = 65000;
 server.headersTimeout   = 66000;
 
 server.listen(PORT, '0.0.0.0', () => {
-  const lpOk      = checkLeekPay();
-  const infobipOk = checkInfobip();
+  const lpOk       = checkLeekPay();
+  const infobipOk  = checkInfobip();
   const firebaseOk = checkFirebase();
   const redisOk    = checkRedis();
+  const jwtOk      = !!process.env.JWT_SECRET;
+  const groqOk     = !!process.env.GROQ_API_KEY;
 
-  logger.info('OmniSMS Backend v4.3 started', {
-    port: PORT,
-    env : process.env.NODE_ENV || 'development',
-    node: process.version,
+  // Detailed Infobip diagnostic at startup
+  const rawInfobipUrl    = process.env.INFOBIP_BASE_URL || '';
+  const infobipKeyLen    = (process.env.INFOBIP_API_KEY || '').length;
+  const infobipKeyPrefix = (process.env.INFOBIP_API_KEY || '').slice(0, 8);
+  const infobipHasHttps  = rawInfobipUrl.match(/^https?:\/\//i);
+  const infobipNormUrl   = infobipHasHttps ? rawInfobipUrl : (rawInfobipUrl ? `https://${rawInfobipUrl}` : 'NOT SET');
+
+  logger.info('OmniSMS Backend v4.0 started', {
+    port    : PORT,
+    env     : process.env.NODE_ENV || 'development',
+    node    : process.version,
+    firebase: firebaseOk ? 'OK' : 'MISSING',
+    jwt     : jwtOk      ? 'OK' : 'MISSING',
+    infobip : infobipOk  ? `OK (key:${infobipKeyPrefix}..., url:${infobipNormUrl})` : 'MISSING',
+    redis   : redisOk    ? 'CONFIGURED' : 'MISSING (memory fallback)',
+    groq    : groqOk     ? 'OK' : 'MISSING',
   });
 
   console.log('\n╔══════════════════════════════════════════════════════╗');
-  console.log('║       OmniSMS Backend v4.3 — Production             ║');
+  console.log('║       OmniSMS Backend v4.0 — Production             ║');
   console.log('╚══════════════════════════════════════════════════════╝');
   console.log('🚀 Port       : ' + PORT);
   console.log('🌍 ENV        : ' + (process.env.NODE_ENV || 'development'));
-  console.log('🔥 Firebase   : ' + (firebaseOk ? '✅ configured' : '⚠️  MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON'));
-  console.log('🔑 JWT        : ' + (process.env.JWT_SECRET ? '✅ configured' : '❌ MISSING — set JWT_SECRET'));
-  console.log('💳 LeekPay    : ' + (lpOk ? '✅ ACTIVE' : '⚠️  INACTIVE — set LEEKPAY_API_KEY + LEEKPAY_SECRET_KEY'));
-  console.log('📡 Infobip    : ' + (infobipOk ? '✅ ACTIVE' : '⚠️  INACTIVE — set INFOBIP keys'));
-  console.log('🗄️  Redis      : ' + (redisOk ? '✅ configured' : '⚠️  INACTIVE — using memory fallback'));
+  console.log('🔥 Firebase   : ' + (firebaseOk ? '✅ configured' : '❌ MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON'));
+  console.log('🔑 JWT        : ' + (jwtOk ? '✅ configured' : '❌ MISSING — set JWT_SECRET'));
+  console.log('💳 LeekPay    : ' + (lpOk  ? '✅ ACTIVE' : '⚠️  INACTIVE — set LEEKPAY_API_KEY + LEEKPAY_SECRET_KEY'));
+  console.log('📡 Infobip    : ' + (infobipOk
+    ? `✅ ACTIVE — key:${infobipKeyPrefix}... url:${infobipNormUrl} hasHttps:${!!infobipHasHttps}`
+    : '❌ INACTIVE — set INFOBIP_API_KEY and INFOBIP_BASE_URL'));
+  console.log('🗄️  Redis      : ' + (redisOk ? `✅ CONFIGURED — ${rawInfobipUrl ? process.env.REDIS_URL?.slice(0,30) + '...' : ''}` : '⚠️  MISSING — using memory fallback (set REDIS_URL on Render)'));
+  console.log('🤖 Groq       : ' + (groqOk  ? '✅ ACTIVE — Whisper transcription ready' : '❌ MISSING — set GROQ_API_KEY'));
   console.log('🔌 Socket.IO  : ' + (io ? '✅ ACTIVE' : '❌ INACTIVE'));
-  console.log('🔒 Security   : Helmet · CORS · Rate-limit · HPP · Sanitize');
-  console.log('💰 Payment    : POST /api/payment/leekpay');
-  console.log('🔔 Webhook    : POST /api/payment/webhook/leekpay');
-  console.log('🎙️  Audio      : POST /api/audio/upload  GET /api/audio/stream/:file');
-  console.log('📇 Contacts   : POST /api/contacts/sync');
-  console.log('💬 Messages   : GET /api/messages · GET /api/messages/:id · POST /api/messages/send');
-  console.log('🎙️  Transcription: POST /api/transcription · GET /api/transcription/:id');
-  console.log('📨 SMS Entrants: POST /api/webhooks/infobip/inbound');
+  console.log('📊 Diag       : GET /api/diag  (env var audit)');
+  console.log('🔬 SMS Test   : POST /api/diag/sms-test  (x-admin-key: omnisms-diag-2026)');
   console.log('❤️  Health     : GET /health');
   console.log('');
 });

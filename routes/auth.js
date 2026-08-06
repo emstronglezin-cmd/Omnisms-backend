@@ -50,9 +50,11 @@ router.post(
       .isLength({ min: 2, max: 100 })
       .withMessage('Le nom doit contenir entre 2 et 100 caractères.'),
     body('username')
-      .optional({ checkFalsy: true })
       .trim()
+      .notEmpty()
+      .withMessage('Le nom d\'utilisateur est requis.')
       .isLength({ min: 2, max: 50 })
+      .withMessage('Le nom d\'utilisateur doit contenir entre 2 et 50 caractères.')
       .matches(/^[a-zA-Z0-9_.-]+$/)
       .withMessage('Le nom d\'utilisateur ne peut contenir que des lettres, chiffres, _ . -'),
     body('phone')
@@ -78,10 +80,8 @@ router.post(
     const { name, email, password, phone, username } = req.body;
     const normalizedPhone    = phone.trim();
     const normalizedEmail    = email ? email.toLowerCase().trim() : null;
-    // Générer un username par défaut si non fourni
-    const normalizedUsername = username
-      ? username.trim().toLowerCase()
-      : (normalizedPhone.replace(/[^a-z0-9]/gi, '').slice(-8) || `user${Date.now().toString().slice(-6)}`);
+    // Username est maintenant obligatoire — le validator l'a déjà vérifié
+    const normalizedUsername = username.trim().toLowerCase();
 
     try {
       // Vérifier si le numéro de téléphone existe déjà
@@ -95,6 +95,20 @@ router.post(
         return res.status(409).json({
           error: 'Un compte avec ce numéro de téléphone existe déjà.',
           code : 'PHONE_EXISTS',
+        });
+      }
+
+      // Vérifier si le username existe déjà
+      const existingUsername = await db
+        .collection('users')
+        .where('username', '==', normalizedUsername)
+        .limit(1)
+        .get();
+
+      if (!existingUsername.empty) {
+        return res.status(409).json({
+          error: 'Ce nom d\'utilisateur est déjà pris. Choisissez-en un autre.',
+          code : 'USERNAME_EXISTS',
         });
       }
 
