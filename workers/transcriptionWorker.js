@@ -5,11 +5,15 @@
  * Traite les jobs de transcription de manière asynchrone.
  * Flux :
  *  1. Reçoit { audioPath, messageId, userId, language, model }
- *  2. Appelle le service Faster-Whisper
+ *  2. Appelle Groq Whisper API (principal) ou fallback
  *  3. Met à jour le document Firestore messages/{messageId}
  *  4. Émet un événement Socket.IO pour notifier le frontend
  *
  * Ce worker est démarré depuis server.js au boot.
+ *
+ * FIX v4.1 : La connexion Worker utilise maintenant une connexion Redis
+ * dédiée SANS commandTimeout pour éviter les "Command timed out" pendant
+ * les longs appels Groq (10-120s). lockDuration: 120s.
  */
 
 const path  = require('path');
@@ -33,55 +37,110 @@ async function transcriptionProcessor(job) {
     audioPath,
     messageId,
     userId,
-    language = 'fr',
-    model    = process.env.WHISPER_MODEL || 'small',
+    language   = 'fr',
+    model      = process.env.WHISPER_MODEL || 'small',
+    collection = 'audio_messages',   // collection Firestore à mettre à jour
   } = job.data;
 
-  logger.info('[TranscriptionWorker] Processing job', {
-    jobId: job.id, messageId, userId, audioPath,
+  const jobStart = Date.now();
+
+  logger.info('[Transcription] Job received', {
+    jobId: job.id, messageId, userId, audioPath, language, model, collection,
   });
 
-  // Mettre à jour le statut "en cours"
-  await updateMessageStatus(messageId, { transcriptionStatus: 'processing' });
-  emitTranscriptionEvent(userId, messageId, { status: 'processing' });
+  // ── Étape 1 : Mettre à jour le statut "en cours" ──────────
+  await updateMessageStatus(messageId, { transcriptionStatus: 'processing' }, collection);
+  emitTranscriptionEvent(userId, messageId, { status: 'processing', messageId });
 
+  // ── Étape 2 : Localiser le fichier audio ──────────────────
   let audioFilePath = audioPath;
-
-  // Si le chemin est relatif, résoudre depuis la racine du projet
   if (!path.isAbsolute(audioFilePath)) {
     audioFilePath = path.join(__dirname, '..', audioFilePath);
   }
 
   if (!fs.existsSync(audioFilePath)) {
     const error = `Fichier audio introuvable: ${audioFilePath}`;
-    logger.error('[TranscriptionWorker] File not found', { audioFilePath, jobId: job.id });
+    logger.error('[Transcription] FAILED — audio file not found', {
+      jobId: job.id, messageId, audioFilePath,
+      hint: 'Vérifier que uploads/audio/ existe et que le fichier est bien sauvegardé lors de l\'upload',
+    });
     await updateMessageStatus(messageId, {
       transcriptionStatus : 'error',
       transcriptionError  : error,
-    });
-    emitTranscriptionEvent(userId, messageId, { status: 'error', error });
+    }, collection);
+    emitTranscriptionEvent(userId, messageId, { status: 'error', error, messageId });
     throw new Error(error);
   }
 
+  // ── Étape 3 : Info fichier ────────────────────────────────
+  const fileStat = fs.statSync(audioFilePath);
+  const fileExt  = path.extname(audioFilePath).toLowerCase();
+  logger.info('[Transcription] Audio file located', {
+    jobId    : job.id,
+    messageId,
+    audioPath: audioFilePath,
+    fileSize : fileStat.size,
+    fileExt,
+    fileSizeKB: Math.round(fileStat.size / 1024),
+  });
+
+  if (fileStat.size === 0) {
+    const error = 'Fichier audio vide (0 octets) — impossible de transcrire.';
+    logger.error('[Transcription] FAILED — empty file', { jobId: job.id, messageId, audioFilePath });
+    await updateMessageStatus(messageId, { transcriptionStatus: 'error', transcriptionError: error }, collection);
+    emitTranscriptionEvent(userId, messageId, { status: 'error', error, messageId });
+    throw new Error(error);
+  }
+
+  // ── Étape 4 : Appel Groq Whisper ─────────────────────────
+  logger.info('[Transcription] Sending request to Groq Whisper', {
+    jobId: job.id, messageId, model: process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo',
+    language, fileSizeKB: Math.round(fileStat.size / 1024),
+  });
+
+  const groqStart = Date.now();
   let result;
   try {
     result = await transcribe({ audioPath: audioFilePath, language, model });
-    logger.info('[TranscriptionWorker] Transcription success', {
-      jobId: job.id, messageId, chars: result.text.length, method: result.method,
+    const groqMs = Date.now() - groqStart;
+    logger.info('[Transcription] Groq response received', {
+      jobId : job.id,
+      messageId,
+      method: result.method,
+      chars : result.text?.length || 0,
+      lang  : result.language,
+      durMs : groqMs,
     });
   } catch (err) {
-    logger.error('[TranscriptionWorker] Transcription failed', {
-      jobId: job.id, messageId, error: err.message,
+    const groqMs = Date.now() - groqStart;
+    logger.error('[Transcription] FAILED — Groq/transcription error', {
+      jobId  : job.id,
+      messageId,
+      error  : err.message,
+      durMs  : groqMs,
+      step   : 'transcription engine call',
     });
     await updateMessageStatus(messageId, {
       transcriptionStatus: 'error',
       transcriptionError : err.message,
-    });
-    emitTranscriptionEvent(userId, messageId, { status: 'error', error: err.message });
+    }, collection);
+    emitTranscriptionEvent(userId, messageId, { status: 'error', error: err.message, messageId });
     throw err;
   }
 
-  // Sauvegarder en Firestore
+  // ── Étape 5 : Transcription générée ──────────────────────
+  logger.info('[Transcription] Transcription generated', {
+    jobId   : job.id,
+    messageId,
+    chars   : result.text?.length || 0,
+    preview : result.text?.slice(0, 80),
+    language: result.language,
+    duration: result.duration,
+    method  : result.method,
+  });
+
+  // ── Étape 6 : Sauvegarde Firestore ────────────────────────
+  logger.info('[Transcription] Saving transcription to Firestore', { jobId: job.id, messageId, collection });
   await updateMessageStatus(messageId, {
     transcriptionStatus  : 'done',
     transcription        : result.text,
@@ -90,15 +149,27 @@ async function transcriptionProcessor(job) {
     transcriptionSegments: result.segments || [],
     transcriptionMethod  : result.method,
     transcribedAt        : new Date().toISOString(),
+  }, collection);
+
+  // ── Étape 7 : Notification Socket.IO ─────────────────────
+  logger.info('[Transcription] Socket notification sent', { jobId: job.id, messageId, userId });
+  emitTranscriptionEvent(userId, messageId, {
+    status  : 'done',
+    text    : result.text,
+    language: result.language,
+    duration: result.duration,
+    method  : result.method,
+    messageId,
   });
 
-  // Notifier le frontend via Socket.IO
-  emitTranscriptionEvent(userId, messageId, {
-    status       : 'done',
-    text         : result.text,
-    language     : result.language,
-    duration     : result.duration,
+  // ── Étape 8 : Job complété ────────────────────────────────
+  const totalMs = Date.now() - jobStart;
+  logger.info('[Transcription] Job completed', {
+    jobId   : job.id,
     messageId,
+    method  : result.method,
+    totalMs,
+    chars   : result.text?.length || 0,
   });
 
   return { messageId, text: result.text, method: result.method };
@@ -106,19 +177,22 @@ async function transcriptionProcessor(job) {
 
 /* ── Helpers ──────────────────────────────────────────────── */
 
-async function updateMessageStatus(messageId, fields) {
+async function updateMessageStatus(messageId, fields, collection = 'audio_messages') {
   if (!messageId) return;
   const db = getDb();
   if (!db || db._stub) return;
 
   try {
-    await db.collection('messages').doc(messageId).update({
+    await db.collection(collection).doc(messageId).update({
       ...fields,
       updatedAt: new Date().toISOString(),
     });
+    logger.info('[TranscriptionWorker] Firestore updated', {
+      messageId, collection, fields: Object.keys(fields),
+    });
   } catch (err) {
     logger.warn('[TranscriptionWorker] Firestore update failed', {
-      messageId, error: err.message,
+      messageId, collection, error: err.message,
     });
   }
 }

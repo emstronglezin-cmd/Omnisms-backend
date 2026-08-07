@@ -117,6 +117,12 @@ async function transcribeViaGroq(options) {
 
   const bodyBuffer = Buffer.concat([headerBuf, fileBuffer, modelBuf, langBuf, fmtBuf, endBuf]);
 
+  const groqStart = Date.now();
+  logger.info('[Transcription] Groq request started', {
+    filename, fileSizeKB: Math.round(fileBuffer.length / 1024),
+    mimeType, model, language, bodyBytes: bodyBuffer.length,
+  });
+
   return new Promise((resolve, reject) => {
     const req = https.request({
       hostname: 'api.groq.com',
@@ -128,16 +134,20 @@ async function transcribeViaGroq(options) {
         'Content-Type'  : `multipart/form-data; boundary=${boundary}`,
         'Content-Length': bodyBuffer.length,
       },
-      timeout: 120000,   // 2 minutes max
+      timeout: 120000,   // 2 minutes max — suffisant pour Groq
     }, (res) => {
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
+        const durMs = Date.now() - groqStart;
         try {
           const parsed = JSON.parse(data);
           if (res.statusCode !== 200) {
             const errMsg = parsed?.error?.message || parsed?.message || `HTTP ${res.statusCode}`;
-            logger.error('[Transcription/Groq] API error', { statusCode: res.statusCode, error: errMsg });
+            logger.error('[Transcription] Groq API error', {
+              statusCode: res.statusCode, error: errMsg,
+              durMs, rawBody: data.substring(0, 300),
+            });
             return reject(new Error(`Groq API error (${res.statusCode}): ${errMsg}`));
           }
 
@@ -148,8 +158,8 @@ async function transcribeViaGroq(options) {
             start: s.start, end: s.end, text: s.text,
           }));
 
-          logger.info('[Transcription/Groq] Succès', {
-            chars: text.length, language, duration, segments: segments.length,
+          logger.info('[Transcription] Groq response received — success', {
+            chars: text.length, language, duration, segments: segments.length, durMs,
           });
 
           resolve({
@@ -161,13 +171,27 @@ async function transcribeViaGroq(options) {
             model : parsed.model || model,
           });
         } catch (parseErr) {
+          logger.error('[Transcription] Groq réponse non-JSON', {
+            durMs, rawBody: data.substring(0, 300), parseError: parseErr.message,
+          });
           reject(new Error(`Groq réponse invalide : ${data.substring(0, 200)}`));
         }
       });
     });
 
-    req.on('error',   err => reject(new Error(`Groq HTTP error : ${err.message}`)));
-    req.on('timeout', ()  => { req.destroy(); reject(new Error('Groq timeout (120s).')); });
+    req.on('error', (err) => {
+      const durMs = Date.now() - groqStart;
+      logger.error('[Transcription] Groq HTTP error', {
+        error: err.message, code: err.code, durMs,
+      });
+      reject(new Error(`Groq HTTP error : ${err.message}`));
+    });
+    req.on('timeout', () => {
+      const durMs = Date.now() - groqStart;
+      logger.error('[Transcription] Groq timeout (120s)', { durMs, filename, fileSizeKB: Math.round(fileBuffer.length / 1024) });
+      req.destroy();
+      reject(new Error('Groq timeout après 120s. Fichier audio peut-être trop long.'));
+    });
     req.write(bodyBuffer);
     req.end();
   });

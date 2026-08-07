@@ -384,9 +384,10 @@ router.post(
           if (fs.existsSync(audioPath)) {
             await addTranscriptionJob({
               audioPath,
-              messageId: docId,
-              userId   : uid,
-              language : 'fr',
+              messageId : docId,
+              userId    : uid,
+              language  : 'fr',
+              collection: 'messages',   // collection Firestore à mettre à jour
             });
             logger.info('[Messages] Transcription job lancé auto', { msgId: docId });
           }

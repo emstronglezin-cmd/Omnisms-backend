@@ -29,33 +29,54 @@ try {
 }
 
 /* ── Config Redis pour BullMQ ─────────────────────────────── */
-let redisConnection = null;
+/*
+ * DEUX connexions séparées obligatoires pour BullMQ :
+ *
+ * 1. redisConnection  → Queue (ajout de jobs) : commandTimeout court OK
+ * 2. workerConnection → Worker (processing)   : PAS de commandTimeout
+ *
+ * CAUSE ROOT BUG "Command timed out" :
+ *   La connexion Worker utilisait commandTimeout: 5000ms.
+ *   BullMQ Worker renouvelle le lock Redis pendant le processing
+ *   (toutes les 15s = lockDuration/2 = 30000/2).
+ *   Groq Whisper peut prendre 10-120s.
+ *   → Les commandes EXTEND du lock dépassaient 5000ms → "Command timed out"
+ *   → Le job échouait alors que Groq avait réussi ou était en cours.
+ *
+ * FIX : connexion Worker SANS commandTimeout, lockDuration augmenté à 120s.
+ */
+let redisConnection = null;   // pour Queue.add()
+let workerConnection = null;  // pour Worker processing — PAS de commandTimeout
 
 if (bullmqAvailable && REDIS_URL) {
   try {
     const Redis = require('ioredis');
     let _queueFallback = false;
 
+    // ── Options TLS communes ─────────────────────────────────
+    const tlsOpts = (REDIS_URL.startsWith('rediss://') || REDIS_URL.includes('upstash'))
+      ? { tls: {} }
+      : {};
+
+    // ── Connexion Queue (pour ajouter des jobs) ──────────────
+    // commandTimeout court acceptable — les add() ne durent pas longtemps
     const queueOpts = {
-      maxRetriesPerRequest: null,   // requis par BullMQ
+      maxRetriesPerRequest: null,
       enableReadyCheck    : false,
       lazyConnect         : false,
       connectTimeout      : 8000,
-      commandTimeout      : 5000,
+      commandTimeout      : 5000,   // court OK pour Queue.add()
       retryStrategy(times) {
-        if (_queueFallback) return null;  // ne plus réessayer après fallback
-        if (times >= 2) return null;      // max 2 tentatives avant abandon
+        if (_queueFallback) return null;
+        if (times >= 2) return null;
         return Math.min(times * 1000, 2000);
       },
+      ...tlsOpts,
     };
-    // TLS requis pour Upstash (rediss:// ou URL contient "upstash")
-    if (REDIS_URL.startsWith('rediss://') || REDIS_URL.includes('upstash')) {
-      queueOpts.tls = {};
-    }
-    const conn = new Redis(REDIS_URL, queueOpts);
+    const queueConn = new Redis(REDIS_URL, queueOpts);
 
-    conn.on('error', (err) => {
-      if (_queueFallback) return;   // log unique — plus rien ensuite
+    queueConn.on('error', (err) => {
+      if (_queueFallback) return;
       const isFatal = (
         err.code === 'ENOTFOUND' ||
         err.code === 'ECONNREFUSED' ||
@@ -66,26 +87,51 @@ if (bullmqAvailable && REDIS_URL) {
         _queueFallback = true;
         logger.warn(`[Queue] Redis DNS/network error (${err.code}) — switching to inline execution.`);
         redisConnection = null;
-        // Tenter une déconnexion propre sans spam
-        try { conn.disconnect(false); } catch (_) {}
+        workerConnection = null;
+        try { queueConn.disconnect(false); } catch (_) {}
       } else {
-        logger.error('[Queue] Redis error', { msg: err.message });
+        logger.error('[Queue] Redis queue connection error', { msg: err.message });
       }
     });
 
-    conn.on('end', () => {
+    queueConn.on('end', () => {
       if (!_queueFallback) {
-        logger.warn('[Queue] Redis connection closed — switching to inline execution.');
+        logger.warn('[Queue] Redis queue connection closed — switching to inline execution.');
         _queueFallback = true;
         redisConnection = null;
+        workerConnection = null;
       }
     });
 
-    redisConnection = conn;
-    logger.info('[Queue] BullMQ connected to Redis.');
+    // ── Connexion Worker (pour processing) ───────────────────
+    // CRITIQUE : PAS de commandTimeout — les commandes BZPOPMIN (blocking 10s)
+    // et EXTEND (lock renewal pendant Groq 10-120s) ne doivent PAS expirer.
+    const workerOpts = {
+      maxRetriesPerRequest: null,   // requis BullMQ
+      enableReadyCheck    : false,
+      lazyConnect         : false,
+      connectTimeout      : 10000,
+      // commandTimeout INTENTIONNELLEMENT ABSENT — c'est le fix du bug
+      retryStrategy(times) {
+        if (_queueFallback) return null;
+        if (times >= 3) return null;
+        return Math.min(times * 2000, 5000);
+      },
+      ...tlsOpts,
+    };
+    const wConn = new Redis(REDIS_URL, workerOpts);
+
+    wConn.on('error', (err) => {
+      logger.error('[Queue] Redis worker connection error', { msg: err.message, code: err.code });
+    });
+
+    redisConnection = queueConn;
+    workerConnection = wConn;
+    logger.info('[Queue] BullMQ connected to Redis (queue + worker connections).');
   } catch (err) {
     logger.error('[Queue] Redis connection failed', { error: err.message });
     redisConnection = null;
+    workerConnection = null;
   }
 }
 
@@ -156,9 +202,18 @@ async function addJob(queueName, data, opts = {}) {
 
 /**
  * Créer un worker pour une queue.
+ *
+ * Utilise workerConnection (sans commandTimeout) pour éviter les timeouts
+ * pendant les longs jobs de transcription (Groq peut prendre 10-120s).
+ * lockDuration: 120000ms — le lock est renouvelé toutes les 60s, ce qui
+ * laisse largement le temps à Groq de répondre.
  */
 function createWorker(queueName, processor, concurrency = 2) {
-  if (!bullmqAvailable || !redisConnection) {
+  // Utiliser workerConnection en priorité (sans commandTimeout)
+  // Si absent, tomber sur redisConnection, puis inline
+  const conn = workerConnection || redisConnection;
+
+  if (!bullmqAvailable || !conn) {
     // Enregistrer comme handler inline
     registerInlineHandler(queueName, processor);
     logger.info(`[Queue] Worker "${queueName}" registered as inline handler.`);
@@ -168,8 +223,11 @@ function createWorker(queueName, processor, concurrency = 2) {
   if (workers[queueName]) return workers[queueName];
 
   const worker = new Worker(queueName, processor, {
-    connection : redisConnection,
+    connection  : conn,
     concurrency,
+    lockDuration: 120000,   // 120s — renouvellement toutes les 60s
+    // stalledInterval: 30000 (default) — vérification jobs bloqués toutes les 30s
+    // maxStalledCount: 1 (default) — 1 retry si stalled, puis échec
   });
 
   worker.on('completed', (job, result) => {
@@ -221,10 +279,12 @@ async function addSmsJob(data) {
 function getQueueStatus() {
   return {
     redisConnected : !!(redisConnection),
+    workerConnected: !!(workerConnection),
     bullmqAvailable,
     queues         : Object.keys(queues),
     workers        : Object.keys(workers),
     mode           : redisConnection ? 'redis' : 'inline-fallback',
+    lockDuration   : 120000,
   };
 }
 

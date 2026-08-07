@@ -215,10 +215,11 @@ router.post('/transcribe/:id', auth, async (req, res) => {
     // Créer le job de transcription
     const job = await addTranscriptionJob({
       audioPath,
-      messageId: id,
-      userId   : uid,
-      language : language.replace(/[^a-zA-Z]/g, '').slice(0, 5),
-      model    : model || process.env.WHISPER_MODEL || 'small',
+      messageId : id,
+      userId    : uid,
+      language  : language.replace(/[^a-zA-Z]/g, '').slice(0, 5),
+      model     : model || process.env.WHISPER_MODEL || 'small',
+      collection: 'audio_messages',   // collection Firestore à mettre à jour
     });
 
     // Mettre à jour le statut
