@@ -120,14 +120,29 @@ function initSocketIO(httpServer) {
   const corsOrigins = [
     'https://omnisms.netlify.app',
     'https://omnisms.web.app',
+    // Vercel — URL principale et previews dynamiques
+    'https://omnisms-frontend.vercel.app',
+    'https://omnisms-frontend-qx1u5k6h9-emmanuel-lezin.vercel.app',
+    // Dev local
     'http://localhost:3000',
     'http://localhost:5000',
+    'http://localhost:8080',
     ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(o => o.trim()) : []),
   ];
 
+  // Regex pour autoriser tous les previews Vercel du projet
+  const vercelPattern = /^https:\/\/omnisms-frontend(-[a-z0-9]+-emmanuel-lezin)?\.vercel\.app$/;
+
   _io = new Server(httpServer, {
     cors: {
-      origin     : corsOrigins,
+      origin(origin, callback) {
+        // Autoriser sans origin (ex: mobile apps, curl)
+        if (!origin) return callback(null, true);
+        if (corsOrigins.includes(origin) || vercelPattern.test(origin)) {
+          return callback(null, true);
+        }
+        return callback(new Error(`CORS: origine non autorisée: ${origin}`));
+      },
       methods    : ['GET', 'POST'],
       credentials: true,
     },

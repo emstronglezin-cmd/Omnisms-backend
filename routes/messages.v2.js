@@ -81,8 +81,8 @@ router.get('/', auth, async (req, res) => {
     // Note: orderBy('createdAt') requires a composite Firestore index.
     // Sorting is done in-memory to avoid index errors on new projects.
     const [sent, received] = await Promise.all([
-      db.collection('messages').where('senderId',   '==', uid).limit(limit * 4).get(),
-      db.collection('messages').where('receiverId', '==', uid).limit(limit * 4).get(),
+      db.collection('messages').where('senderId',   '==', uid).limit(limit * 2).get(),
+      db.collection('messages').where('receiverId', '==', uid).limit(limit * 2).get(),
     ]);
 
     const convMap = new Map();

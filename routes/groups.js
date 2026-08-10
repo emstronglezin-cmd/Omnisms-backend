@@ -225,6 +225,66 @@ if (groupImageUpload && groupBuildFileUrl) {
   });
 }
 
+// ── GET /groups/:id/members — Lister les membres ────────────
+router.get('/:id/members', authenticate, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const ref  = db.collection('groups').doc(id);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+    }
+
+    const data = snap.data();
+    if (!(data.members || []).includes(req.user.uid)) {
+      return res.status(403).json({ error: 'Vous n\'êtes pas membre de ce groupe.', code: 'FORBIDDEN' });
+    }
+
+    // Enrichir avec les données utilisateur (name, avatar) depuis Firestore
+    const memberIds = data.members || [];
+    const memberDetails = [];
+
+    for (let i = 0; i < memberIds.length; i += 10) {
+      const batch = memberIds.slice(i, i + 10);
+      try {
+        const userDocs = await Promise.all(
+          batch.map(uid => db.collection('users').doc(uid).get())
+        );
+        userDocs.forEach((doc, idx) => {
+          const uid = batch[idx];
+          if (doc.exists) {
+            const u = doc.data();
+            memberDetails.push({
+              uid,
+              name    : u.name     || u.username || uid,
+              username: u.username || null,
+              avatar  : u.avatar   || null,
+              phone   : u.phone    || null,
+              isOwner : uid === data.ownerId,
+            });
+          } else {
+            memberDetails.push({ uid, name: uid, isOwner: uid === data.ownerId });
+          }
+        });
+      } catch (_) {
+        batch.forEach(uid => memberDetails.push({ uid, name: uid, isOwner: uid === data.ownerId }));
+      }
+    }
+
+    return res.status(200).json({
+      id,
+      name   : data.name,
+      ownerId: data.ownerId,
+      members: memberDetails,
+    });
+  } catch (err) {
+    logger.error('Erreur liste membres groupe', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
+
 // ── GET /groups/:id/messages — Récupérer les messages ───────
 router.get('/:id/messages', authenticate, async (req, res) => {
   const { id } = req.params;
@@ -240,14 +300,18 @@ router.get('/:id/messages', authenticate, async (req, res) => {
       return res.status(403).json({ error: 'Vous n\'êtes pas membre de ce groupe.', code: 'FORBIDDEN' });
     }
 
+    // NOTE: NO orderBy('createdAt') — requires composite Firestore index which may not exist.
+    // We fetch without ordering and sort in-memory (avoids FAILED_PRECONDITION / infinite loading).
     const snap = await db
       .collection('group_messages')
       .where('groupId', '==', id)
-      .orderBy('createdAt', 'desc')
       .limit(100)
       .get();
 
-    const messages = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const messages = snap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));  // ASC for chat display
+
     return res.status(200).json(messages);
   } catch (err) {
     logger.error('Erreur messages groupe', { error: err.message });

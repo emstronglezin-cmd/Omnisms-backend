@@ -50,11 +50,38 @@ router.put('/profile', auth, async (req, res) => {
   try {
     const updates = { updatedAt: new Date().toISOString() };
 
-    if (name     !== undefined && name     !== null) updates.name     = String(name).trim();
-    if (email    !== undefined && email    !== null) updates.email    = String(email).toLowerCase().trim();
-    if (phone    !== undefined && phone    !== null) updates.phone    = String(phone).trim();
-    if (bio      !== undefined && bio      !== null) updates.bio      = String(bio).trim();
-    if (username !== undefined && username !== null) updates.username = String(username).toLowerCase().trim();
+    if (name  !== undefined && name  !== null) updates.name  = String(name).trim();
+    if (email !== undefined && email !== null) updates.email = String(email).toLowerCase().trim();
+    if (phone !== undefined && phone !== null) updates.phone = String(phone).trim();
+    if (bio   !== undefined && bio   !== null) updates.bio   = String(bio).trim();
+
+    // Username: validate format + uniqueness check
+    if (username !== undefined && username !== null) {
+      const newUsername = String(username).toLowerCase().trim();
+
+      if (!/^[a-zA-Z0-9_.-]{2,50}$/.test(newUsername)) {
+        return res.status(400).json({
+          error: 'Username invalide (lettres, chiffres, _ . - seulement, 2-50 caractères).',
+          code : 'INVALID_USERNAME',
+        });
+      }
+
+      // Check uniqueness: query users where username == newUsername (excluding self)
+      const existing = await db.collection('users')
+        .where('username', '==', newUsername)
+        .limit(2)
+        .get();
+
+      const conflict = existing.docs.find(d => d.id !== uid);
+      if (conflict) {
+        return res.status(409).json({
+          error: `Le nom d'utilisateur "@${newUsername}" est déjà utilisé.`,
+          code : 'USERNAME_EXISTS',
+        });
+      }
+
+      updates.username = newUsername;
+    }
 
     if (password && password.length >= 8) {
       updates.password = await bcrypt.hash(password, 12);
@@ -65,11 +92,52 @@ router.put('/profile', auth, async (req, res) => {
     }
 
     await db.collection('users').doc(uid).set(updates, { merge: true });
-    logger.info('[Me] Profile updated', { uid });
+    logger.info('[Me] Profile updated', { uid, fields: Object.keys(updates) });
 
-    return res.status(200).json({ success: true, message: 'Profil mis à jour.' });
+    // Return updated profile so frontend can refresh in one round-trip
+    const snap = await db.collection('users').doc(uid).get();
+    const user = snap.data() || {};
+    const { password: _pw, ...safeUser } = user;
+
+    return res.status(200).json({
+      success: true,
+      message: 'Profil mis à jour.',
+      user   : { id: uid, ...safeUser },
+    });
   } catch (err) {
     logger.error('Erreur PUT /me/profile', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
+
+/* ── DELETE /me — Supprimer le compte ─────────────────────── */
+router.delete('/', auth, async (req, res) => {
+  const uid = req.user.uid;
+
+  try {
+    const now = new Date().toISOString();
+
+    // Soft-delete: mark account as deleted, keep data for potential recovery
+    await db.collection('users').doc(uid).set({
+      deleted     : true,
+      deletedAt   : now,
+      updatedAt   : now,
+      // Anonymise les données sensibles
+      email       : `deleted_${uid}@omnisms.deleted`,
+      phone       : null,
+      name        : 'Compte supprimé',
+      username    : `deleted_${uid.slice(-8)}`,
+      avatar      : null,
+    }, { merge: true });
+
+    logger.info('[Me] Account deleted (soft)', { uid });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Compte supprimé avec succès.',
+    });
+  } catch (err) {
+    logger.error('Erreur DELETE /me', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
