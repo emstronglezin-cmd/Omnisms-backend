@@ -194,36 +194,84 @@ router.put('/:id', authenticate, async (req, res) => {
 });
 
 // ── POST /groups/:id/avatar — Upload image de groupe ─────────
-let groupImageUpload = null;
-let groupBuildFileUrl = null;
+// Stratégie: stockage base64 dans Firestore (résout ephemeral FS Render)
+// Accepte multipart (champ "image") OU body JSON { imageBase64: "data:image/..." }
+const MAX_GROUP_IMG_B64 = 800 * 1024; // 800 KB
+
+let groupImageUpload    = null;
+let groupMulterErrHndlr = null;
 try {
   const uploadService  = require('../services/uploadService');
   groupImageUpload     = uploadService.imageUpload;
-  groupBuildFileUrl    = uploadService.buildFileUrl;
+  groupMulterErrHndlr = uploadService.multerErrorHandler;
 } catch (_) {}
 
-if (groupImageUpload && groupBuildFileUrl) {
-  router.post('/:id/avatar', authenticate, groupImageUpload.single('image'), async (req, res) => {
-    const { id } = req.params;
-    if (!req.file) {
-      return res.status(400).json({ error: 'Aucun fichier fourni.', code: 'NO_FILE' });
-    }
-    try {
-      const ref  = db.collection('groups').doc(id);
-      const snap = await ref.get();
-      if (!snap.exists) return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
-      if (snap.data().ownerId !== req.user.uid) {
-        return res.status(403).json({ error: 'Seul le propriétaire peut modifier l\'image.', code: 'FORBIDDEN' });
+router.post('/:id/avatar', authenticate, (req, res, next) => {
+  // Cas JSON base64 direct
+  if (req.is('application/json') || req.body?.imageBase64) return next();
+
+  // Cas multipart — wrap multer pour capturer les erreurs proprement
+  if (groupImageUpload) {
+    groupImageUpload.single('image')(req, res, (err) => {
+      if (err) {
+        logger.warn('[Groups] Multer error on group avatar upload', { error: err.message, code: err.code });
+        if (groupMulterErrHndlr) return groupMulterErrHndlr(err, req, res, next);
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Fichier trop volumineux.', code: 'FILE_TOO_LARGE' });
+        if (err.code === 'LIMIT_UNEXPECTED_FILE') return res.status(400).json({ error: 'Champ inattendu. Utilisez le champ "image".', code: 'UNEXPECTED_FIELD' });
+        return res.status(400).json({ error: err.message || 'Erreur upload.', code: 'UPLOAD_ERROR' });
       }
-      const imageUrl = groupBuildFileUrl('images', req.file.filename);
-      await ref.update({ image: imageUrl, updatedAt: new Date().toISOString() });
-      return res.status(200).json({ success: true, imageUrl });
-    } catch (err) {
-      logger.error('Erreur upload image groupe', { error: err.message });
-      return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+      next();
+    });
+  } else {
+    next();
+  }
+}, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const ref  = db.collection('groups').doc(id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+    if (snap.data().ownerId !== req.user.uid) {
+      return res.status(403).json({ error: 'Seul le propriétaire peut modifier l\'image.', code: 'FORBIDDEN' });
     }
-  });
-}
+
+    let imageBase64 = null;
+
+    // A) Fichier multipart → convertir en base64
+    if (req.file) {
+      const fs   = require('fs');
+      const mime = req.file.mimetype || 'image/jpeg';
+      const buf  = fs.readFileSync(req.file.path);
+      const b64  = buf.toString('base64');
+      if (b64.length > MAX_GROUP_IMG_B64) {
+        try { fs.unlinkSync(req.file.path); } catch (_) {}
+        return res.status(413).json({ error: 'Image trop grande (max ~600 KB). Compressez et réessayez.', code: 'IMAGE_TOO_LARGE' });
+      }
+      imageBase64 = `data:${mime};base64,${b64}`;
+      try { fs.unlinkSync(req.file.path); } catch (_) {}
+    }
+
+    // B) base64 JSON direct
+    else if (req.body?.imageBase64) {
+      const raw = req.body.imageBase64;
+      if (!raw.startsWith('data:image/')) return res.status(400).json({ error: 'imageBase64 doit être un data URI image.', code: 'INVALID_DATA_URI' });
+      if (raw.length > MAX_GROUP_IMG_B64) return res.status(413).json({ error: 'Image trop grande.', code: 'IMAGE_TOO_LARGE' });
+      imageBase64 = raw;
+    }
+
+    else {
+      return res.status(400).json({ error: 'Aucun fichier fourni. Champ multipart: "image" ou body JSON: "imageBase64".', code: 'NO_FILE' });
+    }
+
+    // Stocker base64 dans Firestore (persistant après redeploy Render)
+    await ref.update({ image: imageBase64, updatedAt: new Date().toISOString() });
+    logger.info('[Groups] Group avatar updated (base64 in Firestore)', { groupId: id });
+    return res.status(200).json({ success: true, imageUrl: imageBase64 });
+  } catch (err) {
+    logger.error('Erreur upload image groupe', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
 
 // ── GET /groups/:id/members — Lister les membres ────────────
 router.get('/:id/members', authenticate, async (req, res) => {

@@ -98,13 +98,36 @@ router.post(
       const fileUrl  = buildFileUrl('audio', filename);
       const now      = new Date().toISOString();
 
+      // ── Stratégie persistance audio ────────────────────────
+      // Render ephemeral FS : les fichiers sont effacés à chaque redeploy.
+      // Pour les vocaux courts (≤ 1.5 MB), on stocke le base64 dans Firestore.
+      // Pour les fichiers plus grands, on garde l'URL disque (playback immédiat,
+      // mais 404 après redeploy — acceptable pour gros fichiers).
+      const MAX_AUDIO_B64 = 1.5 * 1024 * 1024; // 1.5 MB
+      let audioDataUri = null;
+
+      if (req.file.size <= MAX_AUDIO_B64) {
+        try {
+          const buf  = fs.readFileSync(filePath);
+          const b64  = buf.toString('base64');
+          audioDataUri = `data:${req.file.mimetype};base64,${b64}`;
+          logger.info('[Audio] Small audio stored as base64 in Firestore', { uid, size: req.file.size });
+        } catch (b64Err) {
+          logger.warn('[Audio] base64 conversion failed, keeping disk URL', { error: b64Err.message });
+        }
+      }
+
+      // URL à utiliser : data URI (persistant) ou URL disque (éphémère)
+      const audioUrl = audioDataUri || fileUrl;
+
       const audioDoc = {
         id              : filename.replace(/\.[^.]+$/, ''),  // sans extension
         filename,
         originalName    : req.file.originalname,
         mimetype        : req.file.mimetype,
         size            : req.file.size,
-        url             : fileUrl,
+        url             : audioUrl,
+        audioDataUri    : audioDataUri || null,  // base64 pour persistance
         uploaderId      : uid,
         duration        : metadata?.duration      || null,
         durationFormatted: metadata?.duration
@@ -136,13 +159,14 @@ router.post(
 
       logger.info('[Audio] Upload success', {
         uid, filename, size: req.file.size, duration: metadata?.duration,
+        storedAs: audioDataUri ? 'base64' : 'disk-url',
       });
 
       return res.status(201).json({
         success      : true,
         id           : docId,
         filename,
-        url          : fileUrl,
+        url          : audioUrl,
         size         : req.file.size,
         mimetype     : req.file.mimetype,
         duration     : metadata?.duration      || null,

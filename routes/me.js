@@ -2,16 +2,16 @@
 /**
  * OmniSMS — Route /me
  *
- * GET  /me                → profil complet
- * PUT  /me/profile        → mettre à jour nom, email, phone, bio
- * POST /me/avatar         → upload photo de profil (multipart)
+ * GET    /me             → profil complet
+ * PUT    /me/profile     → mettre à jour nom, email, phone, bio, username
+ * POST   /me/avatar      → upload photo de profil (multipart OU base64)
+ * DELETE /me             → soft-delete du compte
  */
 
 const express      = require('express');
 const router       = express.Router();
 const bcrypt       = require('bcrypt');
 const db           = require('../config/firebase');
-const authenticate = require('../middleware/authenticate');
 const firebaseAuth = require('../middleware/firebaseAuth');
 const { logger }   = require('../middleware/logger');
 
@@ -143,54 +143,119 @@ router.delete('/', auth, async (req, res) => {
 });
 
 /* ── POST /me/avatar ──────────────────────────────────────── */
-// Upload photo de profil — multipart/form-data champ "avatar"
-let imageUpload = null;
-let buildFileUrl = null;
+// Stratégie dual:
+//   1. Essaie l'upload multipart (multer) → stocke base64 dans Firestore (pas de dépendance FS)
+//   2. Accepte aussi body JSON { avatarBase64: "data:image/png;base64,..." }
+// Stocker en base64 dans Firestore résout l'ephemeral FS de Render (pas de 404 après redeploy).
+// Limite: 800 KB en base64 (≈ 600 KB fichier original) — suffisant pour photos de profil compressées.
 
+const MAX_AVATAR_B64 = 800 * 1024; // 800 KB en base64
+
+// Essayer de charger multer/uploadService (optionnel — on peut aussi recevoir base64 directement)
+let imageUpload = null;
+let multerErrorHandler = null;
 try {
   const uploadService = require('../services/uploadService');
-  imageUpload  = uploadService.imageUpload;
-  buildFileUrl = uploadService.buildFileUrl;
+  imageUpload         = uploadService.imageUpload;
+  multerErrorHandler  = uploadService.multerErrorHandler;
 } catch (_) {}
 
-if (imageUpload && buildFileUrl) {
-  router.post(
-    '/avatar',
-    auth,
-    imageUpload.single('avatar'),
-    async (req, res) => {
-      const uid = req.user.uid;
+router.post('/avatar', auth, (req, res, next) => {
+  // Cas 1: body JSON avec avatarBase64 (envoyé par le frontend si multipart non disponible)
+  if (req.is('application/json') || req.body?.avatarBase64) {
+    return next();
+  }
 
-      if (!req.file) {
-        return res.status(400).json({ error: 'Aucun fichier fourni. Champ: "avatar".', code: 'NO_FILE' });
+  // Cas 2: multipart/form-data — on wrap multer dans un callback pour capturer les erreurs
+  if (imageUpload) {
+    imageUpload.single('avatar')(req, res, (err) => {
+      if (err) {
+        logger.warn('[Me] Multer error on avatar upload', { error: err.message, code: err.code });
+        if (multerErrorHandler) return multerErrorHandler(err, req, res, next);
+        // Fallback manuel si multerErrorHandler non disponible
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(413).json({ error: 'Fichier trop volumineux (max 10 MB).', code: 'FILE_TOO_LARGE' });
+        }
+        if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+          return res.status(400).json({ error: 'Champ inattendu. Utilisez le champ "avatar".', code: 'UNEXPECTED_FIELD' });
+        }
+        if (err.message && (err.message.includes('Format non autorisé') || err.message.includes('non autorisé'))) {
+          return res.status(415).json({ error: err.message, code: 'UNSUPPORTED_MEDIA_TYPE' });
+        }
+        return res.status(400).json({ error: err.message || 'Erreur upload.', code: 'UPLOAD_ERROR' });
       }
+      next();
+    });
+  } else {
+    // multer non disponible — on passe au handler qui accepte le JSON base64
+    next();
+  }
+}, async (req, res) => {
+  const uid = req.user.uid;
 
-      try {
-        const fileUrl = buildFileUrl('images', req.file.filename);
+  try {
+    let avatarBase64 = null;
 
-        await db.collection('users').doc(uid).set(
-          { avatar: fileUrl, updatedAt: new Date().toISOString() },
-          { merge: true }
-        );
+    // A) Fichier uploadé via multer
+    if (req.file) {
+      const fs     = require('fs');
+      const path   = require('path');
+      const mime   = req.file.mimetype || 'image/jpeg';
+      const buffer = fs.readFileSync(req.file.path);
 
-        logger.info('[Me] Avatar updated', { uid, url: fileUrl });
-
-        return res.status(200).json({
-          success  : true,
-          avatarUrl: fileUrl,
-          message  : 'Photo de profil mise à jour.',
+      // Vérifier taille base64 avant stockage Firestore
+      const b64 = buffer.toString('base64');
+      if (b64.length > MAX_AVATAR_B64) {
+        // Nettoyage disque
+        try { fs.unlinkSync(req.file.path); } catch (_) {}
+        return res.status(413).json({
+          error: 'Image trop grande pour le stockage (max ~600 KB). Compressez l\'image et réessayez.',
+          code : 'IMAGE_TOO_LARGE',
         });
-      } catch (err) {
-        logger.error('Erreur POST /me/avatar', { error: err.message });
-        return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
       }
+
+      avatarBase64 = `data:${mime};base64,${b64}`;
+
+      // Nettoyage disque après conversion (pas besoin de garder le fichier)
+      try { fs.unlinkSync(req.file.path); } catch (_) {}
+      logger.info('[Me] Avatar: file converted to base64', { uid, size: b64.length });
     }
-  );
-} else {
-  // Fallback si uploadService non disponible
-  router.post('/avatar', auth, (req, res) => {
-    return res.status(501).json({ error: 'Service upload non disponible.', code: 'UPLOAD_UNAVAILABLE' });
-  });
-}
+
+    // B) Base64 directement dans le body JSON
+    else if (req.body?.avatarBase64) {
+      const raw = req.body.avatarBase64;
+      if (!raw.startsWith('data:image/')) {
+        return res.status(400).json({ error: 'avatarBase64 doit être un data URI image.', code: 'INVALID_DATA_URI' });
+      }
+      if (raw.length > MAX_AVATAR_B64) {
+        return res.status(413).json({ error: 'Image trop grande.', code: 'IMAGE_TOO_LARGE' });
+      }
+      avatarBase64 = raw;
+      logger.info('[Me] Avatar: base64 JSON received', { uid, size: raw.length });
+    }
+
+    else {
+      return res.status(400).json({ error: 'Aucun fichier fourni. Champ multipart: "avatar" ou body JSON: "avatarBase64".', code: 'NO_FILE' });
+    }
+
+    // Stocker le base64 directement dans Firestore (résout ephemeral FS Render)
+    await db.collection('users').doc(uid).set(
+      { avatar: avatarBase64, updatedAt: new Date().toISOString() },
+      { merge: true }
+    );
+
+    logger.info('[Me] Avatar updated (base64 in Firestore)', { uid });
+
+    return res.status(200).json({
+      success  : true,
+      avatarUrl: avatarBase64,
+      message  : 'Photo de profil mise à jour.',
+    });
+
+  } catch (err) {
+    logger.error('Erreur POST /me/avatar', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
 
 module.exports = router;
