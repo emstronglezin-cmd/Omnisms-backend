@@ -334,11 +334,57 @@ router.post(
 
     try {
       const now = new Date().toISOString();
-      const cId = convId(uid, receiverId);
+      const db  = getDb();
+
+      // ── Résolution OmniSMS AVANT sauvegarde ─────────────────────────
+      // Si receiverId est un numéro de téléphone qui appartient à un compte
+      // OmniSMS, on utilise l'UID OmniSMS comme receiverId effectif pour
+      // avoir un conversationId cohérent ([uid, omniSmsUid].sort().join('-')).
+      let effectiveReceiverId = receiverId;
+      let resolvedOmniSmsUid  = null;
+
+      if (db) {
+        const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
+        if (looksLikePhone) {
+          // Cas : receiverId est un numéro → chercher en Firestore
+          const normalizedLookup = normalizePhone(receiverId);
+          const lookupVariants = [...new Set([
+            normalizedLookup, receiverId, receiverId.replace(/\s/g, ''),
+          ].filter(Boolean))];
+
+          let foundSnap = null;
+          for (const variant of lookupVariants) {
+            try {
+              const snap = await db.collection('users')
+                .where('phone', '==', variant).where('deleted', '==', false).limit(1).get();
+              if (!snap.empty) { foundSnap = snap.docs[0]; break; }
+            } catch (_) {
+              try {
+                const snap2 = await db.collection('users')
+                  .where('phone', '==', variant).limit(1).get();
+                if (!snap2.empty) {
+                  const d = snap2.docs[0].data();
+                  if (!d.deleted) { foundSnap = snap2.docs[0]; break; }
+                }
+              } catch (_2) {}
+            }
+          }
+
+          if (foundSnap) {
+            resolvedOmniSmsUid  = foundSnap.id;
+            effectiveReceiverId = resolvedOmniSmsUid;
+            logger.info('[Messages] Phone resolved to OmniSMS UID (pre-save)', {
+              phone: receiverId, uid: resolvedOmniSmsUid,
+            });
+          }
+        }
+      }
+
+      const cId = convId(uid, effectiveReceiverId);
 
       const msg = {
         senderId    : uid,
-        receiverId,
+        receiverId  : effectiveReceiverId,
         conversationId: cId,
         content     : content ? content.trim() : null,
         type,
@@ -356,7 +402,6 @@ router.post(
         updatedAt   : now,
       };
 
-      const db = getDb();
       let docId = `msg-${Date.now()}`;
 
       if (db) {
@@ -367,8 +412,14 @@ router.post(
       const fullMsg = { id: docId, ...msg };
 
       // Notifier le destinataire en temps réel via Socket.IO
+      // Notifier sur l'UID effectif (peut différer de receiverId si résolution phone→UID)
       try {
-        emitToUser(receiverId, 'message:receive', fullMsg);
+        emitToUser(effectiveReceiverId, 'message:receive', fullMsg);
+        // Si l'UID résolu est différent du receiverId original, émettre aussi sur l'original
+        // (pour compatibilité avec les clients qui écoutent sur le numéro de téléphone)
+        if (resolvedOmniSmsUid && resolvedOmniSmsUid !== receiverId) {
+          // Déjà émis ci-dessus via effectiveReceiverId = resolvedOmniSmsUid
+        }
       } catch (_) {
         // Socket.IO peut ne pas être initialisé — non bloquant
       }
@@ -376,153 +427,105 @@ router.post(
       // ── Auto-transcription pour messages vocaux ───────────────
       if (type === 'audio' && audioUrl && addTranscriptionJob) {
         try {
-          // Extraire le nom de fichier depuis l'URL audio
-          const path  = require('path');
-          const fs    = require('fs');
-          const fname = audioUrl.split('/').pop();
-          const audioPath = path.join(__dirname, '..', 'uploads', 'audio', fname);
-          if (fs.existsSync(audioPath)) {
-            await addTranscriptionJob({
-              audioPath,
-              messageId : docId,
-              userId    : uid,
-              language  : 'fr',
-              collection: 'messages',   // collection Firestore à mettre à jour
-            });
-            logger.info('[Messages] Transcription job lancé auto', { msgId: docId });
+          const pathMod = require('path');
+          const fs      = require('fs');
+          // Cas 1 : data URI base64 — écrire un fichier temporaire
+          if (audioUrl.startsWith('data:')) {
+            const matches = audioUrl.match(/^data:([^;]+);base64,(.+)$/s);
+            if (matches) {
+              const ext      = matches[1].replace('audio/', '').replace(/[^a-z0-9]/g, '');
+              const tmpName  = `tmp_auto_${docId}_${Date.now()}.${ext || 'webm'}`;
+              const tmpPath  = pathMod.join(__dirname, '..', 'uploads', 'audio', tmpName);
+              try {
+                fs.writeFileSync(tmpPath, Buffer.from(matches[2], 'base64'));
+                await addTranscriptionJob({
+                  audioPath : tmpPath,
+                  tempFile  : tmpPath,
+                  messageId : docId,
+                  userId    : uid,
+                  language  : 'fr',
+                  collection: 'messages',
+                });
+                logger.info('[Messages] Transcription job lancé auto (base64→tempFile)', { msgId: docId });
+              } catch (tmpErr) {
+                logger.warn('[Messages] Échec écriture temp file pour transcription', { error: tmpErr.message });
+              }
+            }
+          } else {
+            // Cas 2 : URL disque — vérifier existence
+            const fname = audioUrl.split('/').pop();
+            const audioPath = pathMod.join(__dirname, '..', 'uploads', 'audio', fname);
+            if (fs.existsSync(audioPath)) {
+              await addTranscriptionJob({
+                audioPath,
+                messageId : docId,
+                userId    : uid,
+                language  : 'fr',
+                collection: 'messages',
+              });
+              logger.info('[Messages] Transcription job lancé auto (disk file)', { msgId: docId });
+            }
           }
         } catch (transcErr) {
           logger.warn('[Messages] Échec lancement transcription auto', { error: transcErr.message });
         }
       }
 
-      // ── Fallback SMS Infobip automatique ─────────────────────
-      // LOGIQUE DE ROUTAGE (priorité OmniSMS) :
-      //   1. Si receiverId est un UID Firestore → vérifier que le doc existe (utilisateur OmniSMS)
-      //   2. Si receiverId ressemble à un numéro de téléphone :
-      //      a. Normaliser en E.164
-      //      b. Chercher dans Firestore users WHERE phone == normalizedPhone
-      //      c. Si trouvé → destinataire OmniSMS → PAS de SMS
-      //      d. Si non trouvé → SMS Infobip
-      //   3. Normaliser TOUS les numéros en E.164 avant comparaison Firestore
+      // ── SMS Infobip (destinataires NON OmniSMS uniquement) ───────────
+      // NOTE: la résolution OmniSMS a déjà eu lieu avant la sauvegarde.
+      // resolvedOmniSmsUid != null  → destinataire OmniSMS → PAS de SMS.
+      // resolvedOmniSmsUid == null et receiverId ressemble à un téléphone → SMS.
       let smsResult = null;
       if (type === 'text' && content && infobip) {
         try {
-          let recipientPhone       = phone || null;
-          let recipientIsOmniSms   = false;
-          let recipientOmniSmsUid  = null;
-
-          // Détecter si receiverId ressemble à un numéro de téléphone
+          // Si le receiverId original était un UID Firestore (pas un téléphone),
+          // vérifier s'il s'agit bien d'un utilisateur OmniSMS valide.
           const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
+          let isOmniSmsRecipient = (resolvedOmniSmsUid !== null); // déjà résolu ci-dessus
 
-          if (!looksLikePhone && db) {
-            // ── Cas 1 : receiverId est un UID Firestore ─────────────────
-            const recipientSnap = await db.collection('users').doc(receiverId).get();
-            if (recipientSnap.exists) {
-              const recipientData = recipientSnap.data();
-              // Marqué comme supprimé → pas OmniSMS
-              if (recipientData.deleted) {
-                recipientIsOmniSms = false;
-              } else {
-                // Tout utilisateur valide dans Firestore = OmniSMS
-                recipientIsOmniSms  = true;
-                recipientOmniSmsUid = receiverId;
-              }
-              if (!recipientPhone) recipientPhone = recipientData.phone || null;
-            } else {
-              recipientIsOmniSms = false;
-            }
-          } else if (looksLikePhone && db) {
-            // ── Cas 2 : receiverId est un numéro de téléphone ──────────
-            if (!recipientPhone) recipientPhone = receiverId;
-
-            // Normaliser en E.164 pour la recherche Firestore
-            const normalizedLookup = normalizePhone(receiverId);
-
-            // Chercher dans Firestore : phone == normalizedLookup (ou == receiverId brut)
-            // Utiliser 2 variantes pour couvrir les différents formats stockés
-            let foundSnap = null;
-            const lookupVariants = [...new Set([
-              normalizedLookup,
-              receiverId,
-              receiverId.replace(/\s/g, ''),
-            ].filter(Boolean))];
-
-            for (const variant of lookupVariants) {
-              try {
-                const snap = await db.collection('users')
-                  .where('phone', '==', variant)
-                  .where('deleted', '==', false)
-                  .limit(1)
-                  .get();
-                if (!snap.empty) { foundSnap = snap.docs[0]; break; }
-              } catch (_) {
-                // Si l'index 'deleted' n'existe pas, retenter sans ce filtre
-                try {
-                  const snap2 = await db.collection('users')
-                    .where('phone', '==', variant)
-                    .limit(1)
-                    .get();
-                  if (!snap2.empty) {
-                    const d = snap2.docs[0].data();
-                    if (!d.deleted) { foundSnap = snap2.docs[0]; break; }
-                  }
-                } catch (_2) {}
-              }
-            }
-
-            if (foundSnap) {
-              // Ce numéro appartient à un utilisateur OmniSMS !
-              recipientIsOmniSms  = true;
-              recipientOmniSmsUid = foundSnap.id;
-              logger.info('[Messages] Numéro de téléphone résolu vers compte OmniSMS', {
-                phone: receiverId, uid: recipientOmniSmsUid,
-              });
-
-              // Réémettre le message vers l'UID OmniSMS trouvé (si différent du receiverId d'origine)
-              if (recipientOmniSmsUid !== receiverId) {
-                try { emitToUser(recipientOmniSmsUid, 'message:receive', fullMsg); } catch (_) {}
-              }
-            } else {
-              recipientIsOmniSms = false;
-              logger.info('[Messages] Numéro non-OmniSMS, routage SMS', { phone: receiverId });
-            }
+          if (!looksLikePhone && !isOmniSmsRecipient && db) {
+            // receiverId est un UID Firestore — vérifier que l'utilisateur existe et n'est pas supprimé
+            try {
+              const snap = await db.collection('users').doc(effectiveReceiverId).get();
+              if (snap.exists && !snap.data().deleted) isOmniSmsRecipient = true;
+            } catch (_) {}
           }
 
-          // ── Envoi SMS si destinataire NON OmniSMS ──────────────────
-          if (!recipientIsOmniSms && recipientPhone && infobip.isConfigured()) {
-            const normalizedRecipient = normalizePhone(recipientPhone) || recipientPhone;
-            const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
-            smsResult = await infobip.sendSMS({
-              to       : normalizedRecipient,
-              text     : content.trim(),
-              from     : smsFrom || process.env.INFOBIP_SENDER || process.env.INFOBIP_SENDER_ID || 'OmniSMS',
-              notifyUrl: deliveryUrl,
-            });
-
-            // Sauvegarder aussi en tant que SMS dans Firestore
-            if (db && smsResult.success) {
-              await db.collection('messages').add({
-                ...msg,
-                id           : `sms-${smsResult.messageId || Date.now()}`,
-                channel      : 'sms',
-                phone        : recipientPhone,
-                smsMessageId : smsResult.messageId,
-                status       : 'sent',
-                createdAt    : now,
-                updatedAt    : now,
+          if (!isOmniSmsRecipient) {
+            // Destinataire non-OmniSMS → SMS via Infobip
+            const recipientPhone = phone || (looksLikePhone ? receiverId : null);
+            if (recipientPhone && infobip.isConfigured()) {
+              const normalizedRecipient = normalizePhone(recipientPhone) || recipientPhone;
+              const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
+              smsResult = await infobip.sendSMS({
+                to       : normalizedRecipient,
+                text     : content.trim(),
+                from     : smsFrom || process.env.INFOBIP_SENDER || process.env.INFOBIP_SENDER_ID || 'OmniSMS',
+                notifyUrl: deliveryUrl,
               });
-            }
 
-            logger.info('[Messages] SMS Infobip envoyé (destinataire non-OmniSMS)', {
-              to: normalizedRecipient, messageId: smsResult.messageId, status: smsResult.status,
-            });
-          } else if (recipientIsOmniSms) {
+              if (db && smsResult.success) {
+                await db.collection('messages').add({
+                  ...msg,
+                  id          : `sms-${smsResult.messageId || Date.now()}`,
+                  channel     : 'sms',
+                  phone       : recipientPhone,
+                  smsMessageId: smsResult.messageId,
+                  status      : 'sent',
+                  createdAt   : now,
+                  updatedAt   : now,
+                });
+              }
+              logger.info('[Messages] SMS Infobip envoyé (destinataire non-OmniSMS)', {
+                to: normalizedRecipient, messageId: smsResult.messageId, status: smsResult.status,
+              });
+            } else if (!recipientPhone) {
+              logger.warn('[Messages] SMS fallback impossible : numéro inconnu', { receiverId });
+            }
+          } else {
             logger.info('[Messages] Destinataire OmniSMS — message in-app uniquement (pas de SMS)', {
-              receiverId, omniSmsUid: recipientOmniSmsUid,
+              originalReceiverId: receiverId, effectiveReceiverId,
             });
-          } else if (!recipientIsOmniSms && !recipientPhone) {
-            logger.warn('[Messages] SMS fallback impossible : numéro inconnu pour le destinataire', { receiverId });
           }
         } catch (smsErr) {
           logger.error('[Messages] Erreur routage SMS/OmniSMS', { error: smsErr.message });

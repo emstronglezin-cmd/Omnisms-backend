@@ -227,18 +227,48 @@ router.post('/transcribe/:id', auth, async (req, res) => {
       return res.status(403).json({ error: 'Accès refusé.', code: 'FORBIDDEN' });
     }
 
-    const audioPath = path.join(DIRS.audio, audioData.filename);
+    const audioPath = path.join(DIRS.audio, audioData.filename || '');
 
-    if (!fs.existsSync(audioPath)) {
+    // ── Stratégie : préférer la base64 en Firestore (persistante),
+    //    tomber sur le fichier disque si la base64 n'est pas disponible ──────
+    const audioDataUri = audioData.audioDataUri || audioData.url || null;
+    const hasBase64    = audioDataUri && audioDataUri.startsWith('data:');
+    const hasDiskFile  = audioPath && fs.existsSync(audioPath);
+
+    if (!hasBase64 && !hasDiskFile) {
       return res.status(404).json({
-        error: 'Fichier audio introuvable sur le serveur.',
+        error: 'Fichier audio introuvable (ni sur disque ni en Firestore base64). Il a peut-être été effacé lors d\'un redeploy.',
         code : 'FILE_NOT_FOUND',
+        hint : 'Re-envoyez le message vocal.',
       });
+    }
+
+    // Si on a la base64, écrire un fichier temporaire pour le worker Whisper
+    let transcriptionAudioPath = audioPath;
+    let tempFile               = null;
+    if (hasBase64 && !hasDiskFile) {
+      try {
+        const matches = audioDataUri.match(/^data:([^;]+);base64,(.+)$/s);
+        if (matches) {
+          const ext      = matches[1].replace('audio/', '').replace(/[^a-z0-9]/g, '');
+          const safeName = `tmp_transcribe_${id}_${Date.now()}.${ext || 'webm'}`;
+          tempFile       = path.join(DIRS.audio, safeName);
+          fs.writeFileSync(tempFile, Buffer.from(matches[2], 'base64'));
+          transcriptionAudioPath = tempFile;
+          logger.info('[Audio] Wrote temp file for transcription from base64', { id, tempFile: safeName });
+        } else {
+          return res.status(400).json({ error: 'Format base64 invalide.', code: 'INVALID_BASE64' });
+        }
+      } catch (tmpErr) {
+        logger.error('[Audio] Failed to write temp file for transcription', { error: tmpErr.message });
+        return res.status(500).json({ error: 'Erreur préparation transcription.', code: 'SERVER_ERROR' });
+      }
     }
 
     // Créer le job de transcription
     const job = await addTranscriptionJob({
-      audioPath,
+      audioPath : transcriptionAudioPath,
+      tempFile,   // transmis au worker pour nettoyage après transcription
       messageId : id,
       userId    : uid,
       language  : language.replace(/[^a-zA-Z]/g, '').slice(0, 5),
