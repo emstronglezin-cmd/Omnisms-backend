@@ -397,41 +397,100 @@ router.post(
       }
 
       // ── Fallback SMS Infobip automatique ─────────────────────
-      // Logique : si le destinataire n'a PAS de compte OmniSMS vérifié
-      //           → envoyer un SMS Infobip automatiquement
-      // Le frontend n'a RIEN à décider — il envoie juste { receiverId, content }
+      // LOGIQUE DE ROUTAGE (priorité OmniSMS) :
+      //   1. Si receiverId est un UID Firestore → vérifier que le doc existe (utilisateur OmniSMS)
+      //   2. Si receiverId ressemble à un numéro de téléphone :
+      //      a. Normaliser en E.164
+      //      b. Chercher dans Firestore users WHERE phone == normalizedPhone
+      //      c. Si trouvé → destinataire OmniSMS → PAS de SMS
+      //      d. Si non trouvé → SMS Infobip
+      //   3. Normaliser TOUS les numéros en E.164 avant comparaison Firestore
       let smsResult = null;
       if (type === 'text' && content && infobip) {
         try {
-          // 1. Chercher le destinataire dans Firestore pour vérifier son statut OmniSMS
-          let recipientPhone = phone || null;  // phone peut venir du frontend (override optionnel)
-          let recipientIsOmniSms = false;
+          let recipientPhone       = phone || null;
+          let recipientIsOmniSms   = false;
+          let recipientOmniSmsUid  = null;
 
-          // Détecter si receiverId est un numéro de téléphone (non-OmniSMS direct)
+          // Détecter si receiverId ressemble à un numéro de téléphone
           const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
 
-          if (looksLikePhone) {
-            // receiverId EST un numéro de téléphone → toujours SMS
-            recipientIsOmniSms = false;
-            if (!recipientPhone) recipientPhone = receiverId;
-          } else if (db) {
-            // receiverId est un UID Firestore → chercher dans users
+          if (!looksLikePhone && db) {
+            // ── Cas 1 : receiverId est un UID Firestore ─────────────────
             const recipientSnap = await db.collection('users').doc(receiverId).get();
             if (recipientSnap.exists) {
               const recipientData = recipientSnap.data();
-              // Considéré comme utilisateur OmniSMS si phoneVerified OU pas de flag phoneVerified
-              recipientIsOmniSms = recipientData.phoneVerified !== false;
-              // Récupérer le numéro du destinataire si on doit envoyer un SMS
+              // Marqué comme supprimé → pas OmniSMS
+              if (recipientData.deleted) {
+                recipientIsOmniSms = false;
+              } else {
+                // Tout utilisateur valide dans Firestore = OmniSMS
+                recipientIsOmniSms  = true;
+                recipientOmniSmsUid = receiverId;
+              }
               if (!recipientPhone) recipientPhone = recipientData.phone || null;
             } else {
-              // UID Firestore introuvable → SMS fallback si on a un numéro
               recipientIsOmniSms = false;
+            }
+          } else if (looksLikePhone && db) {
+            // ── Cas 2 : receiverId est un numéro de téléphone ──────────
+            if (!recipientPhone) recipientPhone = receiverId;
+
+            // Normaliser en E.164 pour la recherche Firestore
+            const normalizedLookup = normalizePhone(receiverId);
+
+            // Chercher dans Firestore : phone == normalizedLookup (ou == receiverId brut)
+            // Utiliser 2 variantes pour couvrir les différents formats stockés
+            let foundSnap = null;
+            const lookupVariants = [...new Set([
+              normalizedLookup,
+              receiverId,
+              receiverId.replace(/\s/g, ''),
+            ].filter(Boolean))];
+
+            for (const variant of lookupVariants) {
+              try {
+                const snap = await db.collection('users')
+                  .where('phone', '==', variant)
+                  .where('deleted', '==', false)
+                  .limit(1)
+                  .get();
+                if (!snap.empty) { foundSnap = snap.docs[0]; break; }
+              } catch (_) {
+                // Si l'index 'deleted' n'existe pas, retenter sans ce filtre
+                try {
+                  const snap2 = await db.collection('users')
+                    .where('phone', '==', variant)
+                    .limit(1)
+                    .get();
+                  if (!snap2.empty) {
+                    const d = snap2.docs[0].data();
+                    if (!d.deleted) { foundSnap = snap2.docs[0]; break; }
+                  }
+                } catch (_2) {}
+              }
+            }
+
+            if (foundSnap) {
+              // Ce numéro appartient à un utilisateur OmniSMS !
+              recipientIsOmniSms  = true;
+              recipientOmniSmsUid = foundSnap.id;
+              logger.info('[Messages] Numéro de téléphone résolu vers compte OmniSMS', {
+                phone: receiverId, uid: recipientOmniSmsUid,
+              });
+
+              // Réémettre le message vers l'UID OmniSMS trouvé (si différent du receiverId d'origine)
+              if (recipientOmniSmsUid !== receiverId) {
+                try { emitToUser(recipientOmniSmsUid, 'message:receive', fullMsg); } catch (_) {}
+              }
+            } else {
+              recipientIsOmniSms = false;
+              logger.info('[Messages] Numéro non-OmniSMS, routage SMS', { phone: receiverId });
             }
           }
 
-          // 2. Si le destinataire n'est PAS sur OmniSMS, envoyer un SMS classique
+          // ── Envoi SMS si destinataire NON OmniSMS ──────────────────
           if (!recipientIsOmniSms && recipientPhone && infobip.isConfigured()) {
-            // Normaliser en E.164 pour Infobip
             const normalizedRecipient = normalizePhone(recipientPhone) || recipientPhone;
             const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
             smsResult = await infobip.sendSMS({
@@ -455,15 +514,18 @@ router.post(
               });
             }
 
-            logger.info('[Messages] SMS Infobip automatique (destinataire non-OmniSMS)', {
-              to: recipientPhone, messageId: smsResult.messageId, status: smsResult.status,
+            logger.info('[Messages] SMS Infobip envoyé (destinataire non-OmniSMS)', {
+              to: normalizedRecipient, messageId: smsResult.messageId, status: smsResult.status,
+            });
+          } else if (recipientIsOmniSms) {
+            logger.info('[Messages] Destinataire OmniSMS — message in-app uniquement (pas de SMS)', {
+              receiverId, omniSmsUid: recipientOmniSmsUid,
             });
           } else if (!recipientIsOmniSms && !recipientPhone) {
             logger.warn('[Messages] SMS fallback impossible : numéro inconnu pour le destinataire', { receiverId });
           }
-          // Si recipientIsOmniSms === true → message in-app suffit, pas de SMS
         } catch (smsErr) {
-          logger.error('[Messages] Erreur SMS fallback automatique', { error: smsErr.message });
+          logger.error('[Messages] Erreur routage SMS/OmniSMS', { error: smsErr.message });
           smsResult = { success: false, error: smsErr.message };
         }
       }
