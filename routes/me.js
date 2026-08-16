@@ -14,6 +14,7 @@ const bcrypt       = require('bcrypt');
 const db           = require('../config/firebase');
 const firebaseAuth = require('../middleware/firebaseAuth');
 const { logger }   = require('../middleware/logger');
+const { normalizePhone } = require('../services/phoneNormalizer');
 
 const auth = firebaseAuth;  // accepte Firebase token + JWT
 
@@ -52,7 +53,13 @@ router.put('/profile', auth, async (req, res) => {
 
     if (name  !== undefined && name  !== null) updates.name  = String(name).trim();
     if (email !== undefined && email !== null) updates.email = String(email).toLowerCase().trim();
-    if (phone !== undefined && phone !== null) updates.phone = String(phone).trim();
+    if (phone !== undefined && phone !== null) {
+      // Stocker en format E.164 canonique pour des recherches cohérentes
+      const rawPhone  = String(phone).trim();
+      const e164Phone = normalizePhone(rawPhone) || rawPhone;
+      updates.phone = e164Phone;
+      if (e164Phone !== rawPhone) updates.phoneRaw = rawPhone;
+    }
     if (bio   !== undefined && bio   !== null) updates.bio   = String(bio).trim();
 
     // Username: validate format + uniqueness check

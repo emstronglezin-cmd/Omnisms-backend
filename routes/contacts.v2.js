@@ -115,8 +115,9 @@ router.post(
 
             snap.forEach(doc => {
               const data = doc.data();
-              // Ignorer les comptes dont phoneVerified est explicitement false (non activés)
+              // Ignorer les comptes désactivés ou supprimés
               if (data.phoneVerified === false) return;
+              if (data.deleted === true) return;
               // Trouver le nom donné par cet utilisateur dans ses contacts
               const contact = validContacts.find(c => c.normalized === data.phone);
               // Éviter les doublons
@@ -247,14 +248,19 @@ router.post(
       const contact = { name, phone: contactNorm, isOnOmniSms: false, addedAt: new Date().toISOString() };
 
       if (!exists) {
-        // Vérifier si ce numéro est sur OmniSMS
+        // Vérifier si ce numéro est sur OmniSMS (exclure comptes supprimés)
         try {
           const omniSnap = await db.collection('users').where('phone', '==', contactNorm).limit(1).get();
           if (!omniSnap.empty) {
             const omniUser = omniSnap.docs[0];
-            contact.isOnOmniSms      = true;
-            contact.userId           = omniUser.id;
-            contact.registeredUserId = omniUser.id;
+            const omniData = omniUser.data();
+            // Ne marquer OmniSMS que si le compte n'est pas supprimé
+            if (!omniData.deleted) {
+              contact.isOnOmniSms      = true;
+              contact.userId           = omniUser.id;
+              contact.registeredUserId = omniUser.id;
+              contact.avatar           = omniData.avatar || null;
+            }
           }
         } catch (_) {}
 

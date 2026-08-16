@@ -3,7 +3,7 @@
  * OmniSMS — Routes Authentification
  *
  * Endpoints :
- *  POST /api/auth/register  → Créer un compte (email + password)
+ *  POST /api/auth/register  → Créer un compte (phone obligatoire, email optionnel)
  *  POST /api/auth/login     → Connexion (email ou phone + password)
  *  POST /api/auth/google    → Google Sign-In (Firebase ID token)
  *  GET  /api/auth/me        → Récupérer son profil (auth requise)
@@ -20,6 +20,7 @@ const db           = require('../config/firebase');
 const authenticate = require('../middleware/authenticate');
 const { signToken } = require('../middleware/authenticate');
 const { logger }   = require('../middleware/logger');
+const { normalizePhone } = require('../services/phoneNormalizer');
 
 const SALT_ROUNDS = 12;
 
@@ -78,63 +79,80 @@ router.post(
     if (validationError) return;
 
     const { name, email, password, phone, username } = req.body;
-    const normalizedPhone    = phone.trim();
+
+    // ── Normalisation des identifiants ─────────────────────────────────────
+    // Téléphone : normalisation E.164 canonique (ex: "+22670000000")
+    // Conserver aussi la version brute pour affichage, mais stocker E.164 pour comparaisons
+    const rawPhone           = phone.trim();
+    const e164Phone          = normalizePhone(rawPhone) || rawPhone;  // E.164 ou brut si échec
     const normalizedEmail    = email ? email.toLowerCase().trim() : null;
-    // Username est maintenant obligatoire — le validator l'a déjà vérifié
     const normalizedUsername = username.trim().toLowerCase();
 
     try {
-      // Vérifier si le numéro de téléphone existe déjà
-      const existingPhone = await db
-        .collection('users')
-        .where('phone', '==', normalizedPhone)
-        .limit(1)
-        .get();
+      // ── Vérification unicité AVANT toute création ────────────────────────
+      // On fait toutes les vérifications en parallèle pour être rapide.
+      // IMPORTANT : on vérifie AUSSI les variantes du numéro pour éviter les doublons
+      // de format (+226XXXXXXXX vs 226XXXXXXXX vs 0XXXXXXXX).
+      const checks = [
+        // Phone : vérifier le format E.164 normalisé ET le format brut (en cas de stocks anciens)
+        db.collection('users').where('phone', '==', e164Phone).limit(1).get(),
+        // Username
+        db.collection('users').where('username', '==', normalizedUsername).limit(1).get(),
+      ];
+      if (normalizedEmail) {
+        checks.push(db.collection('users').where('email', '==', normalizedEmail).limit(1).get());
+      }
+      // Si e164Phone ≠ rawPhone, vérifier aussi le format brut
+      if (e164Phone !== rawPhone) {
+        checks.push(db.collection('users').where('phone', '==', rawPhone).limit(1).get());
+      }
 
-      if (!existingPhone.empty) {
+      const results = await Promise.all(checks);
+      const [phoneSnap, usernameSnap, ...rest] = results;
+
+      if (!phoneSnap.empty) {
         return res.status(409).json({
           error: 'Un compte avec ce numéro de téléphone existe déjà.',
-          code : 'PHONE_EXISTS',
+          code : 'PHONE_ALREADY_EXISTS',
         });
       }
 
-      // Vérifier si le username existe déjà
-      const existingUsername = await db
-        .collection('users')
-        .where('username', '==', normalizedUsername)
-        .limit(1)
-        .get();
-
-      if (!existingUsername.empty) {
+      if (!usernameSnap.empty) {
         return res.status(409).json({
-          error: 'Ce nom d\'utilisateur est déjà pris. Choisissez-en un autre.',
-          code : 'USERNAME_EXISTS',
+          error: `Le nom d'utilisateur "@${normalizedUsername}" est déjà utilisé. Choisissez-en un autre.`,
+          code : 'USERNAME_ALREADY_EXISTS',
         });
       }
 
-      // Vérifier si l'email existe déjà (si fourni)
-      if (normalizedEmail) {
-        const existingEmail = await db
-          .collection('users')
-          .where('email', '==', normalizedEmail)
-          .limit(1)
-          .get();
-
-        if (!existingEmail.empty) {
-          return res.status(409).json({
-            error: 'Un compte avec cet email existe déjà.',
-            code : 'EMAIL_EXISTS',
-          });
-        }
+      // Vérifier email (3ème résultat si email fourni)
+      if (normalizedEmail && rest.length > 0 && !rest[0].empty) {
+        return res.status(409).json({
+          error: 'Un compte avec cette adresse email existe déjà.',
+          code : 'EMAIL_ALREADY_EXISTS',
+        });
       }
 
+      // Vérifier format brut si différent de E.164 (dernier résultat)
+      const rawPhoneSnap = (!normalizedEmail && e164Phone !== rawPhone && rest[0])
+        || (normalizedEmail && e164Phone !== rawPhone && rest[1]);
+      if (rawPhoneSnap && !rawPhoneSnap.empty) {
+        return res.status(409).json({
+          error: 'Un compte avec ce numéro de téléphone existe déjà.',
+          code : 'PHONE_ALREADY_EXISTS',
+        });
+      }
+
+      // ── Création du compte ───────────────────────────────────────────────
       const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
       const now = new Date().toISOString();
 
       const userData = {
         name          : name.trim(),
         username      : normalizedUsername,
-        phone         : normalizedPhone,
+        // Stocker le numéro en format E.164 canonique pour des comparaisons fiables
+        phone         : e164Phone,
+        // Conserver aussi le format original pour affichage
+        phoneRaw      : rawPhone !== e164Phone ? rawPhone : null,
         email         : normalizedEmail,
         password      : hashedPassword,
         phoneVerified : true,    // Activé directement — pas d'OTP requis
@@ -148,12 +166,12 @@ router.post(
       const docRef = await db.collection('users').add(userData);
       const userId = docRef.id;
 
-      logger.info('Utilisateur créé', { uid: userId, phone: normalizedPhone });
+      logger.info('Utilisateur créé', { uid: userId, phone: e164Phone, username: normalizedUsername });
 
       // Générer le JWT immédiatement — pas d'OTP
       const token = signToken({
         uid  : userId,
-        email: normalizedEmail || normalizedPhone,
+        email: normalizedEmail || e164Phone,
         name : userData.name,
       });
 
@@ -164,7 +182,7 @@ router.post(
           id           : userId,
           name         : userData.name,
           username     : normalizedUsername,
-          phone        : normalizedPhone,
+          phone        : e164Phone,
           email        : normalizedEmail,
           phoneVerified: true,
           isSubscribed : false,
@@ -219,15 +237,36 @@ router.post(
       if (email) {
         snap = await db
           .collection('users')
-          .where('email', '==', email.toLowerCase())
+          .where('email', '==', email.toLowerCase().trim())
           .limit(1)
           .get();
       } else {
-        snap = await db
-          .collection('users')
-          .where('phone', '==', phone)
-          .limit(1)
-          .get();
+        // Téléphone : essayer le format E.164 normalisé ET le format brut
+        // pour les comptes anciens stockés dans un format différent
+        const rawPhone  = phone.trim();
+        const e164Phone = normalizePhone(rawPhone) || rawPhone;
+
+        // Essayer E.164 d'abord
+        snap = await db.collection('users').where('phone', '==', e164Phone).limit(1).get();
+
+        // Si non trouvé et format différent, essayer le format brut
+        if (snap.empty && e164Phone !== rawPhone) {
+          snap = await db.collection('users').where('phone', '==', rawPhone).limit(1).get();
+        }
+
+        // Essayer aussi avec le format complet (ex: "+22670000000" ↔ "0022670000000")
+        if (snap.empty) {
+          const variants = [
+            rawPhone.replace(/^\+/, '00'),   // +226... → 00226...
+            rawPhone.replace(/^00/, '+'),     // 00226... → +226...
+            rawPhone.replace(/\s/g, ''),      // sans espaces
+          ].filter(v => v !== rawPhone && v !== e164Phone);
+          for (const variant of variants) {
+            if (snap.empty) {
+              snap = await db.collection('users').where('phone', '==', variant).limit(1).get();
+            }
+          }
+        }
       }
 
       if (snap.empty) {
@@ -278,6 +317,7 @@ router.post(
           username     : user.username     || null,
           email        : user.email        || null,
           phone        : user.phone        || null,
+          avatar       : user.avatar       || null,
           phoneVerified: user.phoneVerified !== false,
           isSubscribed : user.isSubscribed || false,
           credits      : user.credits      || 0,
