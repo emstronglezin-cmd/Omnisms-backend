@@ -20,13 +20,12 @@ const firebaseAuth = require('../middleware/firebaseAuth');
 const { normalizePhone } = require('../services/phoneNormalizer');
 const { emitToUser }    = require('../services/socketService');
 const { logger }        = require('../middleware/logger');
+/* ── Routage central (OmniSMS ↔ Infobip) ────────────────── */
+let routeMessage = null;
+try { ({ routeMessage } = require('../services/messageRouter')); } catch (_) {}
 /* ── Transcription auto pour messages vocaux ─────────────── */
 let addTranscriptionJob = null;
 try { ({ addTranscriptionJob } = require('../services/queueService')); } catch (_) {}
-
-/* ── Infobip (optionnel — non bloquant si non configuré) ───── */
-let infobip = null;
-try { infobip = require('../services/infobip'); } catch (_) {}
 
 const auth = firebaseAuth;
 
@@ -115,7 +114,7 @@ router.get('/', auth, async (req, res) => {
       }
     });
 
-    // Comptage non-lus
+    // Comptage non-lus (conversations OmniSMS)
     received.docs.forEach(d => {
       const msg = d.data();
       if (msg.status !== 'seen') {
@@ -123,6 +122,46 @@ router.get('/', auth, async (req, res) => {
         if (convMap.has(cId)) convMap.get(cId).unreadCount++;
       }
     });
+
+    // ── Conversations externes (external_conversations) ──────────────
+    // Fusionner les conversations SMS ↔ OmniSMS dans la liste principale.
+    // Ces entrées n'ont pas de messages dans 'messages' mais ont un lastMessage.
+    if (!type || type === 'sms') {
+      try {
+        const extSnap = await db.collection('external_conversations')
+          .where('ownerUid', '==', uid)
+          .limit(limit * 2)
+          .get();
+
+        extSnap.docs.forEach(d => {
+          const ext  = d.data();
+          const cId  = d.id;  // ext-{ownerUid}-{e164}
+          if (convMap.has(cId)) return;  // déjà présent via 'messages' (rare mais possible)
+
+          convMap.set(cId, {
+            id                 : cId,
+            otherUserId        : ext.externalPhone || cId,
+            channel            : 'sms',
+            isExternal         : true,
+            externalPhone      : ext.externalPhone || null,
+            externalName       : ext.externalName  || ext.externalPhone || null,
+            lastMessage        : ext.lastMessage   || '',
+            lastMessageContent : ext.lastMessage   || '',
+            lastMessageAt      : ext.lastMessageAt || ext.createdAt || null,
+            lastMessageTime    : ext.lastMessageAt || ext.createdAt || null,
+            lastMessageType    : 'text',
+            lastMessageSenderId: ext.externalPhone || cId,
+            unreadCount        : 0,  // TODO: compter les non-lus dans external_conversations
+            otherUserName      : ext.externalName  || ext.externalPhone || null,
+            otherUserPhone     : ext.externalPhone || null,
+            contactName        : ext.externalName  || ext.externalPhone || null,
+          });
+        });
+      } catch (extErr) {
+        logger.warn('[Messages] GET / external_conversations fetch error', { error: extErr.message });
+        // Non bloquant — continuer sans les conversations externes
+      }
+    }
 
     // Enrichir les conversations avec le nom de l'autre utilisateur
     if (db) {
@@ -319,8 +358,8 @@ router.post(
       receiverId, content, type = 'text',
       audioUrl, imageUrl, fileUrl, duration,
       replyTo,
-      // SMS Infobip optionnel
-      phone, sendSms = false, smsFrom,
+      // Champs optionnels passés par le frontend pour contexte SMS
+      phone, smsFrom,
     } = req.body;
 
     const uid = req.user.uid;
@@ -336,92 +375,123 @@ router.post(
       const now = new Date().toISOString();
       const db  = getDb();
 
-      // ── Résolution OmniSMS AVANT sauvegarde ─────────────────────────
-      // Si receiverId est un numéro de téléphone qui appartient à un compte
-      // OmniSMS, on utilise l'UID OmniSMS comme receiverId effectif pour
-      // avoir un conversationId cohérent ([uid, omniSmsUid].sort().join('-')).
+      // ── ROUTAGE CENTRAL ────────────────────────────────────────────
+      // Déléguer toute la logique OmniSMS↔Infobip au service central.
+      // routeMessage() : résolution phone→UID, Firestore, Socket.IO, Infobip.
+      // Pour les messages audio/image, on gère le Firestore manuellement
+      // (routeMessage est optimisé pour le texte) — on déroute vers le flux
+      // existant pour les types non-texte.
+      // ---------------------------------------------------------------
+
+      // Déterminer si le receiverId est un téléphone ou un UID Firestore
+      const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
+      const targetPhone    = looksLikePhone ? (phone || receiverId) : (phone || null);
+
+      let routeResult = null;
       let effectiveReceiverId = receiverId;
-      let resolvedOmniSmsUid  = null;
+      let cId = convId(uid, receiverId);
 
-      if (db) {
-        const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
-        if (looksLikePhone) {
-          // Cas : receiverId est un numéro → chercher en Firestore
-          const normalizedLookup = normalizePhone(receiverId);
-          const lookupVariants = [...new Set([
-            normalizedLookup, receiverId, receiverId.replace(/\s/g, ''),
-          ].filter(Boolean))];
-
-          let foundSnap = null;
-          for (const variant of lookupVariants) {
+      if (routeMessage && db) {
+        try {
+          // Récupérer le nom de l'expéditeur pour le SMS Infobip
+          let senderName  = req.user.name  || req.user.displayName || null;
+          let senderPhone = req.user.phone || null;
+          if (!senderName || !senderPhone) {
             try {
-              const snap = await db.collection('users')
-                .where('phone', '==', variant).where('deleted', '==', false).limit(1).get();
-              if (!snap.empty) { foundSnap = snap.docs[0]; break; }
-            } catch (_) {
-              try {
-                const snap2 = await db.collection('users')
-                  .where('phone', '==', variant).limit(1).get();
-                if (!snap2.empty) {
-                  const d = snap2.docs[0].data();
-                  if (!d.deleted) { foundSnap = snap2.docs[0]; break; }
-                }
-              } catch (_2) {}
-            }
+              const senderDoc = await db.collection('users').doc(uid).get();
+              if (senderDoc.exists) {
+                const sd = senderDoc.data();
+                senderName  = senderName  || sd.name  || sd.username || uid;
+                senderPhone = senderPhone || sd.phone || null;
+              }
+            } catch (_) {}
           }
 
-          if (foundSnap) {
-            resolvedOmniSmsUid  = foundSnap.id;
-            effectiveReceiverId = resolvedOmniSmsUid;
-            logger.info('[Messages] Phone resolved to OmniSMS UID (pre-save)', {
-              phone: receiverId, uid: resolvedOmniSmsUid,
+          routeResult = await routeMessage({
+            senderUid  : uid,
+            targetPhone: targetPhone || receiverId,
+            targetUid  : looksLikePhone ? null : receiverId,
+            content    : content || (type === 'audio' ? '🎤 Message vocal' : type === 'image' ? '📷 Image' : ''),
+            type,
+            audioUrl   : audioUrl || null,
+            duration   : duration || null,
+            senderName,
+            senderPhone,
+            db,
+          });
+
+          if (routeResult && routeResult.route !== 'ERROR') {
+            cId                 = routeResult.conversationId;
+            effectiveReceiverId = routeResult.resolvedUid || receiverId;
+          } else if (routeResult && routeResult.route === 'ERROR') {
+            logger.warn('[Messages] routeMessage returned ERROR, falling back to direct save', {
+              error: routeResult.message, receiverId,
             });
           }
+        } catch (routeErr) {
+          logger.warn('[Messages] routeMessage threw, falling back to direct save', { error: routeErr.message });
         }
       }
 
-      const cId = convId(uid, effectiveReceiverId);
+      // Si routeMessage a déjà sauvegardé le message (route OMNISMS ou INFOBIP),
+      // réutiliser l'ID Firestore qu'il a créé. Sinon créer le message ici.
+      let docId = routeResult?.messageId || null;
+      let fullMsg;
 
-      const msg = {
-        senderId    : uid,
-        receiverId  : effectiveReceiverId,
-        conversationId: cId,
-        content     : content ? content.trim() : null,
-        type,
-        channel     : 'app',
-        audioUrl    : audioUrl || null,
-        imageUrl    : imageUrl || null,
-        fileUrl     : fileUrl  || null,
-        duration    : duration || null,
-        replyTo     : replyTo  || null,
-        status      : 'sent',
-        reactions   : [],
-        transcription: null,
-        transcriptionStatus: type === 'audio' ? 'pending' : null,
-        createdAt   : now,
-        updatedAt   : now,
-      };
+      if (docId && routeResult?.route !== 'ERROR') {
+        // Message déjà sauvegardé par routeMessage — récupérer le doc pour la réponse
+        // (routeMessage stocke dans 'messages' pour OmniSMS, sinon 'messages' + Infobip)
+        fullMsg = {
+          id             : docId,
+          senderId       : uid,
+          receiverId     : effectiveReceiverId,
+          conversationId : cId,
+          content        : content ? content.trim() : null,
+          type,
+          channel        : routeResult.route === 'INFOBIP' ? 'sms' : 'app',
+          audioUrl       : audioUrl || null,
+          imageUrl       : imageUrl || null,
+          fileUrl        : fileUrl  || null,
+          duration       : duration || null,
+          replyTo        : replyTo  || null,
+          status         : 'sent',
+          reactions      : [],
+          transcription  : null,
+          transcriptionStatus: type === 'audio' ? 'pending' : null,
+          createdAt      : now,
+          updatedAt      : now,
+        };
+      } else {
+        // Fallback : routeMessage absent ou en erreur → sauvegarder directement
+        const msg = {
+          senderId       : uid,
+          receiverId     : effectiveReceiverId,
+          conversationId : cId,
+          content        : content ? content.trim() : null,
+          type,
+          channel        : 'app',
+          audioUrl       : audioUrl || null,
+          imageUrl       : imageUrl || null,
+          fileUrl        : fileUrl  || null,
+          duration       : duration || null,
+          replyTo        : replyTo  || null,
+          status         : 'sent',
+          reactions      : [],
+          transcription  : null,
+          transcriptionStatus: type === 'audio' ? 'pending' : null,
+          createdAt      : now,
+          updatedAt      : now,
+        };
 
-      let docId = `msg-${Date.now()}`;
-
-      if (db) {
-        const ref = await db.collection('messages').add(msg);
-        docId = ref.id;
-      }
-
-      const fullMsg = { id: docId, ...msg };
-
-      // Notifier le destinataire en temps réel via Socket.IO
-      // Notifier sur l'UID effectif (peut différer de receiverId si résolution phone→UID)
-      try {
-        emitToUser(effectiveReceiverId, 'message:receive', fullMsg);
-        // Si l'UID résolu est différent du receiverId original, émettre aussi sur l'original
-        // (pour compatibilité avec les clients qui écoutent sur le numéro de téléphone)
-        if (resolvedOmniSmsUid && resolvedOmniSmsUid !== receiverId) {
-          // Déjà émis ci-dessus via effectiveReceiverId = resolvedOmniSmsUid
+        docId = `msg-${Date.now()}`;
+        if (db) {
+          const ref = await db.collection('messages').add(msg);
+          docId = ref.id;
         }
-      } catch (_) {
-        // Socket.IO peut ne pas être initialisé — non bloquant
+        fullMsg = { id: docId, ...msg };
+
+        // Notifier le destinataire (fallback)
+        try { emitToUser(effectiveReceiverId, 'message:receive', fullMsg); } catch (_) {}
       }
 
       // ── Auto-transcription pour messages vocaux ───────────────
@@ -471,76 +541,22 @@ router.post(
         }
       }
 
-      // ── SMS Infobip (destinataires NON OmniSMS uniquement) ───────────
-      // NOTE: la résolution OmniSMS a déjà eu lieu avant la sauvegarde.
-      // resolvedOmniSmsUid != null  → destinataire OmniSMS → PAS de SMS.
-      // resolvedOmniSmsUid == null et receiverId ressemble à un téléphone → SMS.
-      let smsResult = null;
-      if (type === 'text' && content && infobip) {
-        try {
-          // Si le receiverId original était un UID Firestore (pas un téléphone),
-          // vérifier s'il s'agit bien d'un utilisateur OmniSMS valide.
-          const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
-          let isOmniSmsRecipient = (resolvedOmniSmsUid !== null); // déjà résolu ci-dessus
-
-          if (!looksLikePhone && !isOmniSmsRecipient && db) {
-            // receiverId est un UID Firestore — vérifier que l'utilisateur existe et n'est pas supprimé
-            try {
-              const snap = await db.collection('users').doc(effectiveReceiverId).get();
-              if (snap.exists && !snap.data().deleted) isOmniSmsRecipient = true;
-            } catch (_) {}
-          }
-
-          if (!isOmniSmsRecipient) {
-            // Destinataire non-OmniSMS → SMS via Infobip
-            const recipientPhone = phone || (looksLikePhone ? receiverId : null);
-            if (recipientPhone && infobip.isConfigured()) {
-              const normalizedRecipient = normalizePhone(recipientPhone) || recipientPhone;
-              const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
-              smsResult = await infobip.sendSMS({
-                to       : normalizedRecipient,
-                text     : content.trim(),
-                from     : smsFrom || process.env.INFOBIP_SENDER || process.env.INFOBIP_SENDER_ID || 'OmniSMS',
-                notifyUrl: deliveryUrl,
-              });
-
-              if (db && smsResult.success) {
-                await db.collection('messages').add({
-                  ...msg,
-                  id          : `sms-${smsResult.messageId || Date.now()}`,
-                  channel     : 'sms',
-                  phone       : recipientPhone,
-                  smsMessageId: smsResult.messageId,
-                  status      : 'sent',
-                  createdAt   : now,
-                  updatedAt   : now,
-                });
-              }
-              logger.info('[Messages] SMS Infobip envoyé (destinataire non-OmniSMS)', {
-                to: normalizedRecipient, messageId: smsResult.messageId, status: smsResult.status,
-              });
-            } else if (!recipientPhone) {
-              logger.warn('[Messages] SMS fallback impossible : numéro inconnu', { receiverId });
-            }
-          } else {
-            logger.info('[Messages] Destinataire OmniSMS — message in-app uniquement (pas de SMS)', {
-              originalReceiverId: receiverId, effectiveReceiverId,
-            });
-          }
-        } catch (smsErr) {
-          logger.error('[Messages] Erreur routage SMS/OmniSMS', { error: smsErr.message });
-          smsResult = { success: false, error: smsErr.message };
-        }
-      }
-
-      logger.info('[Messages] Sent', { from: uid, to: receiverId, type, id: docId });
+      logger.info('[ROUTING] POST /send complete', {
+        from   : uid,
+        to     : receiverId,
+        type,
+        id     : docId,
+        route  : routeResult?.route || 'FALLBACK',
+        convId : cId,
+      });
 
       return res.status(201).json({
         success            : true,
         message            : fullMsg,
-        providerMessageId  : smsResult?.messageId  || null,
-        smsStatus          : smsResult?.status      || null,
-        smsSent            : smsResult?.success     || false,
+        route              : routeResult?.route || 'FALLBACK',
+        providerMessageId  : routeResult?.smsResult?.messageId  || null,
+        smsStatus          : routeResult?.smsResult?.status      || null,
+        smsSent            : routeResult?.route === 'INFOBIP'    || false,
         timestamp          : now,
       });
 

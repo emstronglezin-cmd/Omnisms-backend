@@ -31,10 +31,24 @@ function getDb() {
   try { return require('../config/firebase'); } catch (_) { return null; }
 }
 
+/* ── Nettoyage fichier temporaire ─────────────────────────── */
+function cleanupTempFile(tempFile) {
+  if (!tempFile) return;
+  try {
+    if (fs.existsSync(tempFile)) {
+      fs.unlinkSync(tempFile);
+      logger.info('[TranscriptionWorker] Temp file deleted', { tempFile });
+    }
+  } catch (err) {
+    logger.warn('[TranscriptionWorker] Temp file delete failed', { tempFile, error: err.message });
+  }
+}
+
 /* ── Processor du job ─────────────────────────────────────── */
 async function transcriptionProcessor(job) {
   const {
     audioPath,
+    tempFile,                          // fichier temporaire créé depuis base64 — à supprimer après
     messageId,
     userId,
     language   = 'fr',
@@ -69,6 +83,7 @@ async function transcriptionProcessor(job) {
       transcriptionError  : error,
     }, collection);
     emitTranscriptionEvent(userId, messageId, { status: 'error', error, messageId });
+    cleanupTempFile(tempFile);
     throw new Error(error);
   }
 
@@ -89,6 +104,7 @@ async function transcriptionProcessor(job) {
     logger.error('[Transcription] FAILED — empty file', { jobId: job.id, messageId, audioFilePath });
     await updateMessageStatus(messageId, { transcriptionStatus: 'error', transcriptionError: error }, collection);
     emitTranscriptionEvent(userId, messageId, { status: 'error', error, messageId });
+    cleanupTempFile(tempFile);
     throw new Error(error);
   }
 
@@ -125,6 +141,7 @@ async function transcriptionProcessor(job) {
       transcriptionError : err.message,
     }, collection);
     emitTranscriptionEvent(userId, messageId, { status: 'error', error: err.message, messageId });
+    cleanupTempFile(tempFile);
     throw err;
   }
 
@@ -162,7 +179,10 @@ async function transcriptionProcessor(job) {
     messageId,
   });
 
-  // ── Étape 8 : Job complété ────────────────────────────────
+  // ── Étape 8 : Nettoyage fichier temporaire ───────────────
+  cleanupTempFile(tempFile);
+
+  // ── Étape 9 : Job complété ────────────────────────────────
   const totalMs = Date.now() - jobStart;
   logger.info('[Transcription] Job completed', {
     jobId   : job.id,

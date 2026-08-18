@@ -316,8 +316,40 @@ router.get('/:id', auth, async (req, res) => {
       const snap = await db.collection('audio_messages').doc(id).get();
       if (snap.exists) {
         const data = snap.data();
-        // Vérifier accès (propriétaire ou destinataire)
-        if (data.uploaderId !== uid && data.receiverId !== uid) {
+
+        // ── Vérification d'accès ────────────────────────────────
+        // audio_messages ne stocke que uploaderId (pas receiverId).
+        // L'accès est accordé si :
+        //   1. L'utilisateur est l'uploader (expéditeur), OU
+        //   2. L'utilisateur apparaît comme receiverId dans un message de la
+        //      collection 'messages' qui référence cet audioUrl.
+        let hasAccess = (data.uploaderId === uid);
+
+        if (!hasAccess && data.url) {
+          // Chercher le message qui contient cette URL audio
+          try {
+            const msgSnap = await db.collection('messages')
+              .where('audioUrl', '==', data.url)
+              .where('receiverId', '==', uid)
+              .limit(1)
+              .get();
+            if (!msgSnap.empty) hasAccess = true;
+          } catch (_) {}
+        }
+
+        if (!hasAccess && data.audioDataUri) {
+          // Essayer aussi sur audioDataUri (data URI base64)
+          try {
+            const msgSnap2 = await db.collection('messages')
+              .where('audioUrl', '==', data.audioDataUri)
+              .where('receiverId', '==', uid)
+              .limit(1)
+              .get();
+            if (!msgSnap2.empty) hasAccess = true;
+          } catch (_) {}
+        }
+
+        if (!hasAccess) {
           return res.status(403).json({ error: 'Accès refusé.', code: 'FORBIDDEN' });
         }
         return res.status(200).json({ id: snap.id, ...data });

@@ -5,22 +5,51 @@
  * Route :
  *   POST /api/webhooks/infobip/inbound
  *
- * Workflow complet :
- *   Utilisateur → SMS → Numéro Infobip → POST ici → Firestore + Socket.IO
+ * Workflow complet SMS entrant :
+ *
+ *   B (utilisateur externe)
+ *     ↓ SMS
+ *   Infobip
+ *     ↓ webhook POST ici
+ *   Backend
+ *     ↓
+ *   normalizePhone(from)
+ *     ↓
+ *   Protocole #NUMERO (si premier message) :
+ *     → texte commence par "#" → extraire le numéro cible → resolveUserByPhone
+ *   Sinon :
+ *     → findExternalConvByPhone(from) → retrouver ownerUid
+ *     ↓
+ *   Créer message en Firestore
+ *     ↓
+ *   emitToUser(ownerUid, 'message:receive', ...)
+ *     ↓
+ *   Si ownerUid offline → message persiste en Firestore, récupéré à la reconnexion
+ *
+ * IMPORTANT :
+ *   - La conversation externe est basée sur ext-{ownerUid}-{e164}
+ *   - Le conversationId utilisé dans Firestore messages doit correspondre
+ *     à ce que le frontend charge (via /api/messages/:conversationId)
+ *   - Ne jamais utiliser `sms-${from}-${to}` comme conversationId persistant
  *
  * Configurer dans Infobip portal :
  *   Channels → SMS → Configuration → Default inbound webhook URL
  *   → https://omnisms-backend.onrender.com/api/webhooks/infobip/inbound
- *
- * Infobip envoie deux types d'événements :
- *   1. SMS entrant  (MO) : { results: [{ from, to, text, messageId, receivedAt }] }
- *   2. Rapport livraison : { results: [{ messageId, status, sentAt, doneAt }] }
  */
 
 const express = require('express');
 const router  = express.Router();
 const crypto  = require('crypto');
-const { logger } = require('../middleware/logger');
+
+const { logger }              = require('../middleware/logger');
+const { normalizePhone }      = require('../services/phoneNormalizer');
+const { resolveUserByPhone }  = require('../services/userResolver');
+const {
+  findExternalConvByPhone,
+  getOrCreateExternalConv,
+  makeExternalConvId,
+  updateExternalConvLastMessage,
+} = require('../services/messageRouter');
 
 /* ── Lazy imports ────────────────────────────────────────────── */
 function getDb() {
@@ -31,29 +60,23 @@ function getDb() {
   } catch (_) { return null; }
 }
 
-function getIO() {
-  try { return require('../services/socketService').getIO(); } catch (_) { return null; }
-}
-
 function getEmitToUser() {
   try { return require('../services/socketService').emitToUser; } catch (_) { return () => {}; }
 }
 
+function getIO() {
+  try { return require('../services/socketService').getIO(); } catch (_) { return null; }
+}
+
 /* ── Validation signature Infobip (optionnelle) ─────────────── */
-/**
- * Infobip peut signer les webhooks avec HMAC-SHA256.
- * Variable env : INFOBIP_WEBHOOK_SECRET
- * Header      : Authorization ou X-Hub-Signature
- * Si absent : on accepte (pas de rejet — Infobip n'impose pas la signature)
- */
 function validateInfobipSignature(req) {
   const secret = process.env.INFOBIP_WEBHOOK_SECRET;
-  if (!secret) return true;  // pas de secret configuré → accepter
+  if (!secret) return true;
 
   const sig = req.headers['authorization'] || req.headers['x-hub-signature'] || '';
   if (!sig) {
     logger.warn('[Infobip/Inbound] Signature manquante alors que INFOBIP_WEBHOOK_SECRET est configuré.');
-    return true;  // Infobip ne signe pas toujours — on accepte en mode dégradé
+    return true; // Infobip ne signe pas toujours
   }
 
   const raw    = req.rawBody || JSON.stringify(req.body);
@@ -85,61 +108,38 @@ function getAutoReply(text) {
   return AUTO_REPLIES[keyword] || null;
 }
 
-/* ── Stocker SMS entrant en Firestore ───────────────────────── */
-async function storeInboundSms(item, db) {
-  if (!db) return null;
+/* ── Parsing du préfixe # (protocole SMS externe) ────────────── */
+/**
+ * Protocole # : le premier SMS d'un utilisateur externe peut commencer par
+ *   "#NUMERO message"
+ * pour indiquer le destinataire OmniSMS.
+ *
+ * Exemples :
+ *   "#22670000000 Salut Emmanuel"   → targetPhone=+22670000000, text="Salut Emmanuel"
+ *   "#0022670000000 Bonjour"        → targetPhone=+22670000000, text="Bonjour"
+ *   "+22670000000 coucou"           → targetPhone=+22670000000, text="coucou" (+ accepté aussi)
+ *
+ * @param {string} text
+ * @returns {{ targetPhone: string, cleanText: string } | null}
+ */
+function parseHashPrefix(text) {
+  if (!text || typeof text !== 'string') return null;
+  const trimmed = text.trim();
 
-  const now = new Date().toISOString();
-  const doc = {
-    channel    : 'sms',
-    direction  : 'inbound',
-    from       : item.from       || null,
-    to         : item.to         || null,
-    content    : item.text       || '',
-    type       : 'text',
-    messageId  : item.messageId  || null,
-    receivedAt : item.receivedAt || now,
-    // identifiants conversation basés sur les numéros
-    conversationId: `sms-${[item.from, item.to].sort().join('-')}`,
-    senderId   : item.from       || null,    // numéro expéditeur
-    receiverId : item.to         || null,    // numéro destination (notre numéro)
-    status     : 'delivered',
-    createdAt  : now,
-    updatedAt  : now,
-  };
+  // Accepter "#NUMERO" ou "+NUMERO" au début
+  const match = trimmed.match(/^[#]?\s*(\+?[\d]{6,15})\s+([\s\S]+)$/);
+  if (!match) return null;
 
-  try {
-    const ref = await db.collection('messages').add(doc);
-    logger.info('[Infobip/Inbound] Message stocké Firestore', { id: ref.id, from: item.from });
-    return { id: ref.id, ...doc };
-  } catch (err) {
-    logger.error('[Infobip/Inbound] Erreur Firestore', { error: err.message });
-    return doc;
-  }
+  const rawPhone  = match[1];
+  const cleanText = match[2].trim();
+  const e164      = normalizePhone(rawPhone);
+
+  if (!e164 || !cleanText) return null;
+
+  return { targetPhone: e164, cleanText };
 }
 
-/* ── Trouver l'utilisateur OmniSMS propriétaire du numéro ── */
-async function findUserByPhone(phone, db) {
-  if (!db || !phone) return null;
-  try {
-    const snap = await db.collection('users')
-      .where('phone', '==', phone)
-      .limit(1)
-      .get();
-    if (!snap.empty) {
-      return { uid: snap.docs[0].id, ...snap.docs[0].data() };
-    }
-    // Essayer avec le champ phoneNumber (normalisation)
-    const snap2 = await db.collection('users')
-      .where('phoneNumber', '==', phone)
-      .limit(1)
-      .get();
-    if (!snap2.empty) return { uid: snap2.docs[0].id, ...snap2.docs[0].data() };
-    return null;
-  } catch (_) { return null; }
-}
-
-/* ── Mettre à jour le rapport de livraison ─────────────────── */
+/* ── Rapport de livraison (DLR) ─────────────────────────────── */
 async function updateDeliveryStatus(item, db) {
   if (!db || !item.messageId) return;
   try {
@@ -155,7 +155,8 @@ async function updateDeliveryStatus(item, db) {
         updatedAt: new Date().toISOString(),
       });
       logger.info('[Infobip/DLR] Rapport livraison mis à jour', {
-        messageId: item.messageId, status: item.status?.name,
+        messageId: item.messageId,
+        status   : item.status?.name,
       });
     }
   } catch (err) {
@@ -163,8 +164,8 @@ async function updateDeliveryStatus(item, db) {
   }
 }
 
-/* ── Processeur principal (async, après réponse 200) ────────── */
-async function processInfobipInbound(payload, rawBody) {
+/* ── Processeur principal des SMS entrants ──────────────────── */
+async function processInfobipInbound(payload) {
   const db      = getDb();
   const emitFn  = getEmitToUser();
   const io      = getIO();
@@ -177,18 +178,15 @@ async function processInfobipInbound(payload, rawBody) {
     }
 
     for (const item of results) {
+
       /* ── Rapport de livraison (DLR) ─────────────────────── */
-      if (item.messageId && item.status && !item.text) {
+      if (item.messageId && item.status && item.text === undefined) {
         logger.info('[Infobip/DLR] Rapport livraison reçu', {
           messageId: item.messageId,
           status   : item.status?.name || item.status?.groupName,
-          to       : item.to,
-          doneAt   : item.doneAt,
         });
-
         await updateDeliveryStatus(item, db);
 
-        // Notifier via Socket.IO si un user est connecté
         if (io) {
           io.emit('sms:delivery', {
             messageId: item.messageId,
@@ -201,71 +199,200 @@ async function processInfobipInbound(payload, rawBody) {
         continue;
       }
 
-      /* ── SMS entrant (MO — Mobile Originated) ───────────── */
-      if (item.text !== undefined) {
-        logger.info('[Infobip/Inbound] SMS reçu', {
-          from      : item.from,
-          to        : item.to,
-          text      : item.text?.substring(0, 80),
-          messageId : item.messageId,
-          receivedAt: item.receivedAt,
-        });
-
-        // 1. Stocker en Firestore
-        const storedMsg = await storeInboundSms(item, db);
-
-        // 2. Trouver l'utilisateur OmniSMS à notifier
-        //    (propriétaire du numéro Infobip "to")
-        const owner = await findUserByPhone(item.to, db);
-
-        // 3. Émettre new_message via Socket.IO
-        const socketPayload = {
-          type          : 'new_message',
-          channel       : 'sms',
-          direction     : 'inbound',
-          id            : storedMsg?.id || null,
-          from          : item.from,
-          to            : item.to,
-          content       : item.text,
-          conversationId: storedMsg?.conversationId || `sms-${[item.from, item.to].sort().join('-')}`,
-          receivedAt    : item.receivedAt || new Date().toISOString(),
-          messageId     : item.messageId,
-          timestamp     : new Date().toISOString(),
-        };
-
-        // Émettre à l'utilisateur propriétaire du numéro (si trouvé)
-        if (owner?.uid) {
-          emitFn(owner.uid, 'new_message', socketPayload);
-          logger.info('[Infobip/Inbound] new_message émis', { uid: owner.uid, from: item.from });
-        }
-
-        // Émettre aussi à tous (broadcast) pour les cas sans mapping utilisateur
-        if (io) {
-          io.emit('sms:inbound', socketPayload);
-        }
-
-        // 4. Auto-reply si mot-clé
-        const replyText = getAutoReply(item.text);
-        if (replyText && item.from) {
-          let infobip = null;
-          try { infobip = require('../services/infobip'); } catch (_) {}
-
-          if (infobip && infobip.isConfigured()) {
-            try {
-              const replyRes = await infobip.sendSMS({ to: item.from, text: replyText });
-              if (replyRes.success) {
-                logger.info('[Infobip/Inbound] Auto-reply envoyé', { to: item.from, messageId: replyRes.messageId });
-              }
-            } catch (autoErr) {
-              logger.error('[Infobip/Inbound] Auto-reply error', { error: autoErr.message });
-            }
-          }
-        }
+      /* ── SMS entrant (MO — Mobile Originated) ────────────── */
+      if (item.text === undefined) {
+        logger.debug('[Infobip/Inbound] Événement inconnu', { keys: Object.keys(item) });
         continue;
       }
 
-      logger.debug('[Infobip/Inbound] Événement inconnu', { keys: Object.keys(item) });
+      const fromRaw    = item.from    || '';
+      const toRaw      = item.to      || '';
+      const textRaw    = item.text    || '';
+      const fromE164   = normalizePhone(fromRaw) || fromRaw;
+
+      logger.info('[INFOBIP_INBOUND] SMS reçu', {
+        from      : fromE164.replace(/\d{4}$/, '****'),
+        to        : toRaw,
+        textLength: textRaw.length,
+        messageId : item.messageId,
+        receivedAt: item.receivedAt,
+      });
+
+      // ── Auto-reply si mot-clé ──────────────────────────────
+      const autoReply = getAutoReply(textRaw);
+      if (autoReply) {
+        let infobip = null;
+        try { infobip = require('../services/infobip'); } catch (_) {}
+        if (infobip && infobip.isConfigured()) {
+          infobip.sendSMS({ to: fromE164, text: autoReply })
+            .then(r => r.success && logger.info('[Infobip/Inbound] Auto-reply envoyé', { to: fromE164.replace(/\d{4}$/, '****') }))
+            .catch(() => {});
+        }
+        continue; // ne pas traiter les mots-clés comme des messages
+      }
+
+      // ─────────────────────────────────────────────────────────
+      // ÉTAPE 1 : Trouver le destinataire OmniSMS (ownerUid)
+      // ─────────────────────────────────────────────────────────
+      // Cas A : Le texte commence par # → nouveau protocole d'adressage
+      // Cas B : Conversation externe existante → retrouver le propriétaire
+      // Cas C : Pas de conversation existante ET pas de # → broadcast ou ignoré
+
+      let ownerUid     = null;
+      let convId       = null;
+      let finalText    = textRaw;
+      let isNewConv    = false;
+
+      // Cas A : Protocole # (nouveau destinataire)
+      const hashParsed = parseHashPrefix(textRaw);
+      if (hashParsed) {
+        logger.info('[INFOBIP_INBOUND] Protocole # détecté', {
+          targetPhone: hashParsed.targetPhone.replace(/\d{4}$/, '****'),
+        });
+
+        const targetUser = await resolveUserByPhone(hashParsed.targetPhone);
+        if (targetUser.found) {
+          ownerUid  = targetUser.uid;
+          finalText = hashParsed.cleanText;
+          isNewConv = true;
+
+          logger.info('[USER_RESOLUTION] # protocol resolved → OmniSMS', {
+            from     : fromE164.replace(/\d{4}$/, '****'),
+            targetUid: ownerUid,
+            isOmniSms: true,
+          });
+        } else {
+          logger.warn('[INFOBIP_INBOUND] Protocole # : numéro cible non trouvé dans OmniSMS', {
+            targetPhone: hashParsed.targetPhone.replace(/\d{4}$/, '****'),
+          });
+          // Continuer sans ownerUid → essayer de retrouver via conversation existante
+        }
+      }
+
+      // Cas B : Retrouver la conversation externe existante via le numéro de l'expéditeur
+      if (!ownerUid) {
+        const existingConv = await findExternalConvByPhone(db, fromE164, toRaw);
+        if (existingConv) {
+          ownerUid = existingConv.ownerUid;
+          convId   = existingConv.conversationId;
+
+          logger.info('[INFOBIP_INBOUND] Conversation externe trouvée', {
+            from   : fromE164.replace(/\d{4}$/, '****'),
+            ownerUid,
+            convId,
+          });
+        }
+      }
+
+      // Cas C : Dernier recours — chercher le propriétaire du numéro Infobip (item.to)
+      if (!ownerUid && toRaw) {
+        const toUser = await resolveUserByPhone(toRaw);
+        if (toUser.found) {
+          ownerUid = toUser.uid;
+          isNewConv = true;
+          logger.info('[INFOBIP_INBOUND] Owner résolu via numéro Infobip', {
+            to: toRaw, ownerUid,
+          });
+        }
+      }
+
+      if (!ownerUid) {
+        logger.warn('[INFOBIP_INBOUND] Impossible de trouver le destinataire OmniSMS', {
+          from: fromE164.replace(/\d{4}$/, '****'), to: toRaw,
+          hint: 'Configurer un numéro Infobip associé à un compte OmniSMS, ou utiliser le protocole #NUMERO message',
+        });
+        // Stocker quand même pour audit, mais sans conversationId owner-based
+      }
+
+      // ─────────────────────────────────────────────────────────
+      // ÉTAPE 2 : Créer/récupérer la conversation externe
+      // ─────────────────────────────────────────────────────────
+      if (ownerUid && !convId) {
+        const extConv = await getOrCreateExternalConv(db, ownerUid, fromE164, null);
+        convId = extConv?.conversationId || makeExternalConvId(ownerUid, fromE164);
+      }
+
+      // Fallback conversationId si aucun owner
+      if (!convId) {
+        convId = `sms-inbound-${fromE164.replace(/\W/g, '')}-${Date.now()}`;
+      }
+
+      // ─────────────────────────────────────────────────────────
+      // ÉTAPE 3 : Stocker le message en Firestore
+      // ─────────────────────────────────────────────────────────
+      const now = new Date().toISOString();
+      const msgDoc = {
+        channel       : 'sms',
+        direction     : 'inbound',
+        senderId      : fromE164,        // numéro externe (expéditeur)
+        receiverId    : ownerUid || toRaw, // UID OmniSMS ou numéro Infobip
+        conversationId: convId,
+        content       : finalText,
+        type          : 'text',
+        smsMessageId  : item.messageId || null,
+        from          : fromE164,
+        to            : toRaw,
+        status        : 'delivered',
+        createdAt     : item.receivedAt || now,
+        updatedAt     : now,
+      };
+
+      let savedMsgId = null;
+      if (db) {
+        try {
+          const ref = await db.collection('messages').add(msgDoc);
+          savedMsgId = ref.id;
+          // Mettre à jour lastMessage dans la conversation externe
+          if (ownerUid) {
+            await updateExternalConvLastMessage(db, convId, finalText);
+          }
+          logger.info('[INFOBIP_INBOUND] Message stocké Firestore', {
+            id     : savedMsgId,
+            convId,
+            ownerUid,
+          });
+        } catch (dbErr) {
+          logger.error('[INFOBIP_INBOUND] Erreur stockage Firestore', { error: dbErr.message });
+        }
+      }
+
+      // ─────────────────────────────────────────────────────────
+      // ÉTAPE 4 : Notifier le propriétaire OmniSMS via Socket.IO
+      // (Si offline → le message est en Firestore, récupéré à la reconnexion)
+      // ─────────────────────────────────────────────────────────
+      const socketPayload = {
+        id            : savedMsgId || `inbound-${Date.now()}`,
+        type          : 'text',
+        channel       : 'sms',
+        direction     : 'inbound',
+        senderId      : fromE164,
+        receiverId    : ownerUid || toRaw,
+        conversationId: convId,
+        content       : finalText,
+        from          : fromE164,
+        to            : toRaw,
+        status        : 'delivered',
+        createdAt     : item.receivedAt || now,
+        timestamp     : now,
+        smsMessageId  : item.messageId || null,
+      };
+
+      if (ownerUid) {
+        emitFn(ownerUid, 'message:receive', socketPayload);
+        emitFn(ownerUid, 'new_message',     socketPayload); // rétrocompat
+        logger.info('[INFOBIP_INBOUND] message:receive émis', {
+          uid  : ownerUid,
+          from : fromE164.replace(/\d{4}$/, '****'),
+          convId,
+        });
+      }
+
+      // Broadcast général (pour debug ou clients non identifiés)
+      if (io) {
+        io.emit('sms:inbound', socketPayload);
+      }
     }
+
   } catch (err) {
     logger.error('[Infobip/Inbound] Erreur traitement', { error: err.message, stack: err.stack });
   }
@@ -275,7 +402,6 @@ async function processInfobipInbound(payload, rawBody) {
    POST /api/webhooks/infobip/inbound
    ─────────────────────────────────────────────────────────── */
 router.post('/infobip/inbound', (req, res) => {
-  // Valider la signature si configurée
   if (!validateInfobipSignature(req)) {
     logger.warn('[Infobip/Inbound] Signature invalide — requête rejetée');
     return res.status(401).json({ error: 'Signature invalide.', code: 'INVALID_SIGNATURE' });
@@ -284,9 +410,8 @@ router.post('/infobip/inbound', (req, res) => {
   // Répondre 200 IMMÉDIATEMENT pour éviter les retries Infobip
   res.status(200).json({ received: true, timestamp: new Date().toISOString() });
 
-  // Traitement asynchrone
-  const rawBody = req.rawBody || '';
-  setImmediate(() => processInfobipInbound(req.body || {}, rawBody));
+  // Traitement asynchrone (ne bloque pas la réponse 200)
+  setImmediate(() => processInfobipInbound(req.body || {}));
 });
 
 /* ─────────────────────────────────────────────────────────────
@@ -297,13 +422,11 @@ router.post('/infobip', (req, res) => {
     return res.status(401).json({ error: 'Signature invalide.', code: 'INVALID_SIGNATURE' });
   }
   res.status(200).json({ received: true, timestamp: new Date().toISOString() });
-  const rawBody = req.rawBody || '';
-  setImmediate(() => processInfobipInbound(req.body || {}, rawBody));
+  setImmediate(() => processInfobipInbound(req.body || {}));
 });
 
 /* ─────────────────────────────────────────────────────────────
    GET /api/webhooks/infobip/inbound/status
-   Vérification que le webhook est opérationnel
    ─────────────────────────────────────────────────────────── */
 router.get('/infobip/inbound/status', (_req, res) => {
   let infobip = null;
@@ -311,8 +434,13 @@ router.get('/infobip/inbound/status', (_req, res) => {
 
   return res.status(200).json({
     status     : 'active',
-    service    : 'Infobip Inbound Webhook',
+    service    : 'Infobip Inbound Webhook v2',
     webhookUrl : `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`,
+    protocol   : {
+      hashPrefix : 'Pour initier une conversation : #NUMERO_OMNISMS votre message',
+      example    : '#22670000000 Bonjour Emmanuel !',
+      reply      : 'Pour répondre, envoyer directement au numéro OmniSMS (pas besoin de #)',
+    },
     infobip    : {
       configured   : infobip?.isConfigured() || false,
       signatureMode: process.env.INFOBIP_WEBHOOK_SECRET ? 'HMAC-SHA256' : 'none',
@@ -323,7 +451,8 @@ router.get('/infobip/inbound/status', (_req, res) => {
       '1. Connectez-vous sur https://portal.infobip.com',
       '2. Channels → SMS → Configuration',
       '3. Default inbound webhook URL → https://omnisms-backend.onrender.com/api/webhooks/infobip/inbound',
-      '4. Optionnel: configurez INFOBIP_WEBHOOK_SECRET pour la validation HMAC',
+      '4. Optionnel: configurez INFOBIP_WEBHOOK_SECRET pour validation HMAC',
+      '5. Protocole # : nouveau SMS sans historique → commencer par #NUMERO_DESTINATAIRE message',
     ],
   });
 });
