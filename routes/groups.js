@@ -11,6 +11,11 @@ const router       = express.Router();
 const db           = require('../config/firebase');
 const authenticate = require('../middleware/authenticate');
 const { logger }   = require('../middleware/logger');
+const {
+  resolveUserByPhone,
+  resolveUserByUsername,
+  resolveUserByUid,
+} = require('../services/userResolver');
 
 // ── POST /groups — Créer un groupe ──────────────────────────
 router.post('/', authenticate, async (req, res) => {
@@ -59,13 +64,37 @@ router.get('/', authenticate, async (req, res) => {
   }
 });
 
+// ── GET /groups/:id — Récupérer un groupe ───────────────────
+router.get('/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const ref  = db.collection('groups').doc(id);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
+    }
+    const data = snap.data();
+    if (!(data.members || []).includes(req.user.uid) && data.ownerId !== req.user.uid) {
+      return res.status(403).json({ error: 'Accès refusé.', code: 'FORBIDDEN' });
+    }
+    return res.status(200).json({ id: snap.id, ...data });
+  } catch (err) {
+    logger.error('Erreur récupération groupe', { error: err.message });
+    return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
+  }
+});
+
 // ── POST /groups/:id/members — Ajouter des membres ──────────
+// Accepte un tableau "members" où chaque entrée peut être :
+//   - un UID Firestore (alphanumérique)
+//   - un numéro de téléphone (+226xxx)
+//   - un username (@username)
 router.post('/:id/members', authenticate, async (req, res) => {
   const { id }      = req.params;
   const { members } = req.body;
 
   if (!members || !Array.isArray(members) || members.length === 0) {
-    return res.status(400).json({ error: 'members (tableau) est requis.', code: 'MISSING_FIELDS' });
+    return res.status(400).json({ error: 'members (tableau d\'UIDs, phones ou usernames) est requis.', code: 'MISSING_FIELDS' });
   }
 
   try {
@@ -76,16 +105,102 @@ router.post('/:id/members', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'Groupe non trouvé.', code: 'NOT_FOUND' });
     }
 
-    if (snap.data().ownerId !== req.user.uid) {
-      return res.status(403).json({ error: 'Seul le propriétaire peut ajouter des membres.', code: 'FORBIDDEN' });
+    const data = snap.data();
+
+    // Admins et propriétaires peuvent ajouter des membres
+    const isOwner = data.ownerId === req.user.uid;
+    const admins  = data.admins || [];
+    const isAdmin = admins.includes(req.user.uid);
+    const isMember = (data.members || []).includes(req.user.uid);
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: 'Seul le propriétaire ou un administrateur peut ajouter des membres.', code: 'FORBIDDEN' });
     }
 
-    const current = snap.data().members || [];
-    const merged  = [...new Set([...current, ...members])];
+    // Résoudre chaque identifiant → UID réel
+    const resolved  = [];
+    const failed    = [];
+    const PHONE_RE  = /^\+?[0-9\s\-()+]{7,20}$/;
+    const USERNAME_RE = /^@?[a-zA-Z0-9_.-]{2,50}$/;
+
+    for (const identifier of members) {
+      if (!identifier || typeof identifier !== 'string') continue;
+      const s = identifier.trim();
+      let uid = null;
+
+      if (PHONE_RE.test(s) && !s.includes('-')) {
+        // Numéro de téléphone
+        const r = await resolveUserByPhone(s, { includeDeleted: false });
+        if (r.found) uid = r.uid;
+      } else if (USERNAME_RE.test(s)) {
+        const clean = s.startsWith('@') ? s.slice(1) : s;
+        // Essayer username d'abord
+        const r = await resolveUserByUsername(clean, { includeDeleted: false });
+        if (r.found) {
+          uid = r.uid;
+        } else {
+          // Peut-être un UID direct
+          const r2 = await resolveUserByUid(s, { includeDeleted: false });
+          if (r2.found) uid = r2.uid;
+        }
+      } else {
+        // UID direct
+        const r = await resolveUserByUid(s, { includeDeleted: false });
+        if (r.found) uid = r.uid;
+      }
+
+      if (uid) {
+        resolved.push(uid);
+      } else {
+        failed.push({ identifier: s, reason: 'Utilisateur OmniSMS introuvable' });
+        logger.warn('[Groups] Could not resolve member identifier', { identifier: s, groupId: id });
+      }
+    }
+
+    if (resolved.length === 0 && failed.length > 0) {
+      return res.status(400).json({
+        error : 'Aucun utilisateur OmniSMS trouvé pour les identifiants fournis.',
+        code  : 'NO_MEMBERS_RESOLVED',
+        failed,
+      });
+    }
+
+    const current = data.members || [];
+    const merged  = [...new Set([...current, ...resolved])];
 
     await ref.update({ members: merged, updatedAt: new Date().toISOString() });
+
     const updated = await ref.get();
-    return res.status(200).json({ id: updated.id, ...updated.data() });
+    const updatedData = updated.data();
+
+    // Notifier les nouveaux membres via Socket.IO
+    try {
+      const { emitToUser } = require('../services/socketService');
+      const newlyAdded = resolved.filter(uid => !current.includes(uid));
+      newlyAdded.forEach(memberUid => {
+        emitToUser(memberUid, 'group:added', {
+          groupId  : id,
+          groupName: updatedData.name || id,
+          addedBy  : req.user.uid,
+          timestamp: new Date().toISOString(),
+        });
+      });
+    } catch (_) {}
+
+    logger.info('[Groups] Members added', {
+      groupId : id,
+      addedBy : req.user.uid,
+      resolved: resolved.length,
+      failed  : failed.length,
+    });
+
+    return res.status(200).json({
+      id     : updated.id,
+      ...updatedData,
+      addedCount : resolved.length,
+      failedCount: failed.length,
+      failed,
+    });
   } catch (err) {
     logger.error('Erreur ajout membres', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });

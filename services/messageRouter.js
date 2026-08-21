@@ -298,6 +298,43 @@ async function routeMessage(opts = {}) {
       } catch (dbErr) {
         logger.warn('[ROUTING] Firestore save failed (OmniSMS)', { error: dbErr.message });
       }
+
+      // ── Si message audio : stocker receiverId sur audio_messages ──────
+      // audio_messages ne connaît pas le destinataire (uploaderId seulement).
+      // On le stocke maintenant pour permettre la vérification d'accès sur
+      // GET /api/audio/:id sans requête secondaire coûteuse sur messages.
+      if (type === 'audio' && audioUrl && savedId !== msgId) {
+        try {
+          // Extraire l'ID audio depuis l'URL ou la data URI
+          // Le docId audio est stocké par audio.v2.js et référencé dans audioUrl
+          // Format: /uploads/audio/{filename} ou data:audio/...;base64,...
+          // On met à jour via une requête sur audioUrl
+          const audioSnap = await db.collection('audio_messages')
+            .where('url', '==', audioUrl)
+            .limit(1)
+            .get();
+          if (!audioSnap.empty) {
+            await audioSnap.docs[0].ref.update({
+              receiverId: resolvedUid,
+              updatedAt : new Date().toISOString(),
+            }).catch(() => {});
+          } else if (audioUrl.startsWith('data:')) {
+            // base64 URI — chercher aussi par audioDataUri
+            const audioSnap2 = await db.collection('audio_messages')
+              .where('audioDataUri', '==', audioUrl)
+              .limit(1)
+              .get();
+            if (!audioSnap2.empty) {
+              await audioSnap2.docs[0].ref.update({
+                receiverId: resolvedUid,
+                updatedAt : new Date().toISOString(),
+              }).catch(() => {});
+            }
+          }
+        } catch (audioUpdateErr) {
+          logger.warn('[ROUTING] Could not update receiverId on audio_messages', { error: audioUpdateErr.message });
+        }
+      }
     }
 
     // Socket.IO — délivraison temps réel

@@ -14,7 +14,7 @@
  * Workflow sync (style WhatsApp) :
  *   1. Client envoie [{name, phone}, ...]
  *   2. Backend normalise tous les numéros
- *   3. Compare avec la collection Firestore users_sms
+ *   3. Compare avec la collection Firestore users
  *   4. Retourne les contacts qui ont un compte OmniSMS
  */
 
@@ -25,6 +25,7 @@ const authenticate  = require('../middleware/authenticate');
 const firebaseAuth  = require('../middleware/firebaseAuth');
 const { normalizePhone, normalizePhoneBatch, isValidPhone } = require('../services/phoneNormalizer');
 const { logger }    = require('../middleware/logger');
+const { resolveUserByPhone, phoneVariants } = require('../services/userResolver');
 
 /* ── Auth middleware — accepte Firebase ou JWT ────────────── */
 // Utilise firebaseAuth si Firebase configuré, sinon JWT
@@ -248,19 +249,17 @@ router.post(
       const contact = { name, phone: contactNorm, isOnOmniSms: false, addedAt: new Date().toISOString() };
 
       if (!exists) {
-        // Vérifier si ce numéro est sur OmniSMS (exclure comptes supprimés)
+        // Vérifier si ce numéro est sur OmniSMS via résolution multi-variantes
         try {
-          const omniSnap = await db.collection('users').where('phone', '==', contactNorm).limit(1).get();
-          if (!omniSnap.empty) {
-            const omniUser = omniSnap.docs[0];
-            const omniData = omniUser.data();
-            // Ne marquer OmniSMS que si le compte n'est pas supprimé
-            if (!omniData.deleted) {
-              contact.isOnOmniSms      = true;
-              contact.userId           = omniUser.id;
-              contact.registeredUserId = omniUser.id;
-              contact.avatar           = omniData.avatar || null;
-            }
+          const resolved = await resolveUserByPhone(phone, { includeDeleted: false });
+          if (resolved.found) {
+            contact.isOnOmniSms      = true;
+            contact.userId           = resolved.uid;
+            contact.registeredUserId = resolved.uid;
+            contact.avatar           = resolved.avatar || null;
+            contact.name             = contact.name || resolved.name || '';
+            // Normaliser le téléphone vers E.164 canonical
+            contact.phone            = resolved.phone || contactNorm;
           }
         } catch (_) {}
 
@@ -269,6 +268,24 @@ router.post(
           { contacts_manual: contacts, contacts_updated_at: new Date().toISOString() },
           { merge: true }
         );
+      } else {
+        // Contact already exists — refresh OmniSMS status in case it changed
+        const idx = contacts.findIndex(c => c.phone === contactNorm);
+        if (idx >= 0) {
+          try {
+            const resolved = await resolveUserByPhone(phone, { includeDeleted: false });
+            if (resolved.found && !contacts[idx].isOnOmniSms) {
+              contacts[idx].isOnOmniSms      = true;
+              contacts[idx].userId           = resolved.uid;
+              contacts[idx].registeredUserId = resolved.uid;
+              contacts[idx].avatar           = resolved.avatar || null;
+              await db.collection('users').doc(uid).set(
+                { contacts_manual: contacts, contacts_updated_at: new Date().toISOString() },
+                { merge: true }
+              );
+            }
+          } catch (_) {}
+        }
       }
 
       return res.status(exists ? 200 : 201).json({
@@ -382,20 +399,18 @@ router.get(
     }
 
     try {
-      const db = getDb();
-      if (!db) return res.status(200).json({ phone, registered: false, reason: 'db_unavailable' });
-
-      // Chercher dans la collection `users` par numéro de téléphone
-      const snap = await db.collection('users').where('phone', '==', phone).limit(1).get();
-      const found = !snap.empty && snap.docs[0].data().phoneVerified !== false;
+      // Utiliser resolveUserByPhone pour une recherche multi-variantes fiable
+      const resolved = await resolveUserByPhone(req.params.phone, { includeDeleted: false });
 
       return res.status(200).json({
-        phone,
-        registered: found,
-        user      : found ? {
-          userId: snap.docs[0].id,
-          name  : snap.docs[0].data().name   || null,
-          avatar: snap.docs[0].data().avatar || null,
+        phone     : resolved.found ? resolved.phone : phone,
+        registered: resolved.found,
+        isOnOmniSms: resolved.found,
+        user      : resolved.found ? {
+          userId: resolved.uid,
+          name  : resolved.name   || null,
+          avatar: resolved.avatar || null,
+          phone : resolved.phone  || null,
         } : null,
       });
 

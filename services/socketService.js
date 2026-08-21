@@ -22,6 +22,7 @@ const jwt         = require('jsonwebtoken');
 const { logger }  = require('../middleware/logger');
 const redis       = require('./redis');
 const { normalizePhone } = require('./phoneNormalizer');
+const { resolveUserByPhone } = require('./userResolver');
 
 const ONLINE_TTL = 5 * 60; // 5 minutes (renouvelé par heartbeat)
 
@@ -206,32 +207,26 @@ function initSocketIO(httpServer) {
 
         const now = new Date().toISOString();
 
-        // ── Résolution OmniSMS : si receiverId ressemble à un téléphone,
-        //    chercher l'UID OmniSMS correspondant avant de créer le message.
-        //    Cela garantit un conversationId basé sur UIDs, jamais sur numéros.
+        // ── Résolution OmniSMS via userResolver (multi-variantes, source de vérité)
+        //    Garantit un conversationId basé sur UIDs réels, jamais sur numéros.
         let effectiveReceiverId = receiverId;
         const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
         if (looksLikePhone) {
           try {
-            const db = require('../config/firebase');
-            if (db && !db._stub) {
-              const e164 = normalizePhone(receiverId) || receiverId;
-              const variants = [...new Set([e164, receiverId, receiverId.replace(/\s/g, '')].filter(Boolean))];
-              for (const variant of variants) {
-                try {
-                  const snap = await db.collection('users').where('phone', '==', variant).where('deleted', '==', false).limit(1).get();
-                  if (!snap.empty) { effectiveReceiverId = snap.docs[0].id; break; }
-                } catch (_) {
-                  const snap = await db.collection('users').where('phone', '==', variant).limit(1).get().catch(() => null);
-                  if (snap && !snap.empty && !snap.docs[0].data().deleted) { effectiveReceiverId = snap.docs[0].id; break; }
-                }
-              }
+            const resolved = await resolveUserByPhone(receiverId, { includeDeleted: false });
+            if (resolved.found) {
+              effectiveReceiverId = resolved.uid;
+              logger.info('[Socket] Phone resolved → OmniSMS UID', {
+                phone: receiverId.replace(/\d{4}$/, '****'),
+                resolvedUid: resolved.uid,
+              });
             }
           } catch (_) {}
         }
 
         const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        const cId = conversationId || [uid, effectiveReceiverId].sort().join('-');
+        // Toujours construire le conversationId depuis les UIDs réels (déterministe)
+        const cId = [uid, effectiveReceiverId].sort().join('-');
 
         const msg = {
           id            : messageId,
@@ -254,12 +249,8 @@ function initSocketIO(httpServer) {
           logger.error('[Socket] Message persist failed', { error: err.message })
         );
 
-        // Envoyer au destinataire résolu (UID OmniSMS ou numéro tel quel)
+        // Envoyer au destinataire via son UID OmniSMS résolu (room user:{uid})
         _io.to(`user:${effectiveReceiverId}`).emit('message:receive', msg);
-        // Si UID résolu ≠ receiverId original, émettre aussi sur l'original pour compatibilité
-        if (effectiveReceiverId !== receiverId) {
-          _io.to(`user:${receiverId}`).emit('message:receive', msg);
-        }
 
         // Confirmer à l'expéditeur
         if (typeof ack === 'function') {

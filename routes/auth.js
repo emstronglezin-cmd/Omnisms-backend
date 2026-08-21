@@ -168,6 +168,31 @@ router.post(
 
       logger.info('Utilisateur créé', { uid: userId, phone: e164Phone, username: normalizedUsername });
 
+      // ── Notifier les utilisateurs existants qui ont ce numéro en contact ──
+      // Opération ASYNCHRONE non-bloquante : ne ralentit pas la réponse.
+      // Cherche tous les utilisateurs dont contacts_manual ou contacts_synced
+      // contient ce numéro, et met à jour le flag isOnOmniSms sans bloquer.
+      setImmediate(async () => {
+        try {
+          const { broadcast } = require('../services/socketService');
+          // Diffuser à TOUS les sockets connectés qu'un nouveau utilisateur OmniSMS
+          // vient de s'inscrire avec ce numéro.
+          // Les clients frontend écoutent 'contact:omnisms' et mettent à jour
+          // le statut isOnOmniSms pour ce numéro dans leurs contacts.
+          broadcast('contact:omnisms', {
+            phone   : e164Phone,
+            uid     : userId,
+            name    : userData.name,
+            username: normalizedUsername,
+          });
+          logger.info('[AUTH] New OmniSMS user registered — contact:omnisms broadcast', {
+            uid: userId, phone: e164Phone.replace(/\d{4}$/, '****'),
+          });
+        } catch (broadcastErr) {
+          logger.warn('[AUTH] setImmediate broadcast error', { error: broadcastErr.message });
+        }
+      });
+
       // Générer le JWT immédiatement — pas d'OTP
       const token = signToken({
         uid  : userId,
@@ -523,7 +548,25 @@ router.put(
 
       if (name)    updates.name    = name.trim();
       if (country) updates.country = country.trim();
-      if (phone)   updates.phone   = phone.trim();
+
+      if (phone) {
+        // Normaliser le téléphone en E.164 — CRITIQUE pour la résolution cohérente
+        const e164Updated = normalizePhone(phone.trim()) || phone.trim();
+        // Vérifier unicité du nouveau numéro (exclure l'utilisateur courant)
+        const phoneSnap = await db.collection('users')
+          .where('phone', '==', e164Updated)
+          .limit(2)
+          .get();
+        const conflict = phoneSnap.docs.find(d => d.id !== req.user.uid && !d.data().deleted);
+        if (conflict) {
+          return res.status(409).json({
+            error: 'Ce numéro est déjà associé à un autre compte.',
+            code : 'PHONE_ALREADY_EXISTS',
+          });
+        }
+        updates.phone    = e164Updated;
+        updates.phoneRaw = phone.trim() !== e164Updated ? phone.trim() : null;
+      }
 
       if (password) {
         updates.password = await bcrypt.hash(password, SALT_ROUNDS);
@@ -531,7 +574,7 @@ router.put(
 
       await db.collection('users').doc(req.user.uid).update(updates);
 
-      logger.info('Profil mis à jour', { uid: req.user.uid });
+      logger.info('Profil mis à jour', { uid: req.user.uid, fields: Object.keys(updates).filter(k => k !== 'password') });
       return res.status(200).json({ message: 'Profil mis à jour avec succès.' });
     } catch (err) {
       logger.error('Erreur PUT /profile', { error: err.message });

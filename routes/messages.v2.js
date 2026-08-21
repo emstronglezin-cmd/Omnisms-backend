@@ -384,8 +384,9 @@ router.post(
       // ---------------------------------------------------------------
 
       // Déterminer si le receiverId est un téléphone ou un UID Firestore
+      // UID Firestore : chaîne alphanumérique sans '+' ni espaces, peut contenir des '-'
+      // Téléphone     : que des chiffres, +, espaces, tirets, parenthèses — sans '-' à l'intérieur d'un UID
       const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
-      const targetPhone    = looksLikePhone ? (phone || receiverId) : (phone || null);
 
       let routeResult = null;
       let effectiveReceiverId = receiverId;
@@ -409,7 +410,9 @@ router.post(
 
           routeResult = await routeMessage({
             senderUid  : uid,
-            targetPhone: targetPhone || receiverId,
+            // Si receiverId est un UID (pas un téléphone) : passer comme targetUid
+            // Si receiverId est un téléphone : passer comme targetPhone
+            targetPhone: looksLikePhone ? (phone || receiverId) : (phone || null),
             targetUid  : looksLikePhone ? null : receiverId,
             content    : content || (type === 'audio' ? '🎤 Message vocal' : type === 'image' ? '📷 Image' : ''),
             type,
