@@ -164,15 +164,64 @@ router.get('/', auth, async (req, res) => {
     }
 
     // Enrichir les conversations avec le nom de l'autre utilisateur
+    // ── P1 FIX ────────────────────────────────────────────────────────────────
+    // Règle de priorité STRICTE :
+    //   1. contact.displayName (nom local choisi par l'utilisateur) — JAMAIS écrasé
+    //   2. users.name (profil de l'autre) — utilisé uniquement si pas de displayName local
+    //   3. otherUserId (fallback final)
+    // ─────────────────────────────────────────────────────────────────────────
     if (db) {
       // Séparer les UIDs Firestore des numéros de téléphone
       const otherUids   = [...new Set([...convMap.values()].map(c => c.otherUserId).filter(Boolean))];
       const phoneOthers = otherUids.filter(u => /^\+?[0-9\s\-()+]{7,20}$/.test(u) && !u.includes('-'));
       const uidOthers   = otherUids.filter(u => !phoneOthers.includes(u));
 
-      const userCache = new Map();
+      // userCache : { name (profile), avatar, phone } — NE CONTIENT PAS le displayName local
+      const userCache    = new Map();
+      // contactCache : { displayName (local), avatar } — priorité ABSOLUE sur profile name
+      const contactCache = new Map();   // keyed by UID or phone
 
-      // 1. Lookup des vrais UIDs Firestore
+      // Charger les contacts locaux de l'utilisateur (manual > synced) pour les displayNames
+      try {
+        const mySnap = await db.collection('users').doc(uid).get();
+        if (mySnap.exists) {
+          const myData = mySnap.data();
+          // contacts_manual ont la priorité absolue (l'utilisateur les a nommés lui-même)
+          const manualContacts = myData.contacts_manual || [];
+          const syncedContacts = myData.contacts_synced || [];
+
+          // Indexer par UID (contactUid / userId) ET par phone pour couvrir les deux cas
+          for (const c of manualContacts) {
+            const cUid = c.contactUid || c.userId || c.registeredUserId || null;
+            const cPh  = c.phone || c.contactPhone || null;
+            const entry = { displayName: c.displayName || c.name || null, avatar: c.avatar || null };
+            if (cUid)  contactCache.set(cUid, entry);
+            if (cPh)   contactCache.set(cPh,  entry);
+            if (cPh)   contactCache.set(cPh.replace(/\s/g, ''), entry);
+          }
+          // contacts_synced : seulement si pas déjà dans manual (manual a la priorité)
+          for (const c of syncedContacts) {
+            const cUid = c.contactUid || c.userId || c.registeredUserId || null;
+            const cPh  = c.phone || c.contactPhone || null;
+            const entry = { displayName: c.displayName || c.name || null, avatar: c.avatar || null };
+            if (cUid && !contactCache.has(cUid)) contactCache.set(cUid, entry);
+            if (cPh  && !contactCache.has(cPh))  contactCache.set(cPh, entry);
+            if (cPh  && !contactCache.has(cPh.replace(/\s/g,''))) contactCache.set(cPh.replace(/\s/g,''), entry);
+          }
+
+          // Pour les numéros de téléphone dans les conversations, chercher aussi dans les contacts
+          phoneOthers.forEach(phone => {
+            const match = [...manualContacts, ...syncedContacts]
+              .find(c => c.phone === phone || (c.phone || '').replace(/\s/g,'') === phone.replace(/\s/g,''));
+            if (match) {
+              const entry = { displayName: match.displayName || match.name || null, avatar: match.avatar || null };
+              if (!contactCache.has(phone)) contactCache.set(phone, entry);
+            }
+          });
+        }
+      } catch (_) {}
+
+      // 1. Lookup des vrais UIDs Firestore → profileName + avatar
       for (let i = 0; i < uidOthers.length; i += 10) {
         const batch = uidOthers.slice(i, i + 10);
         try {
@@ -186,38 +235,20 @@ router.get('/', auth, async (req, res) => {
         } catch (_) {}
       }
 
-      // 2. Pour les numéros de téléphone : chercher le nom dans les contacts de l'utilisateur
-      if (phoneOthers.length > 0) {
-        try {
-          const mySnap = await db.collection('users').doc(uid).get();
-          if (mySnap.exists) {
-            const myData = mySnap.data();
-            const allContacts = [
-              ...(myData.contacts_manual || []),
-              ...(myData.contacts_synced || []),
-            ];
-            phoneOthers.forEach(phone => {
-              const match = allContacts.find(c => c.phone === phone || c.phone === phone.replace(/\s/g,''));
-              if (match && match.name) {
-                userCache.set(phone, { name: match.name, avatar: match.avatar || null, phone });
-              }
-            });
-          }
-        } catch (_) {}
-      }
-
       convMap.forEach((conv) => {
-        const info = userCache.get(conv.otherUserId);
-        if (info) {
-          conv.otherUserName  = info.name  || conv.otherUserName  || conv.otherUserId;
-          conv.otherUserAvatar= info.avatar|| conv.otherUserAvatar|| null;
-          conv.otherUserPhone = info.phone || conv.otherUserPhone || null;
-          conv.contactName    = info.name  || conv.contactName    || conv.otherUserId;
-        } else {
-          // Fallback : utiliser otherUserId comme displayName
-          if (!conv.otherUserName) conv.otherUserName = conv.otherUserId;
-          if (!conv.contactName)   conv.contactName   = conv.otherUserId;
-        }
+        const contactEntry  = contactCache.get(conv.otherUserId);  // displayName local (priorité absolue)
+        const profileEntry  = userCache.get(conv.otherUserId);     // profile name (fallback)
+
+        // Règle P1 : displayName local > profile name > otherUserId
+        const localDisplayName  = contactEntry?.displayName || null;
+        const profileName       = profileEntry?.name || null;
+        const resolvedName      = localDisplayName || profileName || conv.otherUserName || conv.otherUserId;
+
+        conv.otherUserName  = resolvedName;
+        conv.contactName    = resolvedName;
+        // Avatar : préférer celui du contact local, sinon celui du profil
+        conv.otherUserAvatar= contactEntry?.avatar || profileEntry?.avatar || conv.otherUserAvatar || null;
+        conv.otherUserPhone = profileEntry?.phone || conv.otherUserPhone || null;
       });
     }
 
@@ -556,6 +587,7 @@ router.post(
       return res.status(201).json({
         success            : true,
         message            : fullMsg,
+        conversationId     : cId,           // P0 FIX: Exposer le conversationId canonique au niveau racine
         route              : routeResult?.route || 'FALLBACK',
         providerMessageId  : routeResult?.smsResult?.messageId  || null,
         smsStatus          : routeResult?.smsResult?.status      || null,

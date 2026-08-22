@@ -90,11 +90,17 @@ router.get('/:id', authenticate, async (req, res) => {
 //   - un numéro de téléphone (+226xxx)
 //   - un username (@username)
 router.post('/:id/members', authenticate, async (req, res) => {
-  const { id }      = req.params;
-  const { members } = req.body;
+  const { id } = req.params;
+  // P4 FIX: Accepter soit un tableau `members` (ancien format)
+  // soit un identifiant unique `identifier` (nouveau format envoyé par le modal d'édition)
+  let rawMembers = req.body.members;
+  if (!rawMembers && req.body.identifier) {
+    rawMembers = [req.body.identifier];
+  }
+  const members = rawMembers;
 
   if (!members || !Array.isArray(members) || members.length === 0) {
-    return res.status(400).json({ error: 'members (tableau d\'UIDs, phones ou usernames) est requis.', code: 'MISSING_FIELDS' });
+    return res.status(400).json({ error: 'members (tableau d\'UIDs, phones ou usernames) ou identifier requis.', code: 'MISSING_FIELDS' });
   }
 
   try {
