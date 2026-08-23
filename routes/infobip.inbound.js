@@ -306,9 +306,12 @@ async function processInfobipInbound(payload) {
 
       // ─────────────────────────────────────────────────────────
       // ÉTAPE 2 : Créer/récupérer la conversation externe
+      // Passer infobipNumber (item.to) pour identifier le canal Infobip utilisé
+      // et permettre le routage multi-utilisateurs (si plusieurs OmniSMS partagent Infobip)
       // ─────────────────────────────────────────────────────────
       if (ownerUid && !convId) {
-        const extConv = await getOrCreateExternalConv(db, ownerUid, fromE164, null);
+        const infobipNum = toRaw ? (normalizePhone(toRaw) || toRaw) : null;
+        const extConv = await getOrCreateExternalConv(db, ownerUid, fromE164, null, infobipNum);
         convId = extConv?.conversationId || makeExternalConvId(ownerUid, fromE164);
       }
 
@@ -342,9 +345,9 @@ async function processInfobipInbound(payload) {
         try {
           const ref = await db.collection('messages').add(msgDoc);
           savedMsgId = ref.id;
-          // Mettre à jour lastMessage dans la conversation externe
+          // Mettre à jour lastMessage dans la conversation externe (avec providerMessageId)
           if (ownerUid) {
-            await updateExternalConvLastMessage(db, convId, finalText);
+            await updateExternalConvLastMessage(db, convId, finalText, item.messageId || null);
           }
           logger.info('[INFOBIP_INBOUND] Message stocké Firestore', {
             id     : savedMsgId,

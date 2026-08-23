@@ -191,6 +191,89 @@ router.post(
         } catch (broadcastErr) {
           logger.warn('[AUTH] setImmediate broadcast error', { error: broadcastErr.message });
         }
+
+        // ── TRANSITION SMS → OMNISMS ──────────────────────────────────────────
+        // Si ce numéro avait des conversations SMS externes (avant inscription),
+        // les rattacher au nouveau UID OmniSMS :
+        //   1. Trouver toutes les external_conversations où externalPhone === e164Phone
+        //      (ce numéro était l'expéditeur SMS externe d'un autre utilisateur OmniSMS)
+        //   2. Créer des conversations OmniSMS réelles (IDs déterministes) pour les remplacer
+        //   3. Notifier les propriétaires concernés
+        //
+        // IMPORTANT : on NE supprime PAS les external_conversations — elles restent
+        // pour l'historique et pour le cas où le numéro correspondrait à plusieurs owners.
+        // On ajoute simplement `linkedOmniSmsUid` pour indiquer la transition.
+        try {
+          const extSnap = await db.collection('external_conversations')
+            .where('externalPhone', '==', e164Phone)
+            .limit(50)
+            .get();
+
+          if (!extSnap.empty) {
+            logger.info('[AUTH] SMS→OmniSMS transition: conversations externes trouvées', {
+              count   : extSnap.size,
+              phone   : e164Phone.replace(/\d{4}$/, '****'),
+              newUid  : userId,
+            });
+
+            const { emitToUser } = require('../services/socketService');
+            const batch          = db.batch();
+            const now            = new Date().toISOString();
+
+            for (const doc of extSnap.docs) {
+              const conv     = doc.data();
+              const ownerUid = conv.ownerUid;
+              if (!ownerUid || ownerUid === userId) continue;
+
+              // Marquer la conversation externe comme liée au nouveau UID
+              batch.update(doc.ref, {
+                linkedOmniSmsUid : userId,
+                linkedOmniSmsName: userData.name,
+                linkedAt         : now,
+                updatedAt        : now,
+              });
+
+              // Créer/confirmer la conversation OmniSMS entre les deux utilisateurs
+              // Le conversationId déterministe est le même que celui qu'utiliserait routeMessage()
+              const omniConvId = [ownerUid, userId].sort().join('-');
+
+              // Notifier le propriétaire OmniSMS que son contact SMS vient de s'inscrire
+              emitToUser(ownerUid, 'contact:omnisms', {
+                phone           : e164Phone,
+                uid             : userId,
+                name            : userData.name,
+                username        : normalizedUsername,
+                previousConvId  : doc.id,      // ancien ID externe
+                newConvId       : omniConvId,  // nouvel ID OmniSMS
+                transition      : true,
+              });
+
+              logger.info('[AUTH] SMS→OmniSMS: owner notifié', {
+                ownerUid,
+                newUid    : userId,
+                oldConvId : doc.id,
+                newConvId : omniConvId,
+              });
+            }
+
+            await batch.commit().catch(batchErr =>
+              logger.warn('[AUTH] SMS→OmniSMS batch.commit error', { error: batchErr.message })
+            );
+
+            logger.info('[AUTH] SMS→OmniSMS transition terminée', {
+              uid  : userId,
+              phone: e164Phone.replace(/\d{4}$/, '****'),
+              count: extSnap.size,
+            });
+          }
+        } catch (transitionErr) {
+          // Non-bloquant : ne jamais faire échouer l'inscription à cause de la transition
+          logger.warn('[AUTH] SMS→OmniSMS transition error (non-bloquant)', {
+            error: transitionErr.message,
+            uid  : userId,
+            phone: e164Phone.replace(/\d{4}$/, '****'),
+          });
+        }
       });
 
       // Générer le JWT immédiatement — pas d'OTP

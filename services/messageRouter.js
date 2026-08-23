@@ -64,16 +64,23 @@ function makeExternalConvId(ownerUid, externalPhone) {
  *   ownerUid       : "OMNISMS_UID",
  *   externalPhone  : "+22670000000",
  *   externalName   : "Jean Dupont" | null,
+ *   infobipNumber  : "+22600000000" | null,  // Numéro Infobip utilisé (item.to)
  *   channel        : "sms",
  *   createdAt,
  *   updatedAt,
  *   lastMessageAt,
  *   lastMessage    : "...",
+ *   providerMessageIds: [],                  // IDs messages Infobip (pour DLR)
  * }
  *
+ * @param {object} db
+ * @param {string} ownerUid        - UID OmniSMS du propriétaire
+ * @param {string} externalPhone   - Numéro externe (E.164)
+ * @param {string|null} externalName   - Nom local du contact
+ * @param {string|null} infobipNumber  - Numéro Infobip utilisé (item.to depuis webhook)
  * @returns {object} La conversation (avec son conversationId)
  */
-async function getOrCreateExternalConv(db, ownerUid, externalPhone, externalName = null) {
+async function getOrCreateExternalConv(db, ownerUid, externalPhone, externalName = null, infobipNumber = null) {
   if (!db || !ownerUid || !externalPhone) return null;
 
   const e164   = normalizePhone(externalPhone) || externalPhone;
@@ -84,26 +91,32 @@ async function getOrCreateExternalConv(db, ownerUid, externalPhone, externalName
     const snap = await ref.get();
 
     if (snap.exists) {
-      // Mettre à jour le nom si fourni et différent
+      // Mettre à jour les champs si fournis et différents
       const existing = snap.data();
-      if (externalName && externalName !== existing.externalName) {
-        await ref.update({ externalName, updatedAt: new Date().toISOString() }).catch(() => {});
+      const updates  = {};
+      if (externalName  && externalName  !== existing.externalName)  updates.externalName  = externalName;
+      if (infobipNumber && infobipNumber !== existing.infobipNumber) updates.infobipNumber = infobipNumber;
+      if (Object.keys(updates).length > 0) {
+        updates.updatedAt = new Date().toISOString();
+        await ref.update(updates).catch(() => {});
       }
-      return { conversationId: convId, ...existing };
+      return { conversationId: convId, ...existing, ...updates };
     }
 
     // Créer la conversation externe
     const now  = new Date().toISOString();
     const conv = {
-      conversationId: convId,
+      conversationId    : convId,
       ownerUid,
-      externalPhone : e164,
-      externalName  : externalName || null,
-      channel       : 'sms',
-      createdAt     : now,
-      updatedAt     : now,
-      lastMessageAt : now,
-      lastMessage   : null,
+      externalPhone     : e164,
+      externalName      : externalName  || null,
+      infobipNumber     : infobipNumber || null,
+      channel           : 'sms',
+      createdAt         : now,
+      updatedAt         : now,
+      lastMessageAt     : now,
+      lastMessage       : null,
+      providerMessageIds: [],
     };
 
     await ref.set(conv);
@@ -111,6 +124,7 @@ async function getOrCreateExternalConv(db, ownerUid, externalPhone, externalName
       convId,
       ownerUid,
       externalPhone: e164.replace(/\d{4}$/, '****'),
+      infobipNumber: infobipNumber || null,
     });
     return conv;
 
@@ -121,7 +135,8 @@ async function getOrCreateExternalConv(db, ownerUid, externalPhone, externalName
       conversationId: convId,
       ownerUid,
       externalPhone : e164,
-      externalName  : externalName || null,
+      externalName  : externalName  || null,
+      infobipNumber : infobipNumber || null,
       channel       : 'sms',
     };
   }
@@ -177,15 +192,25 @@ async function findExternalConvByPhone(db, externalPhone, infobipNumber = null) 
 
 /**
  * Met à jour lastMessage dans une conversation externe.
+ * @param {object}      db
+ * @param {string}      conversationId
+ * @param {string}      content
+ * @param {string|null} [providerMessageId]  - ID du message Infobip (pour DLR)
  */
-async function updateExternalConvLastMessage(db, conversationId, content) {
+async function updateExternalConvLastMessage(db, conversationId, content, providerMessageId = null) {
   if (!db || !conversationId) return;
   try {
-    await db.collection('external_conversations').doc(conversationId).update({
+    const update = {
       lastMessage   : content || '',
       lastMessageAt : new Date().toISOString(),
       updatedAt     : new Date().toISOString(),
-    });
+    };
+    // Stocker l'ID Infobip dans la liste providerMessageIds
+    if (providerMessageId) {
+      const { FieldValue } = require('firebase-admin/firestore');
+      update.providerMessageIds = FieldValue.arrayUnion(providerMessageId);
+    }
+    await db.collection('external_conversations').doc(conversationId).update(update);
   } catch (_) {}
 }
 
@@ -428,7 +453,7 @@ async function routeMessage(opts = {}) {
         notifyUrl: deliveryUrl,
       });
 
-      // Mettre à jour le statut du message
+      // Mettre à jour le statut du message + providerMessageId dans external conv
       if (db && savedId && savedId !== msgId) {
         await db.collection('messages').doc(savedId).update({
           status        : smsResult.success ? 'sent' : 'failed',
@@ -436,6 +461,9 @@ async function routeMessage(opts = {}) {
           smsStatus     : smsResult.status    || null,
           updatedAt     : new Date().toISOString(),
         }).catch(() => {});
+        if (smsResult.success && smsResult.messageId) {
+          await updateExternalConvLastMessage(db, convId, content, smsResult.messageId).catch(() => {});
+        }
       }
 
       logger.info('[ROUTING] Message routed → INFOBIP', {

@@ -416,12 +416,63 @@ async function handleSuccessfulPayment({ checkoutId, transactionId, userId, orde
       });
     }
 
-    if (!userId) {
-      logger.warn('[LeekPay] userId absent dans metadata — activation impossible', {
-        checkoutId, hint: 'Vérifier metadata.userId dans createCheckout()',
+    // ── P7 FIX : userId null — fallback Firestore ────────────────────────────
+    // Si LeekPay ne retourne pas metadata.userId dans le webhook (metadata non réinjectée),
+    // on retrouve le userId via leekpay_payments/{checkoutId} ou leekpay_payments/{orderId}
+    // qui ont été sauvés lors de createPayment().
+    let resolvedUserId = userId;
+    if (!resolvedUserId && checkoutId) {
+      try {
+        const db = require('../config/firebase');
+        // Chercher par checkoutId
+        const ckSnap = await db.collection('leekpay_payments').doc(checkoutId).get();
+        if (ckSnap.exists && ckSnap.data()?.userId) {
+          resolvedUserId = ckSnap.data().userId;
+          logger.info('[LeekPay] userId récupéré via Firestore checkoutId', {
+            checkoutId, resolvedUserId,
+          });
+        }
+        // Si toujours pas trouvé, chercher par orderId
+        if (!resolvedUserId && orderId) {
+          const orSnap = await db.collection('leekpay_payments').doc(orderId).get();
+          if (orSnap.exists && orSnap.data()?.userId) {
+            resolvedUserId = orSnap.data().userId;
+            logger.info('[LeekPay] userId récupéré via Firestore orderId', {
+              orderId, resolvedUserId,
+            });
+          }
+        }
+        // Dernier recours : query par checkoutId (si doc est stocké sous un autre format)
+        if (!resolvedUserId) {
+          const querySnap = await db.collection('leekpay_payments')
+            .where('checkoutId', '==', checkoutId)
+            .limit(1)
+            .get();
+          if (!querySnap.empty && querySnap.docs[0].data()?.userId) {
+            resolvedUserId = querySnap.docs[0].data().userId;
+            logger.info('[LeekPay] userId récupéré via Firestore query checkoutId', {
+              checkoutId, resolvedUserId,
+            });
+          }
+        }
+      } catch (lookupErr) {
+        logger.warn('[LeekPay] Erreur lookup userId Firestore', { error: lookupErr.message, checkoutId });
+      }
+    }
+
+    if (!resolvedUserId) {
+      logger.error('[LeekPay] ⚠️ CRITIQUE : userId introuvable — activation premium IMPOSSIBLE', {
+        checkoutId,
+        orderId,
+        hint: '1) Vérifier metadata.userId dans createPayment() createCheckout() call. ' +
+              '2) Vérifier que leekpay_payments/{checkoutId} contient userId. ' +
+              '3) Vérifier que LeekPay réinjecte bien metadata dans le webhook.',
       });
       return;
     }
+
+    // Utiliser le userId résolu (depuis metadata OU depuis Firestore fallback)
+    const userId = resolvedUserId;
 
     await activatePremiumFirestore(userId, {
       checkoutId, transactionId, amount, currency, paymentMethod, paidAt,
