@@ -166,7 +166,9 @@ async function handleSMS(phone, rawMessage, ip = '0.0.0.0') {
   ============================================================ */
   if (isSmsSendCommand(msg)) {
     const lines    = msg.split('\n');
-    const target   = lines[0].trim();
+    // Retirer le préfixe d'envoi (* # @) avant résolution — sinon
+    // "*Marie" serait traité comme un numéro brut ("+226*Marie").
+    const target   = lines[0].trim().replace(/^[*@#]/, '');
     const content  = lines.slice(1).join('\n').trim();
 
     if (!content) {

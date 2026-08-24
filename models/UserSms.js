@@ -161,9 +161,22 @@ async function removeContact(ownerPhone, contactPhone) {
 async function resolveTarget(ownerPhone, target) {
   const t = target.trim();
 
-  // Format @Nom — chercher dans les contacts
-  if (t.startsWith('@')) {
-    const name = t.slice(1).toLowerCase();
+  // Numéro brut — normaliser et retourner
+  // (testé en premier pour éviter de chercher "+2267..." dans les contacts)
+  if (/^\+?\d[\d\s]*$/.test(t)) {
+    try {
+      const phone = normalizePhone(t);
+      return { phone, name: null };
+    } catch {
+      return null;
+    }
+  }
+
+  // Nom (avec ou sans @) — chercher dans les contacts.
+  // Le préfixe d'envoi (* #) est retiré en amont par smsHandler,
+  // donc "*Marie" arrive ici sous forme "Marie".
+  {
+    const name = t.replace(/^@/, '').toLowerCase();
     const user = await getByPhone(ownerPhone);
     if (!user) return null;
 
@@ -171,14 +184,6 @@ async function resolveTarget(ownerPhone, target) {
       c => c.name.toLowerCase() === name || c.name.toLowerCase().startsWith(name)
     );
     if (contact) return { phone: contact.phone, name: contact.name };
-    return null;
-  }
-
-  // Numéro brut — normaliser et retourner
-  try {
-    const phone = normalizePhone(t);
-    return { phone, name: null };
-  } catch {
     return null;
   }
 }
