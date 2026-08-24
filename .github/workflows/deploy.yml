@@ -78,10 +78,14 @@ jobs:
             "middleware/security.js"
             "middleware/logger.js"
             "middleware/authenticate.js"
+            "middleware/firebaseAuth.js"
             "routes/admin.js"
-            "routes/payment.fusionpay.js"
-            "routes/payment.online.js"
-            "routes/sms.webhook.js"
+            "routes/payment.leekpay.js"
+            "controllers/leekpayController.js"
+            "routes/messages.v2.js"
+            "routes/infobip.inbound.js"
+            "services/messageRouter.js"
+            "services/userResolver.js"
             "render.yaml"
           )
           for f in "${files[@]}"; do

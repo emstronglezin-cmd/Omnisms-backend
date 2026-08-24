@@ -370,7 +370,7 @@ app.get('/api/diag', (_req, res) => {
 /* ── Direct Infobip SMS test (admin key required) ─────────── */
 app.post('/api/diag/sms-test', async (req, res) => {
   const adminKey = req.headers['x-admin-key'] || req.body?.adminKey;
-  if (adminKey !== process.env.ADMIN_KEY && adminKey !== 'omnisms-diag-2026') {
+  if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
     return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
   }
 
@@ -509,7 +509,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('🤖 Groq       : ' + (groqOk  ? '✅ ACTIVE — Whisper transcription ready' : '❌ MISSING — set GROQ_API_KEY'));
   console.log('🔌 Socket.IO  : ' + (io ? '✅ ACTIVE' : '❌ INACTIVE'));
   console.log('📊 Diag       : GET /api/diag  (env var audit)');
-  console.log('🔬 SMS Test   : POST /api/diag/sms-test  (x-admin-key: omnisms-diag-2026)');
+  console.log('🔬 SMS Test   : POST /api/diag/sms-test  (x-admin-key: ADMIN_KEY requis)');
   console.log('❤️  Health     : GET /health');
   console.log('');
 });

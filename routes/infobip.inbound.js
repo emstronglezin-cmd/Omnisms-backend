@@ -68,14 +68,25 @@ function getIO() {
   try { return require('../services/socketService').getIO(); } catch (_) { return null; }
 }
 
-/* ── Validation signature Infobip (optionnelle) ─────────────── */
+/* ── Validation signature Infobip ────────────────────────────── */
+/* INFOBIP_WEBHOOK_SECRET       : active la validation HMAC si présent.
+   INFOBIP_REQUIRE_SIGNATURE=true : REJETTE toute requête non signée
+   (à activer seulement une fois Infobip configuré pour signer).      */
 function validateInfobipSignature(req) {
-  const secret = process.env.INFOBIP_WEBHOOK_SECRET;
-  if (!secret) return true;
+  const secret    = process.env.INFOBIP_WEBHOOK_SECRET;
+  const enforced  = process.env.INFOBIP_REQUIRE_SIGNATURE === 'true';
+  if (!secret) {
+    if (enforced) logger.error('[Infobip/Inbound] INFOBIP_REQUIRE_SIGNATURE=true mais INFOBIP_WEBHOOK_SECRET absent — webhook non sécurisé.');
+    return true; // pas de secret configuré : validation impossible
+  }
 
   const sig = req.headers['authorization'] || req.headers['x-hub-signature'] || '';
   if (!sig) {
-    logger.warn('[Infobip/Inbound] Signature manquante alors que INFOBIP_WEBHOOK_SECRET est configuré.');
+    if (enforced) {
+      logger.warn('[Infobip/Inbound] Signature manquante — requête REJETÉE (mode strict).');
+      return false;
+    }
+    logger.warn('[Infobip/Inbound] Signature manquante alors que INFOBIP_WEBHOOK_SECRET est configuré (mode permissif — définir INFOBIP_REQUIRE_SIGNATURE=true pour rejeter).');
     return true; // Infobip ne signe pas toujours
   }
 
