@@ -434,7 +434,7 @@ async function routeMessage(opts = {}) {
     }
   }
 
-  // Envoi SMS via Infobip
+  // Envoi SMS via Infobip (avec queue pour retry automatique)
   let smsResult = null;
   if (infobip && infobip.isConfigured() && type === 'text' && content) {
     try {
@@ -447,6 +447,7 @@ async function routeMessage(opts = {}) {
 
       const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
 
+      // Tentative directe (synchrone)
       smsResult = await infobip.sendSMS({
         to       : e164Target,
         text     : smsText,
@@ -456,13 +457,34 @@ async function routeMessage(opts = {}) {
       // Mettre à jour le statut du message + providerMessageId dans external conv
       if (db && savedId && savedId !== msgId) {
         await db.collection('messages').doc(savedId).update({
-          status        : smsResult.success ? 'sent' : 'failed',
+          status        : smsResult.success ? 'sent' : 'pending',
           smsMessageId  : smsResult.messageId || null,
           smsStatus     : smsResult.status    || null,
           updatedAt     : new Date().toISOString(),
         }).catch(() => {});
         if (smsResult.success && smsResult.messageId) {
           await updateExternalConvLastMessage(db, convId, content, smsResult.messageId).catch(() => {});
+        }
+      }
+
+      // Si l'envoi direct a échoué → mettre en queue pour retry
+      if (!smsResult.success) {
+        logger.warn('[ROUTING] SMS direct failed — enqueueing for retry', {
+          to: e164Target.replace(/\d{4}$/, '****'),
+          messageId: savedId,
+          error: smsResult.error,
+        });
+        try {
+          const { enqueueSmsJob } = require('./smsQueueWorker');
+          await enqueueSmsJob({
+            to            : e164Target,
+            text          : smsText,
+            messageId     : savedId !== msgId ? savedId : null,
+            conversationId: convId,
+            ownerUid      : senderUid,
+          });
+        } catch (qErr) {
+          logger.warn('[ROUTING] Could not enqueue SMS retry job', { error: qErr.message });
         }
       }
 
@@ -477,6 +499,22 @@ async function routeMessage(opts = {}) {
     } catch (smsErr) {
       logger.error('[ROUTING] Infobip sendSMS error', { error: smsErr.message });
       smsResult = { success: false, error: smsErr.message };
+      // Enqueue for retry on exception too
+      try {
+        const { enqueueSmsJob } = require('./smsQueueWorker');
+        const senderDisplay = senderName
+          ? `${senderName}${senderPhone ? ` (${senderPhone})` : ''}`
+          : (senderPhone || 'Un utilisateur OmniSMS');
+        await enqueueSmsJob({
+          to            : e164Target,
+          text          : `[OmniSMS] ${senderDisplay} : ${content.trim()}`,
+          messageId     : savedId !== msgId ? savedId : null,
+          conversationId: convId,
+          ownerUid      : senderUid,
+        });
+      } catch (qErr) {
+        logger.warn('[ROUTING] Could not enqueue SMS retry job after exception', { error: qErr.message });
+      }
     }
   } else if (type !== 'text') {
     logger.info('[ROUTING] Audio/image → Infobip non supporté, message enregistré uniquement', {

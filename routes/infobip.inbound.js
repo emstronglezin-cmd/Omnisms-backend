@@ -68,6 +68,59 @@ function getIO() {
   try { return require('../services/socketService').getIO(); } catch (_) { return null; }
 }
 
+function getRedis() {
+  try { return require('../services/redis'); } catch (_) { return null; }
+}
+
+/* ── Déduplication des webhooks entrants ───────────────────── */
+/**
+ * Vérifie et marque un messageId Infobip comme traité.
+ * Retourne true si le message est un doublon (déjà traité).
+ *
+ * Stratégie :
+ *  1. Redis SETNX avec TTL 24h (si Redis disponible)
+ *  2. Fallback mémoire (Map) si Redis absent
+ *
+ * Protège contre les retries Infobip : si l'envoi 200 est perdu,
+ * Infobip peut renvoyer le même webhook. Sans cette protection,
+ * le message serait inséré deux fois en Firestore.
+ */
+const _dedupMemoryStore = new Map(); // Fallback si Redis absent
+
+async function isAlreadyProcessed(messageId) {
+  if (!messageId) return false;
+  const key = `omnisms:inbound:dedup:${messageId}`;
+
+  // Essayer Redis d'abord
+  const redis = getRedis();
+  if (redis) {
+    try {
+      // SETNX : retourne 1 si créé (nouveau), 0 si existait déjà
+      const set = await redis.setnx(key, '1');
+      if (set === 1) {
+        // Nouveau : poser le TTL (24h) et autoriser le traitement
+        await redis.expire(key, 86400).catch(() => {});
+        return false; // not a duplicate
+      }
+      return true; // duplicate
+    } catch (_) {
+      // Redis error → fallback mémoire
+    }
+  }
+
+  // Fallback mémoire (non distribué, mais OK pour instance unique Render)
+  if (_dedupMemoryStore.has(messageId)) return true;
+  _dedupMemoryStore.set(messageId, Date.now());
+  // Nettoyer les entrées > 24h (éviter memory leak)
+  if (_dedupMemoryStore.size > 50000) {
+    const cutoff = Date.now() - 86400000;
+    for (const [k, ts] of _dedupMemoryStore) {
+      if (ts < cutoff) _dedupMemoryStore.delete(k);
+    }
+  }
+  return false;
+}
+
 /* ── Validation signature Infobip ────────────────────────────── */
 /* INFOBIP_WEBHOOK_SECRET       : active la validation HMAC si présent.
    INFOBIP_REQUIRE_SIGNATURE=true : REJETTE toute requête non signée
@@ -220,6 +273,20 @@ async function processInfobipInbound(payload) {
       const toRaw      = item.to      || '';
       const textRaw    = item.text    || '';
       const fromE164   = normalizePhone(fromRaw) || fromRaw;
+
+      // ── Déduplication : ignorer les webhooks en double ────────
+      // Infobip peut renvoyer le même webhook si notre 200 n'est pas reçu.
+      // On vérifie que ce messageId n'a pas déjà été traité (Redis ou Map mémoire).
+      if (item.messageId) {
+        const duplicate = await isAlreadyProcessed(item.messageId);
+        if (duplicate) {
+          logger.info('[INFOBIP_INBOUND] Doublon ignoré', {
+            messageId: item.messageId,
+            from: fromE164.replace(/\d{4}$/, '****'),
+          });
+          continue;
+        }
+      }
 
       logger.info('[INFOBIP_INBOUND] SMS reçu', {
         from      : fromE164.replace(/\d{4}$/, '****'),

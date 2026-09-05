@@ -464,6 +464,15 @@ try {
   logger.warn('[Worker] Could not start transcription worker.', { error: err.message });
 }
 
+/* ── Worker SMS (retry outbound) ─────────────────────────── */
+try {
+  const { startSmsWorker } = require('./services/smsQueueWorker');
+  startSmsWorker();
+  logger.info('[Worker] SMS queue worker started.');
+} catch (err) {
+  logger.warn('[Worker] Could not start SMS worker.', { error: err.message });
+}
+
 /* ── Démarrage serveur ───────────────────────────────────── */
 server.keepAliveTimeout = 65000;
 server.headersTimeout   = 66000;
