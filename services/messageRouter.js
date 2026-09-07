@@ -386,17 +386,34 @@ async function routeMessage(opts = {}) {
     };
   }
 
-  /* ── 3. Route : Infobip SMS ──────────────────────────────── */
-  // Destinataire n'a pas OmniSMS → SMS via Infobip
+  /* ── 3. Route : SMS externe ──────────────────────────────── */
+  // Destinataire n'a pas OmniSMS → SMS via SMS Gateway (Z Fold2) ou Infobip (standby)
   const e164Target = normalizePhone(targetPhone) || (targetPhone || '').replace(/\s/g, '');
 
-  let infobip = null;
-  try { infobip = require('./infobip'); } catch (_) {}
+  // Déterminer le transport Offline actif
+  let smsGateway = null;
+  let infobip    = null;
+  let transport  = 'none';
 
-  if (!infobip || !infobip.isConfigured()) {
-    logger.warn('[ROUTING] Infobip non configuré — message externe non délivré', {
+  try { smsGateway = require('./smsGateway'); } catch (_) {}
+  try { infobip    = require('./infobip');    } catch (_) {}
+
+  const useGateway = smsGateway && smsGateway.isSmsGatewayProvider() && smsGateway.isConfigured();
+  const useInfobip = infobip    && infobip.isConfigured();
+
+  if (useGateway) {
+    transport = 'sms_gateway';
+  } else if (useInfobip) {
+    transport = 'infobip';
+    logger.info('[ROUTING] SMS Gateway non configuré — utilisation Infobip (standby)', {
       senderUid,
       targetPhone: e164Target.replace(/\d{4}$/, '****'),
+    });
+  } else {
+    logger.warn('[ROUTING] Aucun transport SMS configuré — message externe non délivré', {
+      senderUid,
+      targetPhone: e164Target.replace(/\d{4}$/, '****'),
+      hint: 'Configurer SMS_GATEWAY_LOGIN + SMS_GATEWAY_PASSWORD ou INFOBIP_API_KEY + INFOBIP_BASE_URL',
     });
   }
 
@@ -430,49 +447,82 @@ async function routeMessage(opts = {}) {
       // Mettre à jour lastMessage dans la conversation externe
       await updateExternalConvLastMessage(db, convId, content || '[audio]');
     } catch (dbErr) {
-      logger.warn('[ROUTING] Firestore save failed (Infobip)', { error: dbErr.message });
+      logger.warn('[ROUTING] Firestore save failed (SMS externe)', { error: dbErr.message });
     }
   }
 
-  // Envoi SMS via Infobip (avec queue pour retry automatique)
+  // Construction du texte SMS (commun aux deux transports)
+  const senderDisplay = senderName
+    ? `${senderName}${senderPhone ? ` (${senderPhone})` : ''}`
+    : (senderPhone || 'Un utilisateur OmniSMS');
+  const smsText = `[OmniSMS] ${senderDisplay} : ${content ? content.trim() : ''}`;
+
   let smsResult = null;
-  if (infobip && infobip.isConfigured() && type === 'text' && content) {
+
+  if (transport !== 'none' && type === 'text' && content) {
+    // ── Tentative directe (synchrone) ───────────────────────
     try {
-      // Construction du texte SMS avec header expéditeur
-      const senderDisplay = senderName
-        ? `${senderName}${senderPhone ? ` (${senderPhone})` : ''}`
-        : (senderPhone || 'Un utilisateur OmniSMS');
+      if (transport === 'sms_gateway') {
+        // ── Transport principal : SMS Gateway Z Fold2 ────────
+        smsResult = await smsGateway.sendSMS({
+          to       : e164Target,
+          text     : smsText,
+          messageId: savedId !== msgId ? savedId : null,
+          ttl      : 3600,
+        });
 
-      const smsText = `[OmniSMS] ${senderDisplay} : ${content.trim()}`;
+        // Si Gateway échoue ET fallback Infobip activé → tenter Infobip
+        if (!smsResult.success && smsGateway.isInfobipFallbackEnabled() && useInfobip) {
+          logger.warn('[ROUTING] SMS Gateway failed — tentative Infobip (fallback)', {
+            to: e164Target.replace(/\d{4}$/, '****'),
+            error: smsResult.error,
+          });
+          const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
+          const fallbackResult = await infobip.sendSMS({
+            to       : e164Target,
+            text     : smsText,
+            notifyUrl: deliveryUrl,
+          });
+          if (fallbackResult.success) {
+            smsResult = { ...fallbackResult, provider: 'infobip_fallback' };
+            logger.info('[ROUTING] Infobip fallback réussi', {
+              to: e164Target.replace(/\d{4}$/, '****'),
+            });
+          }
+        }
 
-      const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
+      } else if (transport === 'infobip') {
+        // ── Transport standby : Infobip ──────────────────────
+        const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
+        smsResult = await infobip.sendSMS({
+          to       : e164Target,
+          text     : smsText,
+          notifyUrl: deliveryUrl,
+        });
+      }
 
-      // Tentative directe (synchrone)
-      smsResult = await infobip.sendSMS({
-        to       : e164Target,
-        text     : smsText,
-        notifyUrl: deliveryUrl,
-      });
-
-      // Mettre à jour le statut du message + providerMessageId dans external conv
+      // Mettre à jour le statut du message en Firestore
       if (db && savedId && savedId !== msgId) {
+        const providerMsgId = smsResult?.messageId || smsResult?.gatewayMessageId || null;
         await db.collection('messages').doc(savedId).update({
-          status        : smsResult.success ? 'sent' : 'pending',
-          smsMessageId  : smsResult.messageId || null,
-          smsStatus     : smsResult.status    || null,
+          status        : smsResult?.success ? 'sent' : 'pending',
+          smsMessageId  : providerMsgId,
+          smsProvider   : smsResult?.provider || transport,
+          smsStatus     : smsResult?.state || smsResult?.status || null,
           updatedAt     : new Date().toISOString(),
         }).catch(() => {});
-        if (smsResult.success && smsResult.messageId) {
-          await updateExternalConvLastMessage(db, convId, content, smsResult.messageId).catch(() => {});
+        if (smsResult?.success && providerMsgId) {
+          await updateExternalConvLastMessage(db, convId, content, providerMsgId).catch(() => {});
         }
       }
 
       // Si l'envoi direct a échoué → mettre en queue pour retry
-      if (!smsResult.success) {
+      if (smsResult && !smsResult.success) {
         logger.warn('[ROUTING] SMS direct failed — enqueueing for retry', {
-          to: e164Target.replace(/\d{4}$/, '****'),
+          to       : e164Target.replace(/\d{4}$/, '****'),
           messageId: savedId,
-          error: smsResult.error,
+          transport,
+          error    : smsResult.error,
         });
         try {
           const { enqueueSmsJob } = require('./smsQueueWorker');
@@ -488,26 +538,27 @@ async function routeMessage(opts = {}) {
         }
       }
 
-      logger.info('[ROUTING] Message routed → INFOBIP', {
+      logger.info('[ROUTING] Message routed → SMS_EXTERNE', {
         senderUid,
-        targetPhone: e164Target.replace(/\d{4}$/, '****'),
+        targetPhone   : e164Target.replace(/\d{4}$/, '****'),
+        transport,
         conversationId: convId,
-        smsSuccess : smsResult.success,
-        smsMessageId: smsResult.messageId || null,
+        smsSuccess    : smsResult?.success,
+        smsMessageId  : smsResult?.messageId || smsResult?.gatewayMessageId || null,
       });
 
     } catch (smsErr) {
-      logger.error('[ROUTING] Infobip sendSMS error', { error: smsErr.message });
+      logger.error('[ROUTING] SMS send error', {
+        transport,
+        error: smsErr.message,
+      });
       smsResult = { success: false, error: smsErr.message };
-      // Enqueue for retry on exception too
+      // Enqueue for retry on exception
       try {
         const { enqueueSmsJob } = require('./smsQueueWorker');
-        const senderDisplay = senderName
-          ? `${senderName}${senderPhone ? ` (${senderPhone})` : ''}`
-          : (senderPhone || 'Un utilisateur OmniSMS');
         await enqueueSmsJob({
           to            : e164Target,
-          text          : `[OmniSMS] ${senderDisplay} : ${content.trim()}`,
+          text          : smsText,
           messageId     : savedId !== msgId ? savedId : null,
           conversationId: convId,
           ownerUid      : senderUid,
@@ -517,13 +568,14 @@ async function routeMessage(opts = {}) {
       }
     }
   } else if (type !== 'text') {
-    logger.info('[ROUTING] Audio/image → Infobip non supporté, message enregistré uniquement', {
+    logger.info('[ROUTING] Audio/image → SMS non supporté, message enregistré uniquement', {
       senderUid, type, convId,
     });
   }
 
   return {
-    route         : 'INFOBIP',
+    route         : 'SMS_EXTERNE',
+    transport,
     conversationId: convId,
     messageId     : savedId,
     externalPhone : e164Target,

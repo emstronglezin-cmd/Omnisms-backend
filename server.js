@@ -209,8 +209,9 @@ const authRoutes         = require('./routes/auth');
 // OTP routes supprimées — inscription directe sans OTP
 const leekPayRoutes      = require('./routes/payment.leekpay');
 const webhookRoutes      = require('./routes/webhook');
-const infobipRoutes      = require('./routes/sms.infobip');
+const infobipRoutes        = require('./routes/sms.infobip');
 const infobipInboundRoutes = require('./routes/infobip.inbound');
+const smsGatewayInboundRoutes = require('./routes/sms.gateway.inbound');
 const transcriptionRoutes  = require('./routes/transcription.v2');
 const adminRoutes        = require('./routes/admin');
 const groupRoutes        = require('./routes/groups');
@@ -253,8 +254,11 @@ app.use('/api/audio', audioV2Routes);
 /* ── Transcription v2 (Faster-Whisper) ──────────────────── */
 app.use('/api/transcription', transcriptionRoutes);
 
-/* ── Infobip webhooks entrants ───────────────────────────── */
+/* ── Infobip webhooks entrants (standby) ────────────────── */
 app.use('/api/webhooks', infobipInboundRoutes);
+
+/* ── SMS Gateway Z Fold2 webhooks entrants (principal) ───── */
+app.use('/api/webhooks', smsGatewayInboundRoutes);
 
 /* ── LeekPay payments ─────────────────────────────────────── */
 app.use('/api/payment', leekPayLimiter, leekPayRoutes);

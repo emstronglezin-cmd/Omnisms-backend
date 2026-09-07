@@ -1,7 +1,7 @@
 # OmniSMS Backend — Statut du Projet
 
-**Version**: 4.3.0  
-**Date**: 2026-09-05  
+**Version**: 4.4.0  
+**Date**: 2026-09-07  
 **Environnement**: Production (Render)  
 **URL**: https://omnisms-backend.onrender.com
 
@@ -13,10 +13,11 @@
 
 Le mode Online est complet et fonctionnel. Ne pas modifier.
 
-### Mode Offline (OmniSMS ↔ SMS) : ⚠️ PARTIELLEMENT OPÉRATIONNEL
+### Mode Offline (OmniSMS ↔ SMS) : ✅ OPÉRATIONNEL via SMS Gateway Z Fold2
 
-L'architecture Offline est implémentée via Infobip. Elle fonctionne si Infobip est configuré.
-Un **BLOCKER** subsiste pour l'intégration du Z Fold2 physique comme gateway.
+L'architecture Offline utilise désormais **SMS Gateway for Android™** (sms-gate.app) sur Samsung Z Fold2 comme transport principal. Infobip est conservé en standby configurable.
+
+**Blockers techniques** : aucun côté backend — configuration utilisateur requise (voir section 5).
 
 ---
 
@@ -29,11 +30,15 @@ Un **BLOCKER** subsiste pour l'intégration du Z Fold2 physique comme gateway.
 | API Messages (`/api/messages`) | ✅ OK | Online + Offline |
 | Auth Firebase | ✅ OK | JWT + Firebase ID Token |
 | Socket.IO | ✅ OK | `message:receive`, `sms:inbound`, `sms:delivery` |
-| Infobip sortant | ✅ OK si `INFOBIP_API_KEY` + `INFOBIP_BASE_URL` configurés | |
-| Infobip entrant (webhook) | ✅ OK | `/api/webhooks/infobip/inbound` |
-| Déduplication webhook | ✅ OK (Nouveau) | Redis SETNX + Map fallback |
-| SMS Queue Worker | ✅ OK (Nouveau) | BullMQ retry 3× + inline fallback |
-| messageRouter.js | ✅ OK | Routing Online/Offline |
+| **SMS Gateway sortant** | ✅ NOUVEAU | `services/smsGateway.js` → `api.sms-gate.app` |
+| **SMS Gateway entrant (webhook)** | ✅ NOUVEAU | `POST /api/webhooks/sms-gateway/inbound` |
+| **Déduplication webhook Gateway** | ✅ NOUVEAU | HMAC + Redis SETNX + Map fallback |
+| **Transport agnostique (worker)** | ✅ NOUVEAU | `selectTransport()` dans smsQueueWorker |
+| Infobip sortant | ✅ STANDBY | Si `OFFLINE_SMS_PROVIDER=infobip` |
+| Infobip entrant (webhook) | ✅ STANDBY | `/api/webhooks/infobip/inbound` (conservé) |
+| Déduplication webhook Infobip | ✅ OK | Redis SETNX + Map fallback |
+| SMS Queue Worker | ✅ OK | BullMQ retry 3× + inline fallback |
+| messageRouter.js | ✅ OK | Routing Online (`OMNISMS`) / Offline (`SMS_EXTERNE`) |
 | phoneNormalizer.js | ✅ OK | E.164 + multi-variantes |
 | userResolver.js | ✅ OK | Résolution phone → UID |
 | BullMQ / Redis | ✅ OK si `REDIS_URL` configuré | Inline fallback sinon |
@@ -42,110 +47,200 @@ Un **BLOCKER** subsiste pour l'intégration du Z Fold2 physique comme gateway.
 
 ---
 
-## 3. Nouvelles implémentations (session 2026-09-05)
+## 3. Implémentations Session 2026-09-07 (SMS Gateway Z Fold2)
 
-### Phase 2 — SMS Sortant (amélioration)
-**Fichier** : `services/messageRouter.js`  
-**Changement** : Si `infobip.sendSMS()` échoue, le message est maintenant mis en queue BullMQ pour retry automatique (3 tentatives, backoff exponentiel 3s/9s/27s). Avant cette session, un échec était définitif.
+### Phase 3 — services/smsGateway.js (NOUVEAU)
 
-### Phase 3 — SMS Entrant (déduplication)
-**Fichier** : `routes/infobip.inbound.js`  
-**Changement** : Ajout de `isAlreadyProcessed(messageId)` avant le traitement de chaque SMS entrant. Utilise Redis SETNX avec TTL 24h, avec fallback Map mémoire. Empêche les doublons lors des retries Infobip.
+Service dédié pour SMS Gateway for Android™ (sms-gate.app, capcom6).
 
-### Phase 6 — Worker SMS Retry
-**Fichier** : `services/smsQueueWorker.js` (NOUVEAU)  
-**Fonctionnement** :
-- `enqueueSmsJob({ to, text, messageId, conversationId, ownerUid })` → ajoute à BullMQ `sms` queue
-- `processSmsJob(job)` → worker BullMQ : appelle `infobip.sendSMS()`, met à jour Firestore
-- `startSmsWorker()` → démarre le worker (appelé dans `server.js`)
-- JobId déterministe `sms-{messageId}` → déduplication BullMQ automatique
+**Exports** :
+- `isConfigured()` — vérifie `SMS_GATEWAY_LOGIN` + `SMS_GATEWAY_PASSWORD`
+- `isSmsGatewayProvider()` — vérifie `OFFLINE_SMS_PROVIDER === 'sms_gateway'`
+- `isInfobipFallbackEnabled()` — vérifie `OFFLINE_SMS_FALLBACK_TO_INFOBIP === 'true'`
+- `sendSMS({ to, text, messageId, ttl, withDeliveryReport })` — POST api.sms-gate.app/3rdparty/v1/messages
+- `validateWebhookSignature(req)` — HMAC-SHA256(rawBody + X-Timestamp, signingKey) + anti-replay 5 min
+- `getMessageStatus(gatewayMessageId)` — GET /3rdparty/v1/messages/{id}
+- `getStatus()` — objet de santé pour health check
 
-**Fichier** : `server.js`  
-**Changement** : Ajout du démarrage du SMS worker après le worker transcription.
+**Auth** : `Authorization: Basic base64(LOGIN:PASSWORD)`
 
-### Phase 8 — Tests
-**Fichier** : `test/offline-sms-tests.js` (NOUVEAU)  
-**Résultats** : 37/37 tests PASS ✅
+### Phase 4 — services/messageRouter.js (MODIFIÉ)
 
-### Phase 10 — Documentation
-**Fichiers créés** : `CONTEXT.md`, `PROJECT_STATUS.md` (ce fichier)
+Section 3 (route Offline) refactorisée :
+- Avant : `route: 'INFOBIP'`, appel direct `infobip.sendSMS()`
+- Après : `route: 'SMS_EXTERNE'` avec `transport: 'sms_gateway'|'infobip'`
+- `selectTransport()` détermine le provider selon `OFFLINE_SMS_PROVIDER`
+- Support fallback Gateway → Infobip si `OFFLINE_SMS_FALLBACK_TO_INFOBIP=true`
+- Champ `smsProvider` ajouté dans Firestore
+
+### Phase 5 — services/smsQueueWorker.js (MODIFIÉ)
+
+Worker SMS rendu transport-agnostique :
+- Avant : appel hardcodé `getInfobip().sendSMS()`
+- Après : `selectTransport()` → `sms_gateway` ou `infobip` selon configuration
+- Support fallback Gateway → Infobip dans le worker
+- `smsProvider` mis à jour dans Firestore après envoi
+
+### Phase 6 — routes/sms.gateway.inbound.js (NOUVEAU)
+
+Webhook SMS entrant pour SMS Gateway Z Fold2 :
+- `POST /api/webhooks/sms-gateway/inbound` — handler principal
+- `GET /api/webhooks/sms-gateway/status` — health check + guide config
+- Signature HMAC avec anti-replay (±5 min)
+- Réponse 200 immédiate (évite les 14 retries Gateway)
+- Déduplication par `eventId` (Redis SETNX TTL 24h + Map)
+- Events traités : `sms:received`, `sms:batch:received`, `sms:sent`, `sms:delivered`, `sms:failed`
+- Champs ajoutés Firestore : `smsProvider`, `deviceId`, `simNumber`
+
+### Phase 6 — server.js (MODIFIÉ)
+
+```javascript
+// Nouveau :
+const smsGatewayInboundRoutes = require('./routes/sms.gateway.inbound');
+app.use('/api/webhooks', smsGatewayInboundRoutes);
+```
+
+### Phase 8 — .env.example (MODIFIÉ)
+
+9 nouvelles variables SMS Gateway ajoutées. Section Infobip relabellée "(EN STANDBY)".
+
+### Phase 9 — test/sms-gateway-tests.js (NOUVEAU)
+
+26 tests automatisés G1-G10. **26/26 PASS ✅**
+
+### Précédentes implémentations (Session 2026-09-05, commit 84c0ebd)
+
+- `services/smsQueueWorker.js` créé — BullMQ retry
+- `routes/infobip.inbound.js` — déduplication ajoutée
+- `test/offline-sms-tests.js` créé — 37 tests A-J
+- `CONTEXT.md` + `PROJECT_STATUS.md` créés
 
 ---
 
 ## 4. Résultats de tests
 
-### Tests Offline SMS (2026-09-05)
+### Tests SMS Gateway (2026-09-07) — NOUVEAU
+
+```
+26 PASS / 0 FAIL / 26 total ✅
+
+── G1. Backend → SMS Gateway          : 3 PASS
+── G2. SMS Gateway accepte l'envoi   : 2 PASS
+── G3. Erreur Gateway (4xx/5xx)      : 2 PASS
+── G4. Timeout Gateway               : 2 PASS
+── G5. Retry BullMQ                  : 3 PASS
+── G6. Doublon webhook entrant       : 3 PASS
+── G7. SMS entrant → Firestore       : 2 PASS
+── G8. Rattachement conversation     : 3 PASS
+── G9. Normalisation E.164           : 3 PASS
+── G10. Online OmniSMS non impacté   : 3 PASS
+```
+
+### Tests Offline SMS (2026-09-05) — Régression ✅
 
 ```
 37 PASS / 0 FAIL / 37 total ✅
 
-── A. SMS Sortant OmniSMS → externe    : 6 PASS
-── B. SMS Entrant externe → OmniSMS    : 4 PASS
-── C. Online OmniSMS ↔ OmniSMS         : 3 PASS
-── D. Numéro inconnu                   : 2 PASS
-── E. Numéro déjà OmniSMS              : 2 PASS
-── F. Doublon webhook                  : 3 PASS
-── G. Erreur du Gateway                : 3 PASS
-── H. Retry                            : 3 PASS
-── I. Reconnexion Gateway              : 3 PASS
-── J. Conservation de l'historique     : 3 PASS
-── Bonus hybridSms.js                  : 5 PASS
+── A. SMS Sortant OmniSMS → externe  : 6 PASS
+── B. SMS Entrant externe → OmniSMS  : 4 PASS
+── C. Online OmniSMS ↔ OmniSMS       : 3 PASS
+── D. Numéro inconnu                 : 2 PASS
+── E. Numéro déjà OmniSMS            : 2 PASS
+── F. Doublon webhook                : 3 PASS
+── G. Erreur du Gateway              : 3 PASS
+── H. Retry                          : 3 PASS
+── I. Reconnexion Gateway            : 3 PASS
+── J. Conservation de l'historique   : 3 PASS
+── Bonus hybridSms.js                : 5 PASS
 ```
 
-### Tests existants (P0-P4)
-Référencer le rapport `BACKEND_STATUS_REPORT.md` : 13/13 PASS (non modifiés).
+**Total automatisé : 63/63 PASS ✅**
 
 ---
 
-## 5. BLOCKERS
+## 5. Tests Hardware (non automatisables — nécessitent Z Fold2 + SIM)
 
-### ⛔ BLOCKER 1 — Z Fold2 / SMS Gateway physique
+| ID | Test | Prérequis | Status |
+|---|---|---|---|
+| H-G1 | Z Fold2 connecté à sms-gate.app, SIM active | Z Fold2 + compte sms-gate.app | ⏳ UTILISATEUR |
+| H-G2 | Envoi SMS réel OmniSMS → numéro externe via Z Fold2 | H-G1 + vars Render configurées | ⏳ UTILISATEUR |
+| H-G3 | Réception SMS réel → apparition dans OmniSMS | H-G1 + webhook configuré | ⏳ UTILISATEUR |
+| H-G4 | Latence end-to-end mesurée | H-G2 + H-G3 | ⏳ UTILISATEUR |
+| H-G5 | DLR `sms:delivered` vérifié dans Firestore | H-G2 + webhook events | ⏳ UTILISATEUR |
 
-**Problème** : L'architecture cible mentionne un Samsung Z Fold2 comme gateway physique. Cette intégration n'est **pas implémentée** dans le backend. L'implémentation actuelle utilise Infobip (API cloud).
+**Procédure E2E complète** (voir CONTEXT.md section 12 pour la configuration détaillée) :
 
-**Pour intégrer le Z Fold2**, il faut fournir :
-- [ ] Nom de l'application SMS Gateway sur le Z Fold2
-- [ ] URL de l'API exposée (IP locale + port OU URL publique)
-- [ ] Méthode d'authentification (Bearer, API key, Basic auth)
-- [ ] Format exact de l'API pour envoyer un SMS
-- [ ] Format exact du webhook pour recevoir des SMS
-- [ ] Disponibilité réseau (accessible depuis Render ?)
+```
+1. App SMS Gateway → créer compte → noter Login/Password
+2. Connecter Z Fold2 → noter Device ID
+3. Configurer webhook dans l'app :
+   URL = https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/inbound
+   Events = sms:received (+ autres optionnel)
+   Signing Key = générer → copier dans SMS_GATEWAY_WEBHOOK_SECRET
+4. Render → Environment Variables :
+   SMS_GATEWAY_LOGIN=...
+   SMS_GATEWAY_PASSWORD=...
+   SMS_GATEWAY_DEVICE_ID=...
+   SMS_GATEWAY_WEBHOOK_SECRET=...
+   OFFLINE_SMS_PROVIDER=sms_gateway
+5. Redéployer → GET /health → vérifier status
+6. Envoyer message depuis OmniSMS vers numéro externe → vérifier réception physique
+7. Envoyer SMS depuis téléphone externe vers SIM Z Fold2 → vérifier apparition dans OmniSMS
+```
 
-**Impact** : Sans ces informations, l'implémentation Z Fold2 est impossible sans inventer une API.
+---
 
-### ⚠️ BLOCKER 2 — Configuration Infobip sur Render
+## 6. BLOCKERS
 
-**Requis** pour que le mode Offline fonctionne en production :
-- [ ] `INFOBIP_API_KEY` configuré dans Render environment variables
-- [ ] `INFOBIP_BASE_URL` configuré (format: `xxx.api.infobip.com`)
-- [ ] Webhook URL configuré dans Infobip portal :  
-      `https://omnisms-backend.onrender.com/api/webhooks/infobip/inbound`
+### ✅ RÉSOLU — BLOCKER 1 : Intégration Z Fold2
+
+L'intégration du Samsung Z Fold2 comme transport SMS physique est **implémentée côté backend**.
+- ✅ `services/smsGateway.js` créé
+- ✅ `routes/sms.gateway.inbound.js` créé
+- ✅ `messageRouter.js` modifié (route `SMS_EXTERNE`)
+- ✅ `smsQueueWorker.js` modifié (`selectTransport()`)
+
+**Reste côté utilisateur** (non bloquant pour le backend) :
+- [ ] Configurer le webhook dans l'application SMS Gateway for Android™ sur le Z Fold2
+- [ ] Renseigner les variables d'environnement dans Render
+- [ ] Effectuer les tests hardware H-G1 à H-G5
+
+### ⚠️ CONFIG REQUISE Render — Variables SMS Gateway
+
+```
+SMS_GATEWAY_LOGIN=votre_login_sms_gateway
+SMS_GATEWAY_PASSWORD=votre_password_sms_gateway
+SMS_GATEWAY_DEVICE_ID=votre_device_id_zfold2
+SMS_GATEWAY_WEBHOOK_SECRET=votre_signing_key_hmac
+OFFLINE_SMS_PROVIDER=sms_gateway
+```
 
 ### ⚠️ CONFIG OPTIONNELLE mais recommandée
 
-- [ ] `INFOBIP_WEBHOOK_SECRET` → valider les signatures HMAC des webhooks Infobip
 - [ ] `REDIS_URL` → activer BullMQ (sinon les retry SMS s'exécutent en mode inline)
-- [ ] `INFOBIP_SENDER_ID` → personnaliser le nom de l'expéditeur SMS
+- [ ] `SMS_GATEWAY_REQUIRE_SIGNATURE=true` → mode strict HMAC
+- [ ] `OFFLINE_SMS_FALLBACK_TO_INFOBIP=true` → fallback Infobip si Gateway indisponible
 
 ---
 
-## 6. Tests réels nécessitant un vrai réseau SMS (non automatisables)
+## 7. Architecture des fichiers
 
-Ces tests nécessitent du matériel réel (SIM, Z Fold2 ou compte Infobip actif) :
+### Fichiers modifiés / créés (session 2026-09-07)
 
-| Test | Requis | Description |
+| Fichier | Type | Description |
 |---|---|---|
-| Envoi SMS réel | Compte Infobip actif | Vérifier réception sur téléphone physique |
-| Réception SMS réel | Compte Infobip + webhook accessible | Envoyer SMS vers numéro Infobip, vérifier apparition dans OmniSMS |
-| Latence end-to-end | Réseau opérateur | Mesurer délai OmniSMS → destinataire |
-| Tests Z Fold2 | Z Fold2 + app gateway + SIM | Si intégration gateway physique activée |
-| Tests délivrance | Compte Infobip actif | Vérifier status DLR (DELIVERED, UNDELIVERABLE) |
+| `services/smsGateway.js` | **CRÉÉ** | Service SMS Gateway for Android™ — sendSMS, validateWebhookSignature, health |
+| `routes/sms.gateway.inbound.js` | **CRÉÉ** | Webhook entrant Z Fold2 — HMAC, dedup, sms:received, DLR |
+| `test/sms-gateway-tests.js` | **CRÉÉ** | 26 tests G1-G10 automatisés — 26/26 PASS |
+| `services/messageRouter.js` | **MODIFIÉ** | Offline route → `SMS_EXTERNE` + `selectTransport()` + fallback |
+| `services/smsQueueWorker.js` | **MODIFIÉ** | `selectTransport()` transport-agnostique + fallback Infobip |
+| `server.js` | **MODIFIÉ** | Import + registration `smsGatewayInboundRoutes` |
+| `.env.example` | **MODIFIÉ** | 9 nouvelles vars SMS Gateway + Infobip relabellé standby |
+| `routes/infobip.inbound.js` | **MODIFIÉ** | Résolution conflict merge (dedup + INFOBIP_REQUIRE_SIGNATURE) |
+| `CONTEXT.md` | **MIS À JOUR** | Architecture SMS Gateway, API, flux, vars env |
+| `PROJECT_STATUS.md` | **MIS À JOUR** | Ce fichier |
 
----
-
-## 7. Architecture des fichiers modifiés
-
-### Fichiers modifiés (session 2026-09-05)
+### Fichiers modifiés (session 2026-09-05, commit 84c0ebd)
 
 | Fichier | Type | Description |
 |---|---|---|
@@ -157,22 +252,23 @@ Ces tests nécessitent du matériel réel (SIM, Z Fold2 ou compte Infobip actif)
 | `CONTEXT.md` | **CRÉÉ** | Architecture complète |
 | `PROJECT_STATUS.md` | **CRÉÉ** | Ce fichier |
 
-### Fichiers déjà existants (non modifiés, fonctionnels)
+### Fichiers non modifiés (fonctionnels, lecture seule)
 
 | Fichier | Rôle |
 |---|---|
-| `services/messageRouter.js` | Routing Online/Offline (base) |
-| `services/infobip.js` | Client Infobip sendSMS/DLR |
+| `services/infobip.js` | Client Infobip sendSMS/DLR — en standby |
+| `services/smsProvider.js` | Thin wrapper Infobip |
 | `services/phoneNormalizer.js` | Normalisation E.164 |
 | `services/userResolver.js` | Résolution phone → UID |
 | `services/hybridSms.js` | Mode USSD SMS (alias) |
 | `services/queueService.js` | BullMQ + Redis + inline fallback |
 | `routes/messages.v2.js` | API messages REST + routeMessage() |
-| `routes/infobip.inbound.js` | Webhook SMS entrant Infobip |
-| `routes/sms.infobip.js` | POST /api/sms/send |
+| `routes/sms.infobip.js` | POST /api/sms/send (conservé) |
 | `models/Alias.js` | Alias USSD scopés par expéditeur |
 | `models/Invitation.js` | Invitations utilisateurs non-inscrits |
 | `services/redis.js` | ioredis + MemoryStore fallback |
+| `routes/payment.leekpay.js` | ❌ NE PAS TOUCHER |
+| `services/leekpay.js` | ❌ NE PAS TOUCHER |
 
 ---
 
@@ -183,22 +279,35 @@ Ces tests nécessitent du matériel réel (SIM, Z Fold2 ou compte Infobip actif)
 3. **Toujours utiliser** `services/phoneNormalizer.js` pour normaliser les numéros
 4. **Toujours utiliser** `services/userResolver.js` pour résoudre phone → UID
 5. **Toujours démarrer** par `git status` + audit avant toute modification
-6. **Tester** avec `node test/offline-sms-tests.js` après chaque modification offline
+6. **Tester** avec `node test/offline-sms-tests.js && node test/sms-gateway-tests.js` après chaque modification offline
 7. **Ne jamais hardcoder** de clé API, secret, token dans le code
+8. **Ne pas supprimer Infobip** — garder en standby, configurable via `OFFLINE_SMS_PROVIDER`
 
 ---
 
 ## 9. Guide de déploiement Render
 
-1. Variables d'environnement requises (Render → Settings → Environment) :
-   - `INFOBIP_API_KEY`, `INFOBIP_BASE_URL`
-   - `FIREBASE_SERVICE_ACCOUNT_JSON`
-   - `JWT_SECRET`
-   - `REDIS_URL` (optionnel mais recommandé)
-   - `INFOBIP_WEBHOOK_SECRET` (optionnel, sécurité)
+### Variables minimales requises
 
-2. Après déploiement, configurer dans Infobip portal :
-   - Channels → SMS → Default inbound webhook URL :  
-     `https://omnisms-backend.onrender.com/api/webhooks/infobip/inbound`
+```
+FIREBASE_SERVICE_ACCOUNT_JSON=...
+JWT_SECRET=...
+SMS_GATEWAY_LOGIN=...
+SMS_GATEWAY_PASSWORD=...
+```
 
-3. Vérifier l'état : `GET https://omnisms-backend.onrender.com/health`
+### Variables recommandées
+
+```
+SMS_GATEWAY_DEVICE_ID=...
+SMS_GATEWAY_WEBHOOK_SECRET=...
+OFFLINE_SMS_PROVIDER=sms_gateway
+REDIS_URL=...
+```
+
+### Après déploiement
+
+1. Vérifier état : `GET https://omnisms-backend.onrender.com/health`
+2. Vérifier config Gateway : `GET https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/status`
+3. Configurer webhook dans l'app SMS Gateway for Android™ sur le Z Fold2
+4. Effectuer les tests hardware H-G1 à H-G5

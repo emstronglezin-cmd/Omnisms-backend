@@ -2,11 +2,16 @@
 /**
  * OmniSMS — SMS Outbound Queue Worker
  *
- * Provides async retry logic for outbound SMS via Infobip.
+ * Provides async retry logic for outbound SMS.
  * Uses BullMQ 'sms' queue (via queueService.addSmsJob) with:
  *   - 3 attempts, exponential back-off (3s, 9s, 27s)
  *   - Dedup: a job with the same jobId will not be re-queued
  *   - Status updates written back to Firestore on success/failure
+ *
+ * Transport order :
+ *   1. SMS Gateway for Android™ (Z Fold2) si OFFLINE_SMS_PROVIDER=sms_gateway (défaut)
+ *   2. Infobip si OFFLINE_SMS_PROVIDER=infobip OU si Gateway non configuré
+ *   3. Fallback Infobip si OFFLINE_SMS_FALLBACK_TO_INFOBIP=true
  *
  * If Redis is unavailable → jobs execute inline (queueService fallback).
  *
@@ -31,8 +36,42 @@ function getDb() {
   } catch (_) { return null; }
 }
 
+function getSmsGateway() {
+  try { return require('./smsGateway'); } catch (_) { return null; }
+}
+
 function getInfobip() {
   try { return require('./infobip'); } catch (_) { return null; }
+}
+
+/* ── Transport selector ─────────────────────────────────────── */
+/**
+ * Sélectionne le bon transport pour le retry SMS.
+ * Même logique que messageRouter.js : Gateway d'abord, Infobip en standby.
+ *
+ * @returns {{ provider: string, send: Function }|null}
+ */
+function selectTransport() {
+  const smsGateway = getSmsGateway();
+  const infobip    = getInfobip();
+
+  // SMS Gateway en premier si configuré et actif
+  if (smsGateway && smsGateway.isSmsGatewayProvider() && smsGateway.isConfigured()) {
+    return {
+      provider: 'sms_gateway',
+      send    : (opts) => smsGateway.sendSMS(opts),
+    };
+  }
+
+  // Infobip en standby si configuré
+  if (infobip && infobip.isConfigured()) {
+    return {
+      provider: 'infobip',
+      send    : ({ to, text }) => infobip.sendSMS({ to, text }),
+    };
+  }
+
+  return null;
 }
 
 /* ── Job processor ──────────────────────────────────────────── */
@@ -44,33 +83,74 @@ async function processSmsJob(job) {
   const { to, text, messageId, conversationId, ownerUid } = job.data;
 
   logger.info('[SmsWorker] Processing SMS job', {
-    jobId: job.id,
-    to: to ? to.replace(/\d{4}$/, '****') : null,
+    jobId  : job.id,
+    to     : to ? to.replace(/\d{4}$/, '****') : null,
     messageId,
     attempt: job.attemptsMade,
   });
 
-  const infobip = getInfobip();
-  if (!infobip || !infobip.isConfigured()) {
-    logger.warn('[SmsWorker] Infobip not configured — job skipped', { jobId: job.id });
-    // Don't throw — don't fill retry queue if Infobip simply isn't set up
-    return { skipped: true, reason: 'infobip_not_configured' };
+  const transport = selectTransport();
+
+  if (!transport) {
+    logger.warn('[SmsWorker] Aucun transport SMS configuré — job ignoré', {
+      jobId: job.id,
+      hint : 'Configurer SMS_GATEWAY_LOGIN + SMS_GATEWAY_PASSWORD (transport principal) ou INFOBIP_API_KEY + INFOBIP_BASE_URL (standby)',
+    });
+    // Ne pas jeter — éviter de remplir la queue si aucun provider n'est configuré
+    return { skipped: true, reason: 'no_transport_configured' };
   }
+
+  logger.info('[SmsWorker] Using transport', { provider: transport.provider, jobId: job.id });
 
   let result;
   try {
-    result = await infobip.sendSMS({ to, text });
+    result = await transport.send({
+      to,
+      text,
+      messageId: messageId || null,
+      ttl      : 3600,
+    });
   } catch (err) {
-    logger.error('[SmsWorker] infobip.sendSMS threw', { jobId: job.id, error: err.message });
+    logger.error('[SmsWorker] transport.send threw', {
+      jobId   : job.id,
+      provider: transport.provider,
+      error   : err.message,
+    });
     throw err; // BullMQ will retry
+  }
+
+  // Si le transport principal (Gateway) échoue ET fallback Infobip activé
+  if (!result.success && transport.provider === 'sms_gateway') {
+    const smsGateway = getSmsGateway();
+    const infobip    = getInfobip();
+    if (smsGateway && smsGateway.isInfobipFallbackEnabled() && infobip && infobip.isConfigured()) {
+      logger.warn('[SmsWorker] Gateway failed — tentative Infobip fallback', {
+        jobId: job.id,
+        error: result.error,
+      });
+      try {
+        const fallback = await infobip.sendSMS({ to, text });
+        if (fallback.success) {
+          result = { ...fallback, provider: 'infobip_fallback' };
+          logger.info('[SmsWorker] Infobip fallback réussi', { jobId: job.id });
+        }
+      } catch (fbErr) {
+        logger.warn('[SmsWorker] Infobip fallback threw', { error: fbErr.message });
+      }
+    }
   }
 
   const db = getDb();
 
   if (result.success) {
+    const providerMsgId = result.messageId || result.gatewayMessageId || null;
+
     logger.info('[SmsWorker] SMS sent successfully', {
-      jobId: job.id, messageId, to: to.replace(/\d{4}$/, '****'),
-      smsMessageId: result.messageId,
+      jobId      : job.id,
+      messageId,
+      to         : to.replace(/\d{4}$/, '****'),
+      provider   : result.provider || transport.provider,
+      providerMsgId,
     });
 
     // Update Firestore message status
@@ -78,8 +158,9 @@ async function processSmsJob(job) {
       try {
         await db.collection('messages').doc(messageId).update({
           status      : 'sent',
-          smsMessageId: result.messageId || null,
-          smsStatus   : result.status    || 'SENT',
+          smsMessageId: providerMsgId,
+          smsProvider : result.provider || transport.provider,
+          smsStatus   : result.state || result.status || 'SENT',
           updatedAt   : new Date().toISOString(),
         });
       } catch (dbErr) {
@@ -87,13 +168,16 @@ async function processSmsJob(job) {
       }
     }
 
-    return { success: true, smsMessageId: result.messageId };
+    return { success: true, smsMessageId: providerMsgId, provider: result.provider || transport.provider };
   }
 
   // SMS failed
   logger.error('[SmsWorker] SMS send failed', {
-    jobId: job.id, messageId,
-    error: result.error, statusCode: result.statusCode,
+    jobId     : job.id,
+    messageId,
+    provider  : transport.provider,
+    error     : result.error,
+    statusCode: result.statusCode,
   });
 
   // Update Firestore message as failed on last attempt
@@ -110,7 +194,7 @@ async function processSmsJob(job) {
   }
 
   // Throw to trigger BullMQ retry
-  throw new Error(result.error || 'Infobip SMS send failed');
+  throw new Error(result.error || `SMS send failed via ${transport.provider}`);
 }
 
 /* ── Public API ─────────────────────────────────────────────── */
