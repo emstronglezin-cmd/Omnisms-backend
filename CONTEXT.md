@@ -1,7 +1,7 @@
 # OmniSMS — Architecture et Contexte Technique
 
-**Version**: 4.4.0  
-**Date mise à jour**: 2026-09-07  
+**Version**: 4.5.0  
+**Date mise à jour**: 2026-09-11  
 **Backend URL**: https://omnisms-backend.onrender.com
 
 ---
@@ -10,11 +10,11 @@
 
 OmniSMS est une plateforme de messagerie hybride permettant :
 - La messagerie **en temps réel** entre utilisateurs OmniSMS (mode Online, Socket.IO)
-- La messagerie **SMS classique** vers/depuis des numéros non-inscrits (mode Offline, **SMS Gateway Z Fold2**)
+- La messagerie **SMS classique** vers/depuis des numéros non-inscrits (mode Offline, **INfiniReach Z Fold2**)
 - La **transcription audio** (Groq Whisper)
 - Les **paiements** Premium (LeekPay Mobile Money)
 
-**Transport Offline par défaut** : **SMS Gateway for Android™** (sms-gate.app, capcom6) installé sur Samsung Z Fold2  
+**Transport Offline par défaut** : **INfiniReach** (https://api.infinireach.io) installé sur Samsung Z Fold2  
 **Transport Offline en standby** : Infobip (conservé, configurable via `OFFLINE_SMS_PROVIDER`)
 
 ---
@@ -51,14 +51,16 @@ OmniSMS est une plateforme de messagerie hybride permettant :
 │        │                    services/smsGateway.js  services/infobip.js
 │        │                               │            │               │
 │        │                               ▼            ▼               │
-│        │                    api.sms-gate.app   api.infobip.com      │
+│        │                    api.infinireach.io  api.infobip.com      │
+│        │                    POST /api/v1/messages                   │
+│        │                    X-API-Key: ${INFINIREACH_API_KEY}        │
 │        │                               │                            │
 │        │                          Samsung Z Fold2                   │
 │        │                               │                            │
 │        │                              SIM → réseau SMS              │
 │        │                                                            │
 │  routes/sms.gateway.inbound.js  ◀── POST /api/webhooks/sms-gateway/inbound
-│    (webhook SMS entrant Z Fold2 + déduplication HMAC)               │
+│    (webhook SMS entrant INfiniReach + déduplication)                 │
 │                                                                      │
 │  routes/infobip.inbound.js ◀── (EN STANDBY)                         │
 │    POST /api/webhooks/infobip/inbound (conservé, non supprimé)      │
@@ -71,8 +73,8 @@ OmniSMS est une plateforme de messagerie hybride permettant :
 └──────────────────────────────────────────────────────────────────────┘
             │                    │
             ▼                    ▼
-     Google Firestore     SMS Gateway Cloud API
-     (persistence)        api.sms-gate.app/3rdparty/v1
+     Google Firestore     INfiniReach Cloud API
+     (persistence)        api.infinireach.io
 ```
 
 ---
@@ -89,7 +91,7 @@ OmniSMS user A → `POST /api/messages/send` → `messageRouter.routeMessage()` 
 
 ---
 
-## 4. Mode Offline (OmniSMS ↔ SMS externe) — Transport SMS Gateway Z Fold2
+## 4. Mode Offline (OmniSMS ↔ SMS externe) — Transport INfiniReach Z Fold2
 
 ### 4.1 Flux sortant (OmniSMS → numéro externe)
 
@@ -103,10 +105,17 @@ messageRouter.routeMessage()
    ↓ db.collection('messages').add({ channel: 'sms', status: 'pending' })
    ↓ selectTransport() → { provider: 'sms_gateway', send: smsGateway.sendSMS }
    ↓ smsGateway.sendSMS({ to, text: "[OmniSMS] Nom : contenu", messageId })
-     → POST https://api.sms-gate.app/3rdparty/v1/messages
-     → Authorization: Basic base64(SMS_GATEWAY_LOGIN:SMS_GATEWAY_PASSWORD)
-     → Body: { textMessage: { text }, phoneNumbers: [to], deviceId, simNumber }
-     → Réponse 202: { id: "gw-xxx", state: "Pending" }
+     → POST https://api.infinireach.io/api/v1/messages
+     → X-API-Key: ${INFINIREACH_API_KEY}
+     → Content-Type: application/json
+     → Body: {
+         "to"         : "+22670000000",
+         "message"    : "[OmniSMS] Alice : Bonjour!",
+         "from"       : "${INFINIREACH_FROM_NUMBER}",   // numéro SIM Z Fold2, obligatoire
+         "channel"    : "sms",
+         "externalId" : "omnisms-{messageId}"           // idempotence
+       }
+     → Réponse 200/201/202: { id: "ir-xxx", status: "queued"|"sent" }
    ↓ succès → update status='sent', smsMessageId=gatewayMessageId, smsProvider='sms_gateway'
    ↓ échec → enqueueSmsJob() → BullMQ retry 3×, backoff exponentiel 3s/9s/27s
    ↓ [si OFFLINE_SMS_FALLBACK_TO_INFOBIP=true] → fallback Infobip avant retry queue
@@ -122,8 +131,8 @@ retour: { route: 'SMS_EXTERNE', transport: 'sms_gateway', conversationId, messag
 
 ```javascript
 // Dans messageRouter.js et smsQueueWorker.js
-if (OFFLINE_SMS_PROVIDER === 'sms_gateway' && SMS_GATEWAY_LOGIN && SMS_GATEWAY_PASSWORD) {
-  transport = 'sms_gateway'   // → smsGateway.sendSMS()
+if (OFFLINE_SMS_PROVIDER === 'sms_gateway' && INFINIREACH_API_KEY && INFINIREACH_FROM_NUMBER) {
+  transport = 'sms_gateway'   // → smsGateway.sendSMS() via INfiniReach
 } else if (INFOBIP_API_KEY && INFOBIP_BASE_URL) {
   transport = 'infobip'       // → infobip.sendSMS() (standby)
 }
@@ -134,115 +143,130 @@ if (OFFLINE_SMS_PROVIDER === 'sms_gateway' && SMS_GATEWAY_LOGIN && SMS_GATEWAY_P
 ```
 numéro externe
    ↓ SMS → SIM dans Samsung Z Fold2
-   ↓ SMS Gateway for Android™ détecte le SMS entrant
+   ↓ App INfiniReach détecte le SMS entrant
    ↓ POST https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/inbound
-     Headers: X-Timestamp: epoch_ms, X-Signature: HMAC-SHA256(rawBody+X-Timestamp, signingKey)
+     Headers: [X-Signature optionnel si INFINIREACH_WEBHOOK_SECRET configuré]
      Body: {
-       deviceId: "zfold2-xxx",
-       event: "sms:received",
-       id: "Ey6ECg...",          ← eventId pour déduplication
-       webhookId: "LreFUt...",
-       payload: {
-         messageId: "abc123",
-         message: "Bonjour!",
-         sender: "+22670000000",
-         recipient: "+22600000000",
-         simNumber: 1,
-         receivedAt: "2024-06-22T..."
+       "event"     : "message.inbound",
+       "timestamp" : "2024-06-22T15:46:11.000Z",
+       "data"      : {
+         "messageId" : "ir-msg-abc123",        ← clé de déduplication
+         "direction" : "inbound",
+         "from"      : "+22670000000",          ← expéditeur
+         "to"        : "+22600000000",          ← numéro SIM Z Fold2
+         "body"      : "Bonjour!",             ← texte
+         "deviceId"  : "zfold2-xxx",
+         "timestamp" : "2024-06-22T15:46:11.000Z",
+         "status"    : "delivered"
        }
      }
+
 routes/sms.gateway.inbound.js
-   ↓ 1. validateWebhookSignature() → HMAC-SHA256(rawBody+X-Timestamp, SMS_GATEWAY_WEBHOOK_SECRET)
-       Anti-replay: |now - X-Timestamp| < 5 min
-       Si SMS_GATEWAY_REQUIRE_SIGNATURE=false → lax mode (non bloquant si signature absente)
-   ↓ 2. Réponse 200 immédiate (empêche les retries Gateway)
-   ↓ 3. Async: isAlreadyProcessed(eventId) → skip si doublon
-       Redis SETNX TTL 24h OU Map mémoire (omnisms:gateway:dedup:{eventId})
-   ↓ 4. event === 'sms:received' ou 'sms:batch:received' → traitement inbound
-   ↓ 5. findExternalConvByPhone(sender) → ownerUid depuis external_conversations
-       OU parseHashPrefix(message) → ownerUid si SMS préfixé '#'
-       OU resolveUserByPhone(recipient) → ownerUid depuis numéro SIM
-   ↓ 6. getOrCreateExternalConv(db, ownerUid, senderE164)
-   ↓ 7. db.collection('messages').add({
+   ↓ 1. validateWebhookSignature() → HMAC-SHA256 si INFINIREACH_WEBHOOK_SECRET configuré
+       Sans secret → mode permissif (accepte tout — cas initial INfiniReach)
+   ↓ 2. Réponse 200 immédiate (empêche les retries INfiniReach)
+   ↓ 3. Async: isAlreadyProcessed(data.messageId) → skip si doublon
+       Redis SETNX TTL 24h OU Map mémoire (omnisms:gateway:dedup:{messageId})
+   ↓ 4. event === 'message.inbound' → traitement inbound complet
+   ↓ 5. Mapping INfiniReach → OmniSMS :
+       data.messageId  → smsMessageId (dédup)
+       data.from       → expéditeur, normalisé E.164
+       data.to         → destinataire = numéro SIM
+       data.body       → texte SMS
+       data.deviceId   → deviceId
+       data.timestamp  → createdAt
+   ↓ 6. findExternalConvByPhone(sender) → ownerUid depuis external_conversations
+       OU parseHashPrefix(body) → ownerUid si SMS préfixé '#'
+       OU resolveUserByPhone(to) → ownerUid depuis numéro SIM
+   ↓ 7. getOrCreateExternalConv(db, ownerUid, senderE164)
+   ↓ 8. db.collection('messages').add({
          direction: 'inbound', channel: 'sms',
-         smsProvider: 'sms_gateway', deviceId, simNumber
+         smsProvider: 'sms_gateway', deviceId
        })
-   ↓ 8. emitToUser(ownerUid, 'message:receive', payload)
+   ↓ 9. emitToUser(ownerUid, 'message:receive', payload)
        Si ownerUid offline → message en Firestore, récupéré à la reconnexion
 
-   Autres events traités:
-   ↓ 'sms:sent' / 'sms:delivered' / 'sms:failed' / 'sms:cancelled'
-       → updateDeliveryStatus(gatewayMessageId, status)
+   Events DLR traités :
+   ↓ 'message.sent'      → updateDeliveryStatus(data, db) → status='sent'
+   ↓ 'message.delivered' → updateDeliveryStatus(data, db) → status='delivered'
+   ↓ 'message.failed'    → updateDeliveryStatus(data, db) → status='failed'
 ```
 
-**Déduplication** : clé `omnisms:gateway:dedup:{eventId}` — Redis SETNX TTL 24h + Map mémoire fallback  
-**Retry Gateway** : jusqu'à 14 retries avec backoff exponentiel (départ 10s) → déduplication critique
+**Déduplication** : clé `omnisms:gateway:dedup:{data.messageId}` — Redis SETNX TTL 24h + Map mémoire fallback  
+**Retry INfiniReach** : plusieurs retries possibles → déduplication par `data.messageId` critique
 
 ---
 
-## 5. SMS Gateway for Android™ — API
+## 5. INfiniReach — API
 
-**Application** : SMS Gateway for Android™ par capcom6  
-**GitHub** : https://github.com/capcom6/android-sms-gateway  
-**Docs API** : https://docs.sms-gate.app  
-**Cloud API URL** : `https://api.sms-gate.app/3rdparty/v1`  
-**Compatibilité Render** : ✅ accessible depuis internet (cloud API)
+**Fournisseur** : INfiniReach  
+**App Z Fold2** : Application Android INfiniReach (Z Fold2 enregistré et connecté)  
+**API URL** : `https://api.infinireach.io`  
+**Compatibilité Render** : ✅ accessible depuis internet
 
 ### Authentification
 ```
-Authorization: Basic base64(SMS_GATEWAY_LOGIN:SMS_GATEWAY_PASSWORD)
+X-API-Key: ${INFINIREACH_API_KEY}
+Content-Type: application/json
 ```
 
 ### Envoi SMS
 ```
-POST /3rdparty/v1/messages
+POST https://api.infinireach.io/api/v1/messages
+X-API-Key: ${INFINIREACH_API_KEY}
 Content-Type: application/json
-Authorization: Basic ...
 
 {
-  "textMessage": { "text": "[OmniSMS] Alice : Bonjour!" },
-  "phoneNumbers": ["+22670000000"],
-  "deviceId": "zfold2-device-id",    // SMS_GATEWAY_DEVICE_ID
-  "simNumber": 1,                     // SMS_GATEWAY_SIM_NUMBER
-  "ttl": 3600,
-  "id": "omnisms-msg-xxx"             // idempotence
+  "to"         : "+22670000000",
+  "message"    : "[OmniSMS] Alice : Bonjour!",
+  "from"       : "${INFINIREACH_FROM_NUMBER}",   // numéro SIM Z Fold2, OBLIGATOIRE
+  "channel"    : "sms",
+  "externalId" : "omnisms-msg-xxx"               // idempotence
 }
 
-→ 202 Accepted: { "id": "gw-xxx", "state": "Pending" }
+→ 200/201/202: { "id": "ir-xxx", "status": "queued"|"sent", ... }
 ```
 
 ### Statut message
 ```
-GET /3rdparty/v1/messages/{id}
-→ { "id": "gw-xxx", "state": "Sent"|"Delivered"|"Failed" }
+GET https://api.infinireach.io/api/v1/messages/{id}
+X-API-Key: ${INFINIREACH_API_KEY}
+→ { "id": "ir-xxx", "status": "sent"|"delivered"|"failed" }
 ```
 
-### Webhook entrant (sms:received)
+### Webhook entrant (message.inbound)
 ```
 POST {BACKEND_URL}/api/webhooks/sms-gateway/inbound
-X-Timestamp: 1719059123456
-X-Signature: sha256=abc...
+[X-Signature: optionnel si INFINIREACH_WEBHOOK_SECRET configuré]
 
 {
-  "deviceId": "...",
-  "event": "sms:received",
-  "id": "Ey6ECg...",
-  "webhookId": "LreFUt...",
-  "payload": {
-    "messageId": "abc123",
-    "message": "Bonjour!",
-    "sender": "+22670000000",
-    "recipient": "+22600000000",
-    "simNumber": 1,
-    "receivedAt": "2024-06-22T14:30:00Z"
+  "event"     : "message.inbound",
+  "timestamp" : "2024-06-22T15:46:11.000Z",
+  "data"      : {
+    "messageId" : "ir-msg-abc123",
+    "direction" : "inbound",
+    "from"      : "+22670000000",
+    "to"        : "+22600000000",
+    "body"      : "Bonjour!",
+    "deviceId"  : "zfold2-xxx",
+    "timestamp" : "2024-06-22T15:46:11.000Z",
+    "status"    : "delivered"
   }
 }
 ```
 
-### Signature HMAC
+### Events DLR (statuts sortants)
 ```
-X-Signature = HMAC-SHA256(rawBody + X-Timestamp, SMS_GATEWAY_WEBHOOK_SECRET)
-Anti-replay : |Date.now() - X-Timestamp| < 300 000 ms (5 min)
+message.sent      → { data: { messageId, status: "sent", timestamp } }
+message.delivered → { data: { messageId, status: "delivered", timestamp } }
+message.failed    → { data: { messageId, status: "failed", reason } }
+```
+
+### Signature webhook (optionnelle)
+```
+INFINIREACH_WEBHOOK_SECRET vide = mode permissif (aucune validation)
+INFINIREACH_WEBHOOK_SECRET défini = HMAC-SHA256(rawBody, secret)
+Header attendu : X-Signature ou X-Infinireach-Signature
 ```
 
 ---
@@ -254,7 +278,7 @@ Anti-replay : |Date.now() - X-Timestamp| < 300 000 ms (5 min)
 | Destinataire | Route | Transport | Action |
 |---|---|---|---|
 | UID OmniSMS connu | `OMNISMS` | — | Firestore + Socket.IO |
-| Numéro non trouvé dans OmniSMS | `SMS_EXTERNE` | `sms_gateway` (défaut) | Firestore + SMS Gateway Z Fold2 |
+| Numéro non trouvé dans OmniSMS | `SMS_EXTERNE` | `sms_gateway` (défaut) | Firestore + INfiniReach Z Fold2 |
 | Numéro non trouvé (si sms_gateway non dispo) | `SMS_EXTERNE` | `infobip` (standby) | Firestore + Infobip API |
 
 **Retour routeMessage()** :
@@ -290,8 +314,8 @@ function selectTransport() {
 }
 ```
 
-**Fallback Gateway → Infobip** (si `OFFLINE_SMS_FALLBACK_TO_INFOBIP=true`) :
-- Si Gateway échoue → tente Infobip immédiatement avant d'entrer en queue BullMQ
+**Fallback INfiniReach → Infobip** (si `OFFLINE_SMS_FALLBACK_TO_INFOBIP=true`) :
+- Si INfiniReach échoue → tente Infobip immédiatement avant d'entrer en queue BullMQ
 
 **Déduplication inbound** :
 - Redis SETNX avec TTL 24h (si Redis disponible)
@@ -319,7 +343,7 @@ function selectTransport() {
   updatedAt         : ISO8601,
   lastMessageAt     : ISO8601,
   lastMessage       : "...",
-  providerMessageIds: [],  // IDs Gateway/Infobip pour DLR
+  providerMessageIds: [],  // IDs INfiniReach/Infobip pour DLR
 }
 ```
 
@@ -334,10 +358,9 @@ function selectTransport() {
   channel       : "sms" | "app",
   direction     : "inbound" | "outbound" | null,
   status        : "pending" | "sent" | "delivered" | "failed",
-  smsMessageId  : "gw-xxx" | "infobip-id" | null,
-  smsProvider   : "sms_gateway" | "infobip" | null,   // NOUVEAU — quel transport
-  deviceId      : "zfold2-xxx" | null,                // NOUVEAU — device SMS Gateway
-  simNumber     : 1 | null,                           // NOUVEAU — SIM utilisée
+  smsMessageId  : "ir-xxx" | "infobip-id" | null,
+  smsProvider   : "sms_gateway" | "infobip" | null,   // transport utilisé
+  deviceId      : "zfold2-xxx" | null,                // device INfiniReach
   createdAt     : ISO8601,
 }
 ```
@@ -364,8 +387,8 @@ Permet à des utilisateurs **sans smartphone** d'utiliser OmniSMS via SMS USSD :
 | POST | `/api/messages/send` | Firebase JWT | Envoyer message (Online ou Offline) |
 | GET | `/api/messages` | Firebase JWT | Lister conversations (OmniSMS + SMS) |
 | GET | `/api/messages/:convId` | Firebase JWT | Historique conversation |
-| POST | `/api/webhooks/sms-gateway/inbound` | HMAC opt. | **SMS entrant Z Fold2 (principal)** |
-| GET | `/api/webhooks/sms-gateway/status` | Aucune | Statut webhook SMS Gateway |
+| POST | `/api/webhooks/sms-gateway/inbound` | HMAC opt. | **SMS entrant Z Fold2 INfiniReach (principal)** |
+| GET | `/api/webhooks/sms-gateway/status` | Aucune | Statut webhook + guide config INfiniReach |
 | POST | `/api/webhooks/infobip/inbound` | HMAC opt. | SMS entrant Infobip (standby) |
 | GET | `/api/webhooks/infobip/inbound/status` | Aucune | Statut webhook Infobip |
 | POST | `/api/sms/send` | Firebase JWT | SMS direct via Infobip |
@@ -376,19 +399,18 @@ Permet à des utilisateurs **sans smartphone** d'utiliser OmniSMS via SMS USSD :
 
 ## 11. Variables d'environnement (Render)
 
-### SMS Gateway Z Fold2 (Transport principal Offline)
+### INfiniReach Z Fold2 (Transport principal Offline)
 
 | Variable | Requis | Défaut | Description |
 |---|---|---|---|
-| `SMS_GATEWAY_LOGIN` | **OUI** | — | Login compte sms-gate.app |
-| `SMS_GATEWAY_PASSWORD` | **OUI** | — | Mot de passe compte sms-gate.app |
-| `SMS_GATEWAY_DEVICE_ID` | recommandé | — | Device ID du Z Fold2 (depuis l'app) |
-| `SMS_GATEWAY_API_URL` | non | `https://api.sms-gate.app/3rdparty/v1` | URL API cloud |
-| `SMS_GATEWAY_WEBHOOK_SECRET` | recommandé | — | Clé HMAC pour valider les webhooks |
-| `SMS_GATEWAY_SIM_NUMBER` | non | `1` | Numéro de SIM à utiliser sur le Z Fold2 |
-| `SMS_GATEWAY_REQUIRE_SIGNATURE` | non | `false` | Bloquer si signature HMAC absente/invalide |
-| `OFFLINE_SMS_PROVIDER` | non | `sms_gateway` | `sms_gateway` ou `infobip` |
-| `OFFLINE_SMS_FALLBACK_TO_INFOBIP` | non | `false` | Fallback automatique sur Infobip si Gateway échoue |
+| `INFINIREACH_API_KEY` | **OUI** | — | Clé API INfiniReach |
+| `INFINIREACH_FROM_NUMBER` | **OUI** | — | Numéro SIM du Z Fold2 (champ "from", E.164, ex: +22600000000) |
+| `INFINIREACH_API_URL` | non | `https://api.infinireach.io` | URL de base API INfiniReach |
+| `INFINIREACH_ENABLED` | non | `true` | Activer/désactiver le transport INfiniReach |
+| `INFINIREACH_WEBHOOK_SECRET` | non | `''` | HMAC secret webhook (vide = mode permissif) |
+| `INFINIREACH_REQUIRE_SIGNATURE` | non | `false` | Bloquer si signature HMAC absente/invalide |
+| `OFFLINE_SMS_PROVIDER` | non | `sms_gateway` | `sms_gateway` (INfiniReach) ou `infobip` |
+| `OFFLINE_SMS_FALLBACK_TO_INFOBIP` | non | `false` | Fallback automatique sur Infobip si INfiniReach échoue |
 
 ### Infobip (Transport Offline EN STANDBY)
 
@@ -411,24 +433,25 @@ Permet à des utilisateurs **sans smartphone** d'utiliser OmniSMS via SMS USSD :
 
 ---
 
-## 12. Configuration Z Fold2 (actions utilisateur)
+## 12. Configuration Z Fold2 INfiniReach (actions utilisateur)
 
-### Dans l'application SMS Gateway for Android™
+### Dans l'application INfiniReach sur Z Fold2
 
-1. **Créer un compte** sur https://sms-gate.app → noter `Login` et `Password`
-2. **Connecter le Z Fold2** → noter le `Device ID` affiché dans l'app
-3. **Configurer le webhook** dans Settings → Webhooks :
+1. **Installer** l'application INfiniReach sur le Z Fold2
+2. **Se connecter** et enregistrer le device — noter les identifiants
+3. **Configurer le webhook** dans l'app INfiniReach :
    - URL : `https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/inbound`
-   - Events : `sms:received` (et optionnellement `sms:sent`, `sms:delivered`, `sms:failed`)
-   - Signing Key : générer une clé → copier dans `SMS_GATEWAY_WEBHOOK_SECRET`
+   - Event : `message.inbound` (et optionnellement `message.delivered`, `message.failed`)
 
 ### Dans Render (variables d'environnement)
 
 ```
-SMS_GATEWAY_LOGIN=votre_login
-SMS_GATEWAY_PASSWORD=votre_password
-SMS_GATEWAY_DEVICE_ID=votre_device_id_zfold2
-SMS_GATEWAY_WEBHOOK_SECRET=votre_signing_key_hmac
+INFINIREACH_API_KEY=votre_cle_api_infinireach
+INFINIREACH_FROM_NUMBER=+226xxxxxxxx       # numéro SIM Z Fold2 en E.164
+INFINIREACH_API_URL=https://api.infinireach.io
+INFINIREACH_ENABLED=true
+INFINIREACH_WEBHOOK_SECRET=               # vide pour premier test
+INFINIREACH_REQUIRE_SIGNATURE=false
 OFFLINE_SMS_PROVIDER=sms_gateway
 ```
 
@@ -439,9 +462,10 @@ OFFLINE_SMS_PROVIDER=sms_gateway
 1. **Ne pas toucher au système de paiement** (`routes/payment.leekpay.js`, `services/leekpay.js`)
 2. **Ne pas casser le mode Online** (`makeConversationId`, `routeMessage` branche OMNISMS)
 3. **Ne pas réécrire ce qui fonctionne** — étendre, corriger, compléter
-4. **Toujours utiliser `process.env` pour les secrets** — jamais de hardcode
-5. **Valider les webhooks** avec HMAC si `SMS_GATEWAY_WEBHOOK_SECRET` configuré
-6. **Déduplication systématique** des webhooks entrants (Redis ou Map mémoire)
+4. **Toujours utiliser `process.env` pour les secrets** — jamais de hardcode, ne jamais logger `INFINIREACH_API_KEY`
+5. **Valider les webhooks** avec HMAC si `INFINIREACH_WEBHOOK_SECRET` configuré
+6. **Déduplication systématique** des webhooks entrants par `data.messageId` (Redis ou Map mémoire)
 7. **Normaliser les numéros** via `phoneNormalizer.normalizePhone()` systématiquement
 8. **Ne pas supprimer Infobip** — conserver en standby, activable via `OFFLINE_SMS_PROVIDER=infobip`
 9. **Ne pas inventer d'API** — utiliser uniquement les endpoints documentés officiellement
+10. **`smsProvider` = 'sms_gateway'** pour tous les messages INfiniReach (rétrocompatibilité Firestore)

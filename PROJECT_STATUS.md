@@ -1,7 +1,7 @@
 # OmniSMS Backend — Statut du Projet
 
-**Version**: 4.4.0  
-**Date**: 2026-09-07  
+**Version**: 4.5.0  
+**Date**: 2026-09-11  
 **Environnement**: Production (Render)  
 **URL**: https://omnisms-backend.onrender.com
 
@@ -13,9 +13,9 @@
 
 Le mode Online est complet et fonctionnel. Ne pas modifier.
 
-### Mode Offline (OmniSMS ↔ SMS) : ✅ OPÉRATIONNEL via SMS Gateway Z Fold2
+### Mode Offline (OmniSMS ↔ SMS) : ✅ OPÉRATIONNEL via INfiniReach Z Fold2
 
-L'architecture Offline utilise désormais **SMS Gateway for Android™** (sms-gate.app) sur Samsung Z Fold2 comme transport principal. Infobip est conservé en standby configurable.
+L'architecture Offline utilise désormais **INfiniReach** (https://api.infinireach.io) sur Samsung Z Fold2 comme transport principal. Infobip est conservé en standby configurable.
 
 **Blockers techniques** : aucun côté backend — configuration utilisateur requise (voir section 5).
 
@@ -30,10 +30,10 @@ L'architecture Offline utilise désormais **SMS Gateway for Android™** (sms-ga
 | API Messages (`/api/messages`) | ✅ OK | Online + Offline |
 | Auth Firebase | ✅ OK | JWT + Firebase ID Token |
 | Socket.IO | ✅ OK | `message:receive`, `sms:inbound`, `sms:delivery` |
-| **SMS Gateway sortant** | ✅ NOUVEAU | `services/smsGateway.js` → `api.sms-gate.app` |
-| **SMS Gateway entrant (webhook)** | ✅ NOUVEAU | `POST /api/webhooks/sms-gateway/inbound` |
-| **Déduplication webhook Gateway** | ✅ NOUVEAU | HMAC + Redis SETNX + Map fallback |
-| **Transport agnostique (worker)** | ✅ NOUVEAU | `selectTransport()` dans smsQueueWorker |
+| **INfiniReach sortant** | ✅ MIGRÉ | `services/smsGateway.js` → `api.infinireach.io/api/v1/messages` |
+| **INfiniReach entrant (webhook)** | ✅ MIGRÉ | `POST /api/webhooks/sms-gateway/inbound` — payload `data.*` |
+| **Déduplication webhook INfiniReach** | ✅ OK | data.messageId → Redis SETNX + Map fallback |
+| **Transport agnostique (worker)** | ✅ OK | `selectTransport()` dans smsQueueWorker |
 | Infobip sortant | ✅ STANDBY | Si `OFFLINE_SMS_PROVIDER=infobip` |
 | Infobip entrant (webhook) | ✅ STANDBY | `/api/webhooks/infobip/inbound` (conservé) |
 | Déduplication webhook Infobip | ✅ OK | Redis SETNX + Map fallback |
@@ -47,66 +47,79 @@ L'architecture Offline utilise désormais **SMS Gateway for Android™** (sms-ga
 
 ---
 
-## 3. Implémentations Session 2026-09-07 (SMS Gateway Z Fold2)
+## 3. Implémentations Session 2026-09-11 (Migration INfiniReach)
 
-### Phase 3 — services/smsGateway.js (NOUVEAU)
+### Phase INfiniReach-1 — services/smsGateway.js (RÉÉCRIT)
 
-Service dédié pour SMS Gateway for Android™ (sms-gate.app, capcom6).
+Entièrement réécrit de sms-gate.app vers INfiniReach. Interface exportée **identique** — aucune modification de `messageRouter.js` ou `smsQueueWorker.js` nécessaire.
 
-**Exports** :
-- `isConfigured()` — vérifie `SMS_GATEWAY_LOGIN` + `SMS_GATEWAY_PASSWORD`
-- `isSmsGatewayProvider()` — vérifie `OFFLINE_SMS_PROVIDER === 'sms_gateway'`
-- `isInfobipFallbackEnabled()` — vérifie `OFFLINE_SMS_FALLBACK_TO_INFOBIP === 'true'`
-- `sendSMS({ to, text, messageId, ttl, withDeliveryReport })` — POST api.sms-gate.app/3rdparty/v1/messages
-- `validateWebhookSignature(req)` — HMAC-SHA256(rawBody + X-Timestamp, signingKey) + anti-replay 5 min
-- `getMessageStatus(gatewayMessageId)` — GET /3rdparty/v1/messages/{id}
-- `getStatus()` — objet de santé pour health check
+**Changements clés** :
+- **Auth** : `X-API-Key: ${INFINIREACH_API_KEY}` (était `Authorization: Basic base64(LOGIN:PASSWORD)`)
+- **Endpoint envoi** : `POST /api/v1/messages` (était `POST /messages` sms-gate.app)
+- **Payload** : `{to, message, from, channel:'sms', externalId}` (était `{textMessage, phoneNumbers, deviceId, simNumber}`)
+- **Champ `from` obligatoire** : `INFINIREACH_FROM_NUMBER` = numéro SIM Z Fold2
+- **Codes succès** : `200-299` (était `202` uniquement)
+- **Logs** : `[INfiniReach]` prefix
+- **Vars env** : `INFINIREACH_API_KEY`, `INFINIREACH_FROM_NUMBER`, `INFINIREACH_API_URL`, `INFINIREACH_ENABLED`
+- **Webhook secret** : `INFINIREACH_WEBHOOK_SECRET` (vide = mode permissif)
 
-**Auth** : `Authorization: Basic base64(LOGIN:PASSWORD)`
+**Exports conservés** :
+`isConfigured`, `isSmsGatewayProvider`, `isInfobipFallbackEnabled`, `getActiveProvider`, `sendSMS`, `getMessageStatus`, `validateWebhookSignature`, `getStatus`
 
-### Phase 4 — services/messageRouter.js (MODIFIÉ)
+### Phase INfiniReach-2 — routes/sms.gateway.inbound.js (ADAPTÉ)
 
-Section 3 (route Offline) refactorisée :
-- Avant : `route: 'INFOBIP'`, appel direct `infobip.sendSMS()`
-- Après : `route: 'SMS_EXTERNE'` avec `transport: 'sms_gateway'|'infobip'`
-- `selectTransport()` détermine le provider selon `OFFLINE_SMS_PROVIDER`
-- Support fallback Gateway → Infobip si `OFFLINE_SMS_FALLBACK_TO_INFOBIP=true`
-- Champ `smsProvider` ajouté dans Firestore
+Webhook entrant adapté du format sms-gate.app vers le format INfiniReach.
 
-### Phase 5 — services/smsQueueWorker.js (MODIFIÉ)
+**Mapping INfiniReach → interne OmniSMS** :
 
-Worker SMS rendu transport-agnostique :
-- Avant : appel hardcodé `getInfobip().sendSMS()`
-- Après : `selectTransport()` → `sms_gateway` ou `infobip` selon configuration
-- Support fallback Gateway → Infobip dans le worker
-- `smsProvider` mis à jour dans Firestore après envoi
+| INfiniReach (body.data.*) | Champ interne | Ancien (body.payload.*) |
+|---|---|---|
+| `data.messageId` | `smsMessageId` + clé dédup | `body.id \|\| payload.messageId` |
+| `data.from` | `senderId`, `from` | `payload.sender` |
+| `data.to` | `to` | `payload.recipient` |
+| `data.body` | `content` | `payload.message` |
+| `data.deviceId` | `deviceId` | `body.deviceId` |
+| `data.timestamp` | `createdAt` | `payload.receivedAt` |
 
-### Phase 6 — routes/sms.gateway.inbound.js (NOUVEAU)
+**Events dispatcher** :
 
-Webhook SMS entrant pour SMS Gateway Z Fold2 :
-- `POST /api/webhooks/sms-gateway/inbound` — handler principal
-- `GET /api/webhooks/sms-gateway/status` — health check + guide config
-- Signature HMAC avec anti-replay (±5 min)
-- Réponse 200 immédiate (évite les 14 retries Gateway)
-- Déduplication par `eventId` (Redis SETNX TTL 24h + Map)
-- Events traités : `sms:received`, `sms:batch:received`, `sms:sent`, `sms:delivered`, `sms:failed`
-- Champs ajoutés Firestore : `smsProvider`, `deviceId`, `simNumber`
+| INfiniReach event | Action | Ancien event |
+|---|---|---|
+| `message.inbound` | SMS entrant complet | `sms:received` |
+| `message.sent` | DLR envoi | `sms:sent` |
+| `message.delivered` | DLR livraison | `sms:delivered` |
+| `message.failed` | DLR échec | `sms:failed` |
 
-### Phase 6 — server.js (MODIFIÉ)
+**GET /api/webhooks/sms-gateway/status** : mis à jour avec guide config INfiniReach.
 
-```javascript
-// Nouveau :
-const smsGatewayInboundRoutes = require('./routes/sms.gateway.inbound');
-app.use('/api/webhooks', smsGatewayInboundRoutes);
-```
+### Phase INfiniReach-3 — .env.example (MIS À JOUR)
 
-### Phase 8 — .env.example (MODIFIÉ)
+Variables `SMS_GATEWAY_*` remplacées par `INFINIREACH_*` :
+- `INFINIREACH_API_KEY`, `INFINIREACH_FROM_NUMBER`, `INFINIREACH_API_URL`, `INFINIREACH_ENABLED`
+- `INFINIREACH_WEBHOOK_SECRET` (vide = permissif), `INFINIREACH_REQUIRE_SIGNATURE`
+- `OFFLINE_SMS_PROVIDER`, `OFFLINE_SMS_FALLBACK_TO_INFOBIP` conservés inchangés
+- Section Infobip conservée en standby
 
-9 nouvelles variables SMS Gateway ajoutées. Section Infobip relabellée "(EN STANDBY)".
+### Phase INfiniReach-4 — test/sms-gateway-tests.js (RÉÉCRIT)
 
-### Phase 9 — test/sms-gateway-tests.js (NOUVEAU)
+Suite de tests remplacée : 26 tests G1-G10 (sms-gate.app) → 33 tests A-E + régression G (INfiniReach).
 
-26 tests automatisés G1-G10. **26/26 PASS ✅**
+**Tests A-E nouveaux** :
+- **A (6 tests)** — Envoi SMS : URL `/api/v1/messages`, `X-API-Key`, `channel=sms`, `from`, `to`, `message`, `externalId`
+- **B (5 tests)** — Webhook entrant : payload `data.*` accepté, mapping correct, déduplication `data.messageId`
+- **C (6 tests)** — Erreurs : 401, 400, 429, 500, timeout, BullMQ throw
+- **D (4 tests)** — Online : aucun appel INfiniReach depuis mode Online, `isSmsGatewayProvider()`
+- **E (5 tests)** — Offline : `SMS_EXTERNE`, `processSmsJob`, retry BullMQ, fallback Infobip, standby
+
+**Régression G (7 tests)** : déduplication Redis, Firestore champs, `makeExternalConvId`, normalisation E.164, `makeConversationId`, Online isolation
+
+### Précédentes implémentations (Session 2026-09-07)
+
+- `services/smsGateway.js` — transport sms-gate.app (remplacé par INfiniReach)
+- `routes/sms.gateway.inbound.js` — webhook sms-gate.app (adapté INfiniReach)
+- `services/messageRouter.js` — route `SMS_EXTERNE` + `selectTransport()`
+- `services/smsQueueWorker.js` — `selectTransport()` transport-agnostique
+- `server.js` — enregistrement `smsGatewayInboundRoutes`
 
 ### Précédentes implémentations (Session 2026-09-05, commit 84c0ebd)
 
@@ -119,21 +132,17 @@ app.use('/api/webhooks', smsGatewayInboundRoutes);
 
 ## 4. Résultats de tests
 
-### Tests SMS Gateway (2026-09-07) — NOUVEAU
+### Tests INfiniReach (2026-09-11) — NOUVEAU
 
 ```
-26 PASS / 0 FAIL / 26 total ✅
+33 PASS / 0 FAIL / 33 total ✅
 
-── G1. Backend → SMS Gateway          : 3 PASS
-── G2. SMS Gateway accepte l'envoi   : 2 PASS
-── G3. Erreur Gateway (4xx/5xx)      : 2 PASS
-── G4. Timeout Gateway               : 2 PASS
-── G5. Retry BullMQ                  : 3 PASS
-── G6. Doublon webhook entrant       : 3 PASS
-── G7. SMS entrant → Firestore       : 2 PASS
-── G8. Rattachement conversation     : 3 PASS
-── G9. Normalisation E.164           : 3 PASS
-── G10. Online OmniSMS non impacté   : 3 PASS
+══ TEST A — Envoi SMS INfiniReach       : 6 PASS
+══ TEST B — Webhook entrant INfiniReach : 5 PASS
+══ TEST C — Erreurs API INfiniReach     : 6 PASS
+══ TEST D — Online — Isolation          : 4 PASS
+══ TEST E — Offline — Retry             : 5 PASS
+══ RÉGRESSION G — Interface + Routage  : 7 PASS
 ```
 
 ### Tests Offline SMS (2026-09-05) — Régression ✅
@@ -154,109 +163,108 @@ app.use('/api/webhooks', smsGatewayInboundRoutes);
 ── Bonus hybridSms.js                : 5 PASS
 ```
 
-**Total automatisé : 63/63 PASS ✅**
+**Total automatisé : 70/70 PASS ✅**
 
 ---
 
-## 5. Tests Hardware (non automatisables — nécessitent Z Fold2 + SIM)
+## 5. Tests Hardware (non automatisables — nécessitent Z Fold2 + SIM + INfiniReach)
 
 | ID | Test | Prérequis | Status |
 |---|---|---|---|
-| H-G1 | Z Fold2 connecté à sms-gate.app, SIM active | Z Fold2 + compte sms-gate.app | ⏳ UTILISATEUR |
-| H-G2 | Envoi SMS réel OmniSMS → numéro externe via Z Fold2 | H-G1 + vars Render configurées | ⏳ UTILISATEUR |
-| H-G3 | Réception SMS réel → apparition dans OmniSMS | H-G1 + webhook configuré | ⏳ UTILISATEUR |
-| H-G4 | Latence end-to-end mesurée | H-G2 + H-G3 | ⏳ UTILISATEUR |
-| H-G5 | DLR `sms:delivered` vérifié dans Firestore | H-G2 + webhook events | ⏳ UTILISATEUR |
+| H-A1 | Z Fold2 connecté à INfiniReach, SIM active | Z Fold2 + app INfiniReach | ⏳ UTILISATEUR |
+| H-A2 | Envoi SMS réel OmniSMS → numéro externe via Z Fold2 | H-A1 + vars Render configurées | ⏳ UTILISATEUR |
+| H-A3 | Réception SMS réel → apparition dans OmniSMS | H-A1 + webhook configuré | ⏳ UTILISATEUR |
+| H-A4 | Latence end-to-end mesurée | H-A2 + H-A3 | ⏳ UTILISATEUR |
+| H-A5 | DLR `message.delivered` vérifié dans Firestore | H-A2 + webhook DLR | ⏳ UTILISATEUR |
 
-**Procédure E2E complète** (voir CONTEXT.md section 12 pour la configuration détaillée) :
+**Procédure E2E complète** :
 
 ```
-1. App SMS Gateway → créer compte → noter Login/Password
-2. Connecter Z Fold2 → noter Device ID
+1. Installer l'app INfiniReach sur Z Fold2
+2. Se connecter — noter les identifiants (API Key)
 3. Configurer webhook dans l'app :
    URL = https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/inbound
-   Events = sms:received (+ autres optionnel)
-   Signing Key = générer → copier dans SMS_GATEWAY_WEBHOOK_SECRET
+   Event = message.inbound (+ optionnel: message.delivered, message.failed)
 4. Render → Environment Variables :
-   SMS_GATEWAY_LOGIN=...
-   SMS_GATEWAY_PASSWORD=...
-   SMS_GATEWAY_DEVICE_ID=...
-   SMS_GATEWAY_WEBHOOK_SECRET=...
+   INFINIREACH_API_KEY=...
+   INFINIREACH_FROM_NUMBER=+226xxxxxxxx   (numéro SIM Z Fold2 en E.164)
+   INFINIREACH_API_URL=https://api.infinireach.io
+   INFINIREACH_ENABLED=true
+   INFINIREACH_WEBHOOK_SECRET=             (vide pour premier test)
    OFFLINE_SMS_PROVIDER=sms_gateway
 5. Redéployer → GET /health → vérifier status
-6. Envoyer message depuis OmniSMS vers numéro externe → vérifier réception physique
-7. Envoyer SMS depuis téléphone externe vers SIM Z Fold2 → vérifier apparition dans OmniSMS
+6. GET /api/webhooks/sms-gateway/status → vérifier config INfiniReach
+7. Envoyer message depuis OmniSMS vers numéro externe → vérifier réception physique
+8. Envoyer SMS depuis téléphone externe vers SIM Z Fold2 → vérifier apparition dans OmniSMS
 ```
 
 ---
 
 ## 6. BLOCKERS
 
-### ✅ RÉSOLU — BLOCKER 1 : Intégration Z Fold2
+### ✅ RÉSOLU — BLOCKER 1 : Intégration Z Fold2 (SMS Gateway → INfiniReach)
 
-L'intégration du Samsung Z Fold2 comme transport SMS physique est **implémentée côté backend**.
-- ✅ `services/smsGateway.js` créé
-- ✅ `routes/sms.gateway.inbound.js` créé
-- ✅ `messageRouter.js` modifié (route `SMS_EXTERNE`)
-- ✅ `smsQueueWorker.js` modifié (`selectTransport()`)
+La migration du transport SMS Gateway (sms-gate.app) vers INfiniReach est **complète côté backend**.
+
+- ✅ `services/smsGateway.js` réécrit pour INfiniReach (X-API-Key, `/api/v1/messages`, `INFINIREACH_*` vars)
+- ✅ `routes/sms.gateway.inbound.js` adapté payload `data.*` + events `message.*`
+- ✅ `.env.example` mis à jour (INFINIREACH_* vars)
+- ✅ `test/sms-gateway-tests.js` réécrit — tests A-E INfiniReach — **33/33 PASS**
+- ✅ Régression `test/offline-sms-tests.js` — **37/37 PASS**
+- ✅ `CONTEXT.md` et `PROJECT_STATUS.md` mis à jour
 
 **Reste côté utilisateur** (non bloquant pour le backend) :
-- [ ] Configurer le webhook dans l'application SMS Gateway for Android™ sur le Z Fold2
+- [ ] Configurer le webhook dans l'application INfiniReach sur le Z Fold2
 - [ ] Renseigner les variables d'environnement dans Render
-- [ ] Effectuer les tests hardware H-G1 à H-G5
+- [ ] Effectuer les tests hardware H-A1 à H-A5
 
-### ⚠️ CONFIG REQUISE Render — Variables SMS Gateway
+### ⚠️ CONFIG REQUISE Render — Variables INfiniReach
 
 ```
-SMS_GATEWAY_LOGIN=votre_login_sms_gateway
-SMS_GATEWAY_PASSWORD=votre_password_sms_gateway
-SMS_GATEWAY_DEVICE_ID=votre_device_id_zfold2
-SMS_GATEWAY_WEBHOOK_SECRET=votre_signing_key_hmac
+INFINIREACH_API_KEY=votre_cle_api_infinireach
+INFINIREACH_FROM_NUMBER=+226xxxxxxxx
+INFINIREACH_API_URL=https://api.infinireach.io
+INFINIREACH_ENABLED=true
 OFFLINE_SMS_PROVIDER=sms_gateway
 ```
 
 ### ⚠️ CONFIG OPTIONNELLE mais recommandée
 
-- [ ] `REDIS_URL` → activer BullMQ (sinon les retry SMS s'exécutent en mode inline)
-- [ ] `SMS_GATEWAY_REQUIRE_SIGNATURE=true` → mode strict HMAC
-- [ ] `OFFLINE_SMS_FALLBACK_TO_INFOBIP=true` → fallback Infobip si Gateway indisponible
+- [ ] `REDIS_URL` → activer BullMQ (sinon retry SMS en mode inline)
+- [ ] `INFINIREACH_WEBHOOK_SECRET` → sécuriser les webhooks entrants (après validation initiale)
+- [ ] `INFINIREACH_REQUIRE_SIGNATURE=true` → mode strict HMAC
+- [ ] `OFFLINE_SMS_FALLBACK_TO_INFOBIP=true` → fallback Infobip si INfiniReach indisponible
 
 ---
 
 ## 7. Architecture des fichiers
 
-### Fichiers modifiés / créés (session 2026-09-07)
+### Fichiers modifiés / créés (session 2026-09-11 — Migration INfiniReach)
 
 | Fichier | Type | Description |
 |---|---|---|
-| `services/smsGateway.js` | **CRÉÉ** | Service SMS Gateway for Android™ — sendSMS, validateWebhookSignature, health |
-| `routes/sms.gateway.inbound.js` | **CRÉÉ** | Webhook entrant Z Fold2 — HMAC, dedup, sms:received, DLR |
-| `test/sms-gateway-tests.js` | **CRÉÉ** | 26 tests G1-G10 automatisés — 26/26 PASS |
-| `services/messageRouter.js` | **MODIFIÉ** | Offline route → `SMS_EXTERNE` + `selectTransport()` + fallback |
-| `services/smsQueueWorker.js` | **MODIFIÉ** | `selectTransport()` transport-agnostique + fallback Infobip |
-| `server.js` | **MODIFIÉ** | Import + registration `smsGatewayInboundRoutes` |
-| `.env.example` | **MODIFIÉ** | 9 nouvelles vars SMS Gateway + Infobip relabellé standby |
-| `routes/infobip.inbound.js` | **MODIFIÉ** | Résolution conflict merge (dedup + INFOBIP_REQUIRE_SIGNATURE) |
-| `CONTEXT.md` | **MIS À JOUR** | Architecture SMS Gateway, API, flux, vars env |
+| `services/smsGateway.js` | **RÉÉCRIT** | INfiniReach : X-API-Key, `/api/v1/messages`, INFINIREACH_* vars, même interface exportée |
+| `routes/sms.gateway.inbound.js` | **ADAPTÉ** | Payload `body.data.*`, events `message.inbound/sent/delivered/failed` |
+| `test/sms-gateway-tests.js` | **RÉÉCRIT** | 33 tests A-E + régression G — 33/33 PASS |
+| `.env.example` | **MIS À JOUR** | INFINIREACH_* vars, Infobip conservé en standby |
+| `CONTEXT.md` | **MIS À JOUR** | Architecture INfiniReach, flows, API, env vars |
 | `PROJECT_STATUS.md` | **MIS À JOUR** | Ce fichier |
 
-### Fichiers modifiés (session 2026-09-05, commit 84c0ebd)
+### Fichiers non modifiés (lecture seule — interface compatible)
 
-| Fichier | Type | Description |
+| Fichier | Rôle | Raison non-modification |
 |---|---|---|
-| `services/smsQueueWorker.js` | **CRÉÉ** | Worker BullMQ SMS retry + enqueueSmsJob() |
-| `routes/infobip.inbound.js` | **MODIFIÉ** | Déduplication isAlreadyProcessed() + getRedis() |
-| `services/messageRouter.js` | **MODIFIÉ** | Retry via enqueueSmsJob() si sendSMS échec |
-| `server.js` | **MODIFIÉ** | Démarrage SMS worker au boot |
-| `test/offline-sms-tests.js` | **CRÉÉ** | 37 tests A-J mode Offline |
-| `CONTEXT.md` | **CRÉÉ** | Architecture complète |
-| `PROJECT_STATUS.md` | **CRÉÉ** | Ce fichier |
+| `services/messageRouter.js` | Routing Online/Offline | `selectTransport()` utilise `smsGateway.isConfigured()` — interface inchangée |
+| `services/smsQueueWorker.js` | Worker BullMQ retry | `selectTransport()` utilise `smsGateway.sendSMS()` — interface inchangée |
+| `server.js` | Express app | Enregistrement `smsGatewayInboundRoutes` inchangé |
+| `test/offline-sms-tests.js` | Régression 37 tests | Toujours valide — 37/37 PASS |
 
 ### Fichiers non modifiés (fonctionnels, lecture seule)
 
 | Fichier | Rôle |
 |---|---|
 | `services/infobip.js` | Client Infobip sendSMS/DLR — en standby |
+| `routes/infobip.inbound.js` | Webhook Infobip — en standby |
 | `services/smsProvider.js` | Thin wrapper Infobip |
 | `services/phoneNormalizer.js` | Normalisation E.164 |
 | `services/userResolver.js` | Résolution phone → UID |
@@ -280,8 +288,10 @@ OFFLINE_SMS_PROVIDER=sms_gateway
 4. **Toujours utiliser** `services/userResolver.js` pour résoudre phone → UID
 5. **Toujours démarrer** par `git status` + audit avant toute modification
 6. **Tester** avec `node test/offline-sms-tests.js && node test/sms-gateway-tests.js` après chaque modification offline
-7. **Ne jamais hardcoder** de clé API, secret, token dans le code
+7. **Ne jamais hardcoder** de clé API, secret, token dans le code — ne jamais logger `INFINIREACH_API_KEY`
 8. **Ne pas supprimer Infobip** — garder en standby, configurable via `OFFLINE_SMS_PROVIDER`
+9. **`smsProvider = 'sms_gateway'`** pour tous les messages INfiniReach (rétrocompatibilité Firestore)
+10. **Déduplication par `data.messageId`** pour les webhooks INfiniReach entrants
 
 ---
 
@@ -292,15 +302,15 @@ OFFLINE_SMS_PROVIDER=sms_gateway
 ```
 FIREBASE_SERVICE_ACCOUNT_JSON=...
 JWT_SECRET=...
-SMS_GATEWAY_LOGIN=...
-SMS_GATEWAY_PASSWORD=...
+INFINIREACH_API_KEY=...
+INFINIREACH_FROM_NUMBER=+226xxxxxxxx
 ```
 
 ### Variables recommandées
 
 ```
-SMS_GATEWAY_DEVICE_ID=...
-SMS_GATEWAY_WEBHOOK_SECRET=...
+INFINIREACH_API_URL=https://api.infinireach.io
+INFINIREACH_ENABLED=true
 OFFLINE_SMS_PROVIDER=sms_gateway
 REDIS_URL=...
 ```
@@ -308,6 +318,6 @@ REDIS_URL=...
 ### Après déploiement
 
 1. Vérifier état : `GET https://omnisms-backend.onrender.com/health`
-2. Vérifier config Gateway : `GET https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/status`
-3. Configurer webhook dans l'app SMS Gateway for Android™ sur le Z Fold2
-4. Effectuer les tests hardware H-G1 à H-G5
+2. Vérifier config INfiniReach : `GET https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/status`
+3. Configurer webhook dans l'app INfiniReach sur le Z Fold2
+4. Effectuer les tests hardware H-A1 à H-A5

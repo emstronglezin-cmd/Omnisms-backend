@@ -1,29 +1,29 @@
 'use strict';
 /**
- * OmniSMS — Webhook SMS Gateway for Android™ (SMS Entrants)
+ * OmniSMS — Webhook INfiniReach (SMS Entrants)
  *
- * Application : SMS Gateway for Android™ (sms-gate.app) sur Z Fold2
+ * Fournisseur : INfiniReach (https://api.infinireach.io)
+ * Transport   : INfiniReach → Samsung Z Fold2 → SIM → réseau SMS (et retour)
  *
  * Route principale :
  *   POST /api/webhooks/sms-gateway/inbound
  *
- * Configuration dans l'app SMS Gateway (onglet Settings → Webhooks) :
- *   URL  : https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/inbound
- *   Event: sms:received
- *   (Enregistrer séparément pour chaque event si nécessaire)
+ * Configuration dans l'app INfiniReach sur Z Fold2 :
+ *   URL webhook : https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/inbound
+ *   Events      : message.inbound (+ message.delivered, message.failed optionnel)
  *
- * Workflow complet SMS entrant via Z Fold2 :
+ * Workflow complet SMS entrant via INfiniReach Z Fold2 :
  *
  *   Utilisateur externe
  *     ↓ SMS
  *   SIM Z Fold2
  *     ↓ capture
- *   SMS Gateway for Android™ (app Z Fold2)
+ *   App INfiniReach (Z Fold2)
  *     ↓ POST webhook ici
  *   Backend OmniSMS
- *     ↓ validateWebhookSignature (HMAC si SMS_GATEWAY_WEBHOOK_SECRET configuré)
- *     ↓ Déduplication (Redis SETNX ou Map mémoire)
- *     ↓ normalizePhone(sender) → E.164
+ *     ↓ validateWebhookSignature (HMAC si INFINIREACH_WEBHOOK_SECRET configuré)
+ *     ↓ Déduplication (Redis SETNX ou Map mémoire) — clé = data.messageId
+ *     ↓ normalizePhone(data.from) → E.164
  *     ↓ Protocole # : si message commence par "#NUMERO " → resolveUserByPhone(target)
  *     ↓ Sinon : findExternalConvByPhone(from) → ownerUid depuis external_conversations
  *     ↓ getOrCreateExternalConv(db, ownerUid, from, null, recipientNumber)
@@ -31,34 +31,34 @@
  *     ↓ emitToUser(ownerUid, 'message:receive', payload)
  *     ↓ Si ownerUid offline → message en Firestore, récupéré à la reconnexion
  *
- * Format du webhook (event sms:received) :
+ * Format du webhook INfiniReach (event message.inbound) :
  *   {
- *     "deviceId"  : "ffffffffceb0b1db0000018e937c815b",
- *     "event"     : "sms:received",
- *     "id"        : "Ey6ECgOkVVFjz3CL48B8C",        ← ID unique de l'événement
- *     "webhookId" : "LreFUt-Z3sSq0JufY9uWB",
- *     "payload"   : {
- *       "messageId"  : "abc123",                     ← ID du message (dédup)
- *       "message"    : "Bonjour Emmanuel !",
- *       "sender"     : "+22670000000",               ← numéro expéditeur
- *       "recipient"  : "+22600000000",               ← numéro SIM Z Fold2 (peut être null)
- *       "simNumber"  : 1,
- *       "receivedAt" : "2024-06-22T15:46:11.000+07:00"
+ *     "event"     : "message.inbound",
+ *     "timestamp" : "2024-06-22T15:46:11.000Z",
+ *     "data"      : {
+ *       "messageId" : "ir-msg-abc123",         ← ID unique du message (dédup)
+ *       "direction" : "inbound",
+ *       "from"      : "+22670000000",           ← numéro expéditeur
+ *       "to"        : "+22600000000",           ← numéro SIM Z Fold2
+ *       "body"      : "Bonjour Emmanuel !",     ← contenu SMS
+ *       "deviceId"  : "zfold2-device-xxx",
+ *       "timestamp" : "2024-06-22T15:46:11.000Z",
+ *       "status"    : "delivered"
  *     }
  *   }
  *
- * Signature HMAC (X-Signature) :
- *   HMAC-SHA256(rawBody + X-Timestamp, SMS_GATEWAY_WEBHOOK_SECRET)
- *   Headers : X-Signature, X-Timestamp (Unix timestamp en secondes)
+ * Événements DLR (statuts sortants) :
+ *   message.sent, message.delivered, message.failed
+ *
+ * Signature HMAC (optionnelle, premier test sans secret) :
+ *   INFINIREACH_WEBHOOK_SECRET non configuré → mode permissif (accepte tout)
+ *   INFINIREACH_WEBHOOK_SECRET configuré     → HMAC-SHA256 via validateWebhookSignature()
  *
  * Événements gérés :
- *   sms:received   → SMS entrant (traitement complet)
- *   sms:sent       → Accusé de livraison (update Firestore)
- *   sms:delivered  → Accusé de livraison (update Firestore)
- *   sms:failed     → SMS échoué (update Firestore)
- *   sms:batch:received → Lot de SMS entrants
- *   app:started    → Z Fold2 redémarré (log uniquement)
- *   system:ping    → Ping health check (réponse 200)
+ *   message.inbound   → SMS entrant (traitement complet)
+ *   message.sent      → Accusé envoi (update Firestore)
+ *   message.delivered → Accusé livraison (update Firestore)
+ *   message.failed    → SMS échoué (update Firestore)
  *
  * IMPORTANT : Route Infobip conservée et indépendante :
  *   POST /api/webhooks/infobip/inbound  ← reste actif en standby
@@ -104,11 +104,11 @@ function getSmsGateway() {
 
 /* ── Déduplication des webhooks entrants ───────────────────── */
 /**
- * Vérifie et marque un ID d'événement SMS Gateway comme traité.
- * Utilise l'event ID (id du webhook) OU le messageId du payload.
+ * Vérifie et marque un ID de message INfiniReach comme traité.
+ * Utilise data.messageId comme clé principale.
  *
- * La rétry du SMS Gateway est agressive : jusqu'à 14 fois (expo backoff).
- * Sans déduplication, le même SMS peut être inséré 14 fois en Firestore.
+ * INfiniReach peut réessayer plusieurs fois si le webhook échoue.
+ * Sans déduplication, le même SMS peut être inséré plusieurs fois.
  *
  * Stratégie :
  *  1. Redis SETNX avec TTL 24h (si Redis disponible)
@@ -168,28 +168,38 @@ function parseHashPrefix(text) {
 
 /* ── Mise à jour statut livraison ───────────────────────────── */
 /**
- * Traite les événements sms:sent, sms:delivered, sms:failed, sms:cancelled.
+ * Traite les événements message.sent, message.delivered, message.failed.
  * Met à jour le statut dans Firestore (messages + external_conversations).
+ *
+ * INfiniReach DLR payload:
+ *   {
+ *     "event": "message.delivered",
+ *     "data": {
+ *       "messageId": "ir-xxx",     ← ID gateway (correspond à externalId=omnisms-{firestoreId})
+ *       "status": "delivered",
+ *       ...
+ *     }
+ *   }
  */
-async function updateDeliveryStatus(event, payload, db) {
+async function updateDeliveryStatus(event, data, db) {
   if (!db) return;
 
-  const gwMessageId = payload?.messageId;
+  // data.messageId = ID INfiniReach du message sortant
+  // Lors de l'envoi, on a positionné externalId = "omnisms-{firestoreId}"
+  // INfiniReach renvoie cet externalId dans les DLR events
+  const gwMessageId = data?.messageId || data?.externalId;
   if (!gwMessageId) return;
 
   const statusMap = {
-    'sms:sent'      : 'sent',
-    'sms:delivered' : 'delivered',
-    'sms:failed'    : 'failed',
-    'sms:cancelled' : 'cancelled',
+    'message.sent'      : 'sent',
+    'message.delivered' : 'delivered',
+    'message.failed'    : 'failed',
   };
   const newStatus = statusMap[event];
   if (!newStatus) return;
 
   try {
-    // Chercher le message par son ID Gateway
-    // Le message a été sauvegardé avec smsMessageId = gatewayMessageId = "omnisms-{firestoreId}"
-    // On cherche donc par smsMessageId (format "omnisms-{id}") ou directement par gwMessageId
+    // Chercher le message par smsMessageId (= gatewayMessageId retourné au moment de l'envoi)
     const snap = await db.collection('messages')
       .where('smsMessageId', '==', gwMessageId)
       .limit(1)
@@ -200,24 +210,23 @@ async function updateDeliveryStatus(event, payload, db) {
         status   : newStatus,
         updatedAt: new Date().toISOString(),
       };
-      if (event === 'sms:failed')    updateData.smsError = payload?.reason || 'unknown';
-      if (event === 'sms:delivered') updateData.deliveredAt = payload?.deliveredAt || null;
-      if (event === 'sms:sent')      updateData.sentAt     = payload?.sentAt || null;
+      if (event === 'message.failed')    updateData.smsError   = data?.reason || data?.error || 'unknown';
+      if (event === 'message.delivered') updateData.deliveredAt = data?.deliveredAt || data?.timestamp || null;
+      if (event === 'message.sent')      updateData.sentAt      = data?.sentAt     || data?.timestamp || null;
 
       await snap.docs[0].ref.update(updateData);
 
-      logger.info('[SmsGateway/DLR] Statut message mis à jour', {
+      logger.info('[INfiniReach/DLR] Statut message mis à jour', {
         gwMessageId,
         event,
         newStatus,
         docId: snap.docs[0].id,
       });
     } else {
-      // Essayer avec le format "omnisms-{id}" préfixé
-      logger.debug('[SmsGateway/DLR] Message non trouvé par smsMessageId', { gwMessageId });
+      logger.debug('[INfiniReach/DLR] Message non trouvé par smsMessageId', { gwMessageId });
     }
   } catch (err) {
-    logger.warn('[SmsGateway/DLR] Update failed', { error: err.message, gwMessageId });
+    logger.warn('[INfiniReach/DLR] Update failed', { error: err.message, gwMessageId });
   }
 
   // Émettre l'événement Socket.IO pour les clients connectés
@@ -231,103 +240,97 @@ async function updateDeliveryStatus(event, payload, db) {
       timestamp : new Date().toISOString(),
     });
   }
+
+  logger.info('[INfiniReach] status:' + newStatus, {
+    gwMessageId,
+    event,
+  });
 }
 
-/* ── Traitement SMS entrant (sms:received) ──────────────────── */
+/* ── Traitement SMS entrant (message.inbound) ───────────────── */
+/**
+ * Mappe le payload INfiniReach vers le format interne OmniSMS.
+ *
+ * INfiniReach payload (body.data.*) :
+ *   data.messageId  → clé déduplication principale
+ *   data.from       → expéditeur (E.164)
+ *   data.to         → destinataire = numéro SIM Z Fold2
+ *   data.body       → texte du SMS
+ *   data.deviceId   → ID device INfiniReach
+ *   data.timestamp  → horodatage réception
+ *   data.status     → statut INfiniReach (ex: "delivered")
+ */
 async function processSmsReceived(webhookBody) {
   const db      = getDb();
   const emitFn  = getEmitToUser();
   const io      = getIO();
 
+  const event    = webhookBody?.event;
+  const data     = webhookBody?.data || {};
+
+  // ── Extraction des champs INfiniReach ───────────────────────
   const {
-    deviceId,
-    event,
-    id: eventId,        // ID unique de l'événement webhook
-    webhookId,
-    payload,
-  } = webhookBody || {};
+    messageId : gwMessageId,   // ID unique INfiniReach — clé de déduplication
+    from      : senderRaw,     // numéro expéditeur
+    to        : recipientRaw,  // numéro SIM Z Fold2
+    body      : textRaw,       // contenu SMS
+    deviceId,                  // device ID INfiniReach
+    timestamp : receivedAt,    // horodatage
+    status    : msgStatus,     // statut INfiniReach
+    direction,                 // "inbound"
+  } = data;
 
-  if (!payload) {
-    logger.debug('[SmsGateway/Inbound] Payload manquant — ignoré');
-    return;
-  }
-
-  const {
-    messageId: gwMessageId,
-    message  : textRaw,
-    sender   : senderRaw,
-    recipient: recipientRaw,
-    simNumber,
-    receivedAt,
-  } = payload;
-
-  // ── Événements non-SMS (livraison, ping, app:started) ────────
-  if (event === 'system:ping' || event === 'app:started') {
-    logger.info('[SmsGateway/Webhook] Système event reçu', { event, deviceId });
-    return;
-  }
-
-  // ── Statuts de livraison ─────────────────────────────────────
-  if (['sms:sent', 'sms:delivered', 'sms:failed', 'sms:cancelled'].includes(event)) {
-    logger.info('[SmsGateway/DLR] Événement livraison', {
-      event,
-      gwMessageId,
-      to: payload?.recipient,
-    });
-    await updateDeliveryStatus(event, payload, db);
-    return;
-  }
-
-  // ── SMS entrant (sms:received ou sms:batch:received) ─────────
-  // Utiliser l'eventId (id du webhook) comme clé de déduplication principale
-  // Le gwMessageId peut aussi être utilisé en clé secondaire
-  const dedupKey = eventId || gwMessageId;
+  // ── Déduplication ────────────────────────────────────────────
+  // Utiliser data.messageId comme clé principale (recommandé INfiniReach)
+  const dedupKey = gwMessageId;
   if (dedupKey) {
     const duplicate = await isAlreadyProcessed(dedupKey);
     if (duplicate) {
-      logger.info('[SmsGateway/Inbound] Doublon ignoré', {
-        eventId   : dedupKey,
-        gwMessageId,
+      logger.info('[INfiniReach] webhook:duplicate', {
+        messageId : dedupKey,
         sender    : senderRaw ? senderRaw.replace(/\d{4}$/, '****') : null,
       });
       return;
     }
   }
 
-  if (textRaw === undefined) {
-    logger.debug('[SmsGateway/Inbound] Événement sans texte', { event, keys: Object.keys(payload || {}) });
+  if (textRaw === undefined || textRaw === null) {
+    logger.debug('[INfiniReach] webhook:received Événement sans texte', {
+      event,
+      keys: Object.keys(data),
+    });
     return;
   }
 
-  const fromE164    = normalizePhone(senderRaw)    || senderRaw    || '';
+  const fromE164      = normalizePhone(senderRaw)    || senderRaw    || '';
   const recipientE164 = normalizePhone(recipientRaw) || recipientRaw || null;
 
-  logger.info('[SmsGateway/Inbound] SMS reçu', {
+  logger.info('[INfiniReach] webhook:inbound', {
     from      : fromE164.replace(/\d{4}$/, '****'),
-    recipient : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
-    textLength: textRaw.length,
-    gwMessageId,
-    simNumber,
-    receivedAt,
+    to        : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
+    textLength: String(textRaw).length,
+    messageId : gwMessageId,
     deviceId,
+    receivedAt,
+    direction,
   });
 
   // ─────────────────────────────────────────────────────────────
   // ÉTAPE 1 : Trouver le destinataire OmniSMS (ownerUid)
   // ─────────────────────────────────────────────────────────────
-  // Cas A : Le texte commence par # → nouveau protocole d'adressage
+  // Cas A : Le texte commence par # → protocole d'adressage direct
   // Cas B : Conversation externe existante → retrouver le propriétaire
-  // Cas C : Dernier recours via le numéro SIM (recipient)
+  // Cas C : Dernier recours via le numéro SIM (to = numéro destinataire)
 
   let ownerUid  = null;
   let convId    = null;
-  let finalText = textRaw;
+  let finalText = String(textRaw);
   let isNewConv = false;
 
   // Cas A : Protocole #
-  const hashParsed = parseHashPrefix(textRaw);
+  const hashParsed = parseHashPrefix(finalText);
   if (hashParsed) {
-    logger.info('[SmsGateway/Inbound] Protocole # détecté', {
+    logger.info('[INfiniReach] webhook:inbound Protocole # détecté', {
       targetPhone: hashParsed.targetPhone.replace(/\d{4}$/, '****'),
     });
 
@@ -336,11 +339,11 @@ async function processSmsReceived(webhookBody) {
       ownerUid  = targetUser.uid;
       finalText = hashParsed.cleanText;
       isNewConv = true;
-      logger.info('[SmsGateway/Inbound] # protocol → OmniSMS user trouvé', {
+      logger.info('[INfiniReach] webhook:inbound # protocol → OmniSMS user trouvé', {
         targetUid: ownerUid,
       });
     } else {
-      logger.warn('[SmsGateway/Inbound] # protocol : numéro cible non OmniSMS', {
+      logger.warn('[INfiniReach] webhook:inbound # protocol : numéro cible non OmniSMS', {
         targetPhone: hashParsed.targetPhone.replace(/\d{4}$/, '****'),
       });
     }
@@ -352,7 +355,7 @@ async function processSmsReceived(webhookBody) {
     if (existingConv) {
       ownerUid = existingConv.ownerUid;
       convId   = existingConv.conversationId;
-      logger.info('[SmsGateway/Inbound] Conversation externe trouvée', {
+      logger.info('[INfiniReach] webhook:inbound Conversation externe trouvée', {
         from    : fromE164.replace(/\d{4}$/, '****'),
         ownerUid,
         convId,
@@ -360,23 +363,23 @@ async function processSmsReceived(webhookBody) {
     }
   }
 
-  // Cas C : Résoudre via le numéro SIM destinataire (recipient de l'app)
+  // Cas C : Résoudre via le numéro SIM destinataire
   if (!ownerUid && recipientE164) {
     const toUser = await resolveUserByPhone(recipientE164);
     if (toUser.found) {
       ownerUid  = toUser.uid;
       isNewConv = true;
-      logger.info('[SmsGateway/Inbound] Owner résolu via numéro SIM', {
-        recipient: recipientE164.replace(/\d{4}$/, '****'),
+      logger.info('[INfiniReach] webhook:inbound Owner résolu via numéro SIM', {
+        to      : recipientE164.replace(/\d{4}$/, '****'),
         ownerUid,
       });
     }
   }
 
   if (!ownerUid) {
-    logger.warn('[SmsGateway/Inbound] Impossible de trouver le destinataire OmniSMS', {
+    logger.warn('[INfiniReach] webhook:inbound Impossible de trouver le destinataire OmniSMS', {
       from     : fromE164.replace(/\d{4}$/, '****'),
-      recipient: recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
+      to       : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
       hint     : 'Associer le numéro SIM du Z Fold2 à un compte OmniSMS, ou utiliser le protocole #NUMERO message',
     });
   }
@@ -393,14 +396,14 @@ async function processSmsReceived(webhookBody) {
 
   // Fallback conversationId si aucun owner
   if (!convId) {
-    convId = `sms-gateway-inbound-${fromE164.replace(/\W/g, '')}-${Date.now()}`;
+    convId = `sms-infinireach-inbound-${fromE164.replace(/\W/g, '')}-${Date.now()}`;
   }
 
   // ─────────────────────────────────────────────────────────────
   // ÉTAPE 3 : Stocker le message en Firestore
   // ─────────────────────────────────────────────────────────────
-  const nowIso  = new Date().toISOString();
-  const msgDoc  = {
+  const nowIso = new Date().toISOString();
+  const msgDoc = {
     channel         : 'sms',
     direction       : 'inbound',
     senderId        : fromE164,
@@ -412,9 +415,8 @@ async function processSmsReceived(webhookBody) {
     from            : fromE164,
     to              : recipientE164 || null,
     status          : 'delivered',
-    smsProvider     : 'sms_gateway',
+    smsProvider     : 'sms_gateway',          // identique à l'ancien format → aucune migration nécessaire
     deviceId        : deviceId || null,
-    simNumber       : simNumber || null,
     createdAt       : receivedAt || nowIso,
     updatedAt       : nowIso,
   };
@@ -427,13 +429,13 @@ async function processSmsReceived(webhookBody) {
       if (ownerUid) {
         await updateExternalConvLastMessage(db, convId, finalText, gwMessageId || null);
       }
-      logger.info('[SmsGateway/Inbound] Message stocké Firestore', {
+      logger.info('[INfiniReach] webhook:inbound Message stocké Firestore', {
         id      : savedMsgId,
         convId,
         ownerUid,
       });
     } catch (dbErr) {
-      logger.error('[SmsGateway/Inbound] Erreur stockage Firestore', { error: dbErr.message });
+      logger.error('[INfiniReach] webhook:inbound Erreur stockage Firestore', { error: dbErr.message });
     }
   }
 
@@ -441,7 +443,7 @@ async function processSmsReceived(webhookBody) {
   // ÉTAPE 4 : Notifier le propriétaire via Socket.IO
   // ─────────────────────────────────────────────────────────────
   const socketPayload = {
-    id            : savedMsgId || `gw-inbound-${Date.now()}`,
+    id            : savedMsgId || `infinireach-inbound-${Date.now()}`,
     type          : 'text',
     channel       : 'sms',
     direction     : 'inbound',
@@ -461,7 +463,7 @@ async function processSmsReceived(webhookBody) {
   if (ownerUid) {
     emitFn(ownerUid, 'message:receive', socketPayload);
     emitFn(ownerUid, 'new_message',     socketPayload); // rétrocompat
-    logger.info('[SmsGateway/Inbound] message:receive émis', {
+    logger.info('[INfiniReach] webhook:inbound message:receive émis', {
       uid   : ownerUid,
       from  : fromE164.replace(/\d{4}$/, '****'),
       convId,
@@ -474,68 +476,47 @@ async function processSmsReceived(webhookBody) {
   }
 }
 
-/* ── Traitement lot (sms:batch:received) ────────────────────── */
-async function processBatchReceived(webhookBody) {
-  const messages = webhookBody?.payload?.messages;
-  if (!Array.isArray(messages) || messages.length === 0) {
-    logger.debug('[SmsGateway/Batch] Batch vide');
-    return;
-  }
-
-  logger.info('[SmsGateway/Batch] Traitement lot', { count: messages.length });
-
-  for (const msg of messages) {
-    // Construire un corps de webhook individuel pour chaque message
-    await processSmsReceived({
-      deviceId : webhookBody.deviceId,
-      event    : 'sms:received',
-      id       : `${webhookBody.id}-${msg.messageId}`,
-      webhookId: webhookBody.webhookId,
-      payload  : msg,
-    });
-  }
-}
-
 /* ── Dispatcher principal ───────────────────────────────────── */
+/**
+ * Aiguille le webhook INfiniReach selon event :
+ *   message.inbound   → SMS entrant complet
+ *   message.sent      → DLR envoi
+ *   message.delivered → DLR livraison
+ *   message.failed    → DLR échec
+ */
 async function processGatewayWebhook(body) {
-  const { event } = body || {};
+  const event = body?.event;
+  const data  = body?.data || {};
+
+  logger.info('[INfiniReach] webhook:received', {
+    event,
+    messageId: data.messageId,
+    direction: data.direction,
+  });
 
   try {
     switch (event) {
-      case 'sms:received':
+      // ── SMS entrant ────────────────────────────────────────
+      case 'message.inbound':
         await processSmsReceived(body);
         break;
 
-      case 'sms:batch:received':
-        await processBatchReceived(body);
+      // ── DLR sortants ───────────────────────────────────────
+      case 'message.sent':
+      case 'message.delivered':
+      case 'message.failed':
+        await updateDeliveryStatus(event, data, getDb());
         break;
 
-      case 'sms:sent':
-      case 'sms:delivered':
-      case 'sms:failed':
-      case 'sms:cancelled':
-        await processSmsReceived(body); // délègue au handler qui traite aussi les DLR
-        break;
-
-      case 'system:ping':
-        logger.info('[SmsGateway/Webhook] Ping reçu', {
-          deviceId: body.deviceId,
-          health  : body.payload?.health,
-        });
-        break;
-
-      case 'app:started':
-        logger.info('[SmsGateway/Webhook] App Z Fold2 démarrée', {
-          deviceId: body.deviceId,
-          simCards: body.payload?.simCards,
-        });
-        break;
-
+      // ── Inconnu ────────────────────────────────────────────
       default:
-        logger.debug('[SmsGateway/Webhook] Événement inconnu', { event, keys: Object.keys(body || {}) });
+        logger.debug('[INfiniReach] webhook:received Événement inconnu', {
+          event,
+          keys: Object.keys(body || {}),
+        });
     }
   } catch (err) {
-    logger.error('[SmsGateway/Webhook] Erreur traitement', {
+    logger.error('[INfiniReach] webhook:received Erreur traitement', {
       error : err.message,
       event,
       stack : err.stack,
@@ -545,22 +526,22 @@ async function processGatewayWebhook(body) {
 
 /* ─────────────────────────────────────────────────────────────
    POST /api/webhooks/sms-gateway/inbound
-   Route principale SMS entrant du Z Fold2
+   Route principale SMS entrant INfiniReach Z Fold2
    ─────────────────────────────────────────────────────────── */
 router.post('/sms-gateway/inbound', (req, res) => {
   const smsGateway = getSmsGateway();
 
-  // Validation de la signature HMAC si configurée
+  // Validation de la signature HMAC si INFINIREACH_WEBHOOK_SECRET configuré
+  // Sans secret → mode permissif (cas initial INfiniReach, premier test)
   if (smsGateway && !smsGateway.validateWebhookSignature(req)) {
-    logger.warn('[SmsGateway/Inbound] Signature invalide — requête rejetée');
+    logger.warn('[INfiniReach] webhook:invalid Signature invalide — requête rejetée');
     return res.status(401).json({
       error: 'Signature invalide.',
       code : 'INVALID_SIGNATURE',
     });
   }
 
-  // Répondre 200 IMMÉDIATEMENT pour stopper les retries du Gateway
-  // (le Gateway retente jusqu'à 14 fois avec backoff expo si pas de 2xx)
+  // Répondre 200 IMMÉDIATEMENT pour stopper les retries INfiniReach
   res.status(200).json({
     received : true,
     provider : 'sms_gateway',
@@ -573,7 +554,7 @@ router.post('/sms-gateway/inbound', (req, res) => {
 
 /* ─────────────────────────────────────────────────────────────
    GET /api/webhooks/sms-gateway/status
-   Health check + configuration guide
+   Health check + guide de configuration INfiniReach
    ─────────────────────────────────────────────────────────── */
 router.get('/sms-gateway/status', (_req, res) => {
   const smsGateway = getSmsGateway();
@@ -581,24 +562,31 @@ router.get('/sms-gateway/status', (_req, res) => {
 
   return res.status(200).json({
     status       : 'active',
-    service      : 'SMS Gateway for Android™ Inbound Webhook v1',
+    service      : 'INfiniReach Inbound Webhook v2',
     webhookUrl   : `${backendUrl}/api/webhooks/sms-gateway/inbound`,
     provider     : smsGateway ? smsGateway.getStatus() : { configured: false },
+    transport    : {
+      name       : 'INfiniReach',
+      apiUrl     : 'https://api.infinireach.io',
+      sendEndpoint: 'POST /api/v1/messages',
+      auth       : 'X-API-Key header',
+    },
     configuration: {
-      step1: 'Installer SMS Gateway for Android™ sur Z Fold2',
-      step2: 'Se connecter au compte Cloud (onglet Home) — noter login, password, deviceId',
-      step3: `Configurer le webhook dans Settings → Webhooks : URL = ${backendUrl}/api/webhooks/sms-gateway/inbound, Event = sms:received`,
-      step4: 'Récupérer la Signing Key (Settings → Webhooks → Signing Key) → SMS_GATEWAY_WEBHOOK_SECRET',
-      step5: 'Configurer les env vars Render : SMS_GATEWAY_LOGIN, SMS_GATEWAY_PASSWORD, SMS_GATEWAY_DEVICE_ID, SMS_GATEWAY_WEBHOOK_SECRET',
+      step1: 'Installer l\'application INfiniReach sur le Z Fold2',
+      step2: 'Se connecter et enregistrer le device',
+      step3: `Configurer le webhook dans INfiniReach : URL = ${backendUrl}/api/webhooks/sms-gateway/inbound, Event = message.inbound`,
+      step4: 'Configurer les env vars Render : INFINIREACH_API_KEY, INFINIREACH_FROM_NUMBER',
+      step5: '(Optionnel) Configurer INFINIREACH_WEBHOOK_SECRET pour valider les signatures webhook',
     },
     envVarsRequired: [
-      'SMS_GATEWAY_LOGIN',
-      'SMS_GATEWAY_PASSWORD',
+      'INFINIREACH_API_KEY',
+      'INFINIREACH_FROM_NUMBER',
     ],
-    envVarsRecommended: [
-      'SMS_GATEWAY_DEVICE_ID',
-      'SMS_GATEWAY_WEBHOOK_SECRET',
-      'SMS_GATEWAY_API_URL (défaut: https://api.sms-gate.app/3rdparty/v1)',
+    envVarsOptional: [
+      'INFINIREACH_API_URL (défaut: https://api.infinireach.io)',
+      'INFINIREACH_ENABLED (défaut: true)',
+      'INFINIREACH_WEBHOOK_SECRET (vide = mode permissif)',
+      'INFINIREACH_REQUIRE_SIGNATURE (défaut: false)',
     ],
   });
 });
