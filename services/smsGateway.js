@@ -124,6 +124,37 @@ function isInfobipFallbackEnabled() {
   return process.env.OFFLINE_SMS_FALLBACK_TO_INFOBIP === 'true';
 }
 
+/* ── Diagnostic de démarrage ────────────────────────────────── */
+
+/**
+ * Émet des logs de démarrage sûrs pour diagnostiquer la configuration INfiniReach.
+ * Appelé UNE SEULE FOIS depuis server.js au démarrage.
+ * Ne logue JAMAIS la valeur réelle de apiKey ou webhookSecret.
+ */
+function logStartupDiagnostic() {
+  const { apiKey, fromNumber, apiUrl, enabled, webhookSecret } = getConfig();
+  const provider = getActiveProvider();
+  const isGw     = isSmsGatewayProvider();
+  const cfg      = isConfigured();
+
+  logger.info('[InfiniReach] ── Configuration au démarrage ─────────────────────────');
+  logger.info(`[InfiniReach] enabled          : ${enabled ? 'YES' : 'NO'}`);
+  logger.info(`[InfiniReach] INFINIREACH_API_KEY     : ${apiKey      ? 'CONFIGURED' : 'MISSING ⚠️'}`);
+  logger.info(`[InfiniReach] INFINIREACH_FROM_NUMBER : ${fromNumber  ? 'CONFIGURED (' + fromNumber.replace(/\d{4}$/, '****') + ')' : 'MISSING ⚠️'}`);
+  logger.info(`[InfiniReach] INFINIREACH_API_URL     : ${apiUrl      || 'https://api.infinireach.io (défaut)'}`);
+  logger.info(`[InfiniReach] INFINIREACH_WEBHOOK_SECRET : ${webhookSecret ? 'CONFIGURED' : 'non défini (mode permissif)'}`);
+  logger.info('[Offline SMS] ──────────────────────────────────────────────────────');
+  logger.info(`[Offline SMS] OFFLINE_SMS_PROVIDER           : ${provider} (${isGw ? 'INfiniReach' : 'autre'})`);
+  logger.info(`[Offline SMS] OFFLINE_SMS_FALLBACK_TO_INFOBIP: ${isInfobipFallbackEnabled() ? 'true (fallback Infobip actif)' : 'false (Infobip désactivé pendant test INfiniReach)'}`);
+  logger.info(`[Offline SMS] Transport résolu : ${isGw ? 'INfiniReach Z Fold2' : 'Infobip standby ou aucun'}`);
+  logger.info(`[Offline SMS] isConfigured()   : ${cfg ? 'YES ✅' : 'NO ❌ — vérifier INFINIREACH_API_KEY + INFINIREACH_FROM_NUMBER'}`);
+  logger.info('[InfiniReach] ──────────────────────────────────────────────────────');
+
+  if (!cfg) {
+    logger.warn('[InfiniReach] Transport INfiniReach NON opérationnel. Vérifier les variables d\'environnement sur Render.');
+  }
+}
+
 /* ── Client HTTP bas niveau ─────────────────────────────────── */
 
 /**
@@ -318,13 +349,15 @@ async function sendSMS({ to, text, messageId = null } = {}) {
     || JSON.stringify(body);
 
   const hint = statusCode === 401
-    ? 'Clé API invalide — vérifier INFINIREACH_API_KEY'
+    ? 'Clé API invalide — vérifier INFINIREACH_API_KEY dans Render'
+    : statusCode === 404
+    ? `Device non trouvé — vérifier que INFINIREACH_FROM_NUMBER (${fromNumber}) est bien enregistré dans l'application INfiniReach sur le Z Fold2. Le numéro SIM doit correspondre exactement au device enregistré dans votre compte INfiniReach.`
     : statusCode === 400
-    ? 'Payload invalide — vérifier INFINIREACH_FROM_NUMBER et le format du numéro'
+    ? 'Payload invalide — vérifier INFINIREACH_FROM_NUMBER et le format du numéro (E.164 : +22675405214)'
     : statusCode === 429
     ? 'Rate limit atteint — réessai automatique via BullMQ'
     : statusCode === 503
-    ? 'Service INfiniReach indisponible ou Z Fold2 hors ligne'
+    ? 'Service INfiniReach indisponible ou Z Fold2 hors ligne / déconnecté'
     : `Réponse inattendue INfiniReach (code ${statusCode})`;
 
   logger.error('[INfiniReach] send:error', {
@@ -487,4 +520,5 @@ module.exports = {
   getMessageStatus,
   validateWebhookSignature,
   getStatus,
+  logStartupDiagnostic,
 };

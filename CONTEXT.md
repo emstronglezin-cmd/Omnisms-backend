@@ -1,7 +1,7 @@
 # OmniSMS — Architecture et Contexte Technique
 
-**Version**: 4.5.0  
-**Date mise à jour**: 2026-09-11  
+**Version**: 4.6.0  
+**Date mise à jour**: 2026-09-13  
 **Backend URL**: https://omnisms-backend.onrender.com
 
 ---
@@ -469,3 +469,101 @@ OFFLINE_SMS_PROVIDER=sms_gateway
 8. **Ne pas supprimer Infobip** — conserver en standby, activable via `OFFLINE_SMS_PROVIDER=infobip`
 9. **Ne pas inventer d'API** — utiliser uniquement les endpoints documentés officiellement
 10. **`smsProvider` = 'sms_gateway'** pour tous les messages INfiniReach (rétrocompatibilité Firestore)
+
+---
+
+## 14. Diagnostic — Logs de démarrage INfiniReach
+
+Depuis la version 4.6.0, `services/smsGateway.js` expose `logStartupDiagnostic()`, appelé automatiquement depuis `server.js` au démarrage. Ces logs permettent de vérifier la configuration sans jamais exposer la clé API :
+
+```
+[InfiniReach] ── Configuration au démarrage ─────────────────────────
+[InfiniReach] enabled          : YES
+[InfiniReach] INFINIREACH_API_KEY     : CONFIGURED
+[InfiniReach] INFINIREACH_FROM_NUMBER : CONFIGURED (+2267540****)
+[InfiniReach] INFINIREACH_API_URL     : https://api.infinireach.io
+[InfiniReach] INFINIREACH_WEBHOOK_SECRET : non défini (mode permissif)
+[Offline SMS] ──────────────────────────────────────────────────────
+[Offline SMS] OFFLINE_SMS_PROVIDER           : sms_gateway (INfiniReach)
+[Offline SMS] OFFLINE_SMS_FALLBACK_TO_INFOBIP: false (Infobip désactivé pendant test INfiniReach)
+[Offline SMS] Transport résolu : INfiniReach Z Fold2
+[Offline SMS] isConfigured()   : YES ✅
+```
+
+**Logs webhook entrant** (depuis la version 4.6.0, ajoutés à l'entrée HTTP du POST handler) :
+```
+[InfiniReach Webhook] received { event, messageId, from, to, bodyLength, direction, deviceId, ip }
+```
+
+---
+
+## 15. Troubleshooting — Erreurs INfiniReach connues
+
+### 404 — No device found with phone number +XXXXX for your account
+
+**Cause** : `INFINIREACH_FROM_NUMBER` contient un numéro non enregistré comme device dans le compte INfiniReach.
+
+**Le code est correct** — le numéro de `INFINIREACH_FROM_NUMBER` est transmis directement comme champ `"from"` sans aucune transformation. Si INfiniReach répond 404, c'est que le numéro ne correspond à aucun device enregistré dans votre compte INfiniReach.
+
+**Vérification** :
+1. Ouvrir l'application INfiniReach sur le Z Fold2
+2. Aller dans Paramètres → Devices / Appareils
+3. Vérifier que le numéro SIM affiché correspond EXACTEMENT à `INFINIREACH_FROM_NUMBER` en format E.164
+4. Si différent : mettre à jour `INFINIREACH_FROM_NUMBER` sur Render avec le bon numéro
+5. Si le device n'est pas enregistré : connecter/enregistrer le Z Fold2 dans INfiniReach
+
+**Hint dans les logs** :
+```
+[INfiniReach] send:error
+  statusCode: 404
+  error: "No device found with phone number +22675405214 for your account."
+  hint: "Device non trouvé — vérifier que INFINIREACH_FROM_NUMBER (+22675405214) est bien enregistré
+         dans l'application INfiniReach sur le Z Fold2. Le numéro SIM doit correspondre exactement
+         au device enregistré dans votre compte INfiniReach."
+```
+
+### 401 — Clé API invalide
+
+**Cause** : `INFINIREACH_API_KEY` incorrect ou expiré.  
+**Action** : Régénérer la clé dans l'interface INfiniReach, mettre à jour Render.
+
+### Infobip fallback — Désactiver pendant tests INfiniReach
+
+Pour voir clairement les erreurs INfiniReach sans masquage Infobip :
+```
+OFFLINE_SMS_FALLBACK_TO_INFOBIP=false    # sur Render
+```
+Remettre à `true` en production pour la résilience.
+
+---
+
+## 16. Cycle de vie d'un compte OmniSMS (userResolver)
+
+`services/userResolver.js` est la source de vérité unique pour la résolution `phone → UID`.
+
+### Règles de résolution
+
+| État du compte | `resolveUserByPhone()` | Traitement |
+|---|---|---|
+| Actif (`deleted` absent ou `false`) | `{ found: true, uid: "xxx" }` | Route OMNISMS |
+| Supprimé (`deleted: true`) | `{ found: false }` | Route SMS_EXTERNE classique |
+| Non inscrit | `{ found: false }` | Route SMS_EXTERNE classique |
+
+### CAS 1 — Compte actif → OmniSMS
+`resolveUserByPhone()` ignore les documents avec `deleted === true`.  
+Seuls les comptes actifs sont trouvés et retournent `{ found: true, uid }`.
+
+### CAS 2 — Compte supprimé (`deleted=true`) → SMS classique
+Après suppression, le champ `deleted: true` est positionné sur le document Firestore.  
+`resolveUserByPhone()` (ligne 118 de userResolver.js) : `if (!includeDeleted && data.deleted === true) continue;`  
+Le numéro n'est plus résolu vers l'ancien UID → traité comme SMS classique.
+
+### CAS 3 — Même numéro réajouté sans nouvelle inscription
+Si `deleted=true` reste en Firestore, le numéro est toujours traité comme SMS classique.  
+Le compte n'est PAS automatiquement réactivé.
+
+### CAS 4 — Nouvelle inscription valide
+Une nouvelle inscription crée un nouveau document avec `deleted: false` (ou sans `deleted`).  
+Le numéro est de nouveau résolu → redevient OmniSMS.
+
+**Pas de cache** : `resolveUserByPhone()` interroge Firestore à chaque appel. Aucun état mis en cache qui pourrait retourner un ancien UID supprimé.

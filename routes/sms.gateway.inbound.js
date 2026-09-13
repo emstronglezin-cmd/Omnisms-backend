@@ -529,12 +529,32 @@ async function processGatewayWebhook(body) {
    Route principale SMS entrant INfiniReach Z Fold2
    ─────────────────────────────────────────────────────────── */
 router.post('/sms-gateway/inbound', (req, res) => {
+  const body       = req.body || {};
+  const event      = body?.event || '(unknown)';
+  const data       = body?.data  || {};
+  const messageId  = data?.messageId  || null;
+  const fromRaw    = data?.from       || null;
+  const toRaw      = data?.to         || null;
+  const bodyLength = typeof data?.body === 'string' ? data.body.length : 0;
+
+  // Log d'entrée sûr — aucun secret, aucun contenu SMS complet
+  logger.info('[InfiniReach Webhook] received', {
+    event,
+    messageId,
+    from      : fromRaw   ? String(fromRaw).replace(/\d{4}$/, '****') : null,
+    to        : toRaw     ? String(toRaw).replace(/\d{4}$/, '****')   : null,
+    bodyLength,
+    direction : data?.direction || null,
+    deviceId  : data?.deviceId  || null,
+    ip        : req.ip || req.headers['x-forwarded-for'] || null,
+  });
+
   const smsGateway = getSmsGateway();
 
   // Validation de la signature HMAC si INFINIREACH_WEBHOOK_SECRET configuré
   // Sans secret → mode permissif (cas initial INfiniReach, premier test)
   if (smsGateway && !smsGateway.validateWebhookSignature(req)) {
-    logger.warn('[INfiniReach] webhook:invalid Signature invalide — requête rejetée');
+    logger.warn('[InfiniReach Webhook] Signature invalide — requête rejetée', { event, messageId });
     return res.status(401).json({
       error: 'Signature invalide.',
       code : 'INVALID_SIGNATURE',
@@ -549,7 +569,7 @@ router.post('/sms-gateway/inbound', (req, res) => {
   });
 
   // Traitement asynchrone (ne bloque pas la réponse 200)
-  setImmediate(() => processGatewayWebhook(req.body || {}));
+  setImmediate(() => processGatewayWebhook(body));
 });
 
 /* ─────────────────────────────────────────────────────────────

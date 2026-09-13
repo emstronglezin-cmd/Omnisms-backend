@@ -413,7 +413,7 @@ async function routeMessage(opts = {}) {
     logger.warn('[ROUTING] Aucun transport SMS configuré — message externe non délivré', {
       senderUid,
       targetPhone: e164Target.replace(/\d{4}$/, '****'),
-      hint: 'Configurer SMS_GATEWAY_LOGIN + SMS_GATEWAY_PASSWORD ou INFOBIP_API_KEY + INFOBIP_BASE_URL',
+      hint: 'Configurer INFINIREACH_API_KEY + INFINIREACH_FROM_NUMBER (INfiniReach Z Fold2) ou INFOBIP_API_KEY + INFOBIP_BASE_URL (standby)',
     });
   }
 
@@ -472,6 +472,8 @@ async function routeMessage(opts = {}) {
         });
 
         // Si Gateway échoue ET fallback Infobip activé → tenter Infobip
+        // ⚠️  Pendant la phase de test INfiniReach : mettre OFFLINE_SMS_FALLBACK_TO_INFOBIP=false
+        //     sur Render pour voir clairement les erreurs INfiniReach sans masquage Infobip.
         if (!smsResult.success && smsGateway.isInfobipFallbackEnabled() && useInfobip) {
           logger.warn('[ROUTING] SMS Gateway failed — tentative Infobip (fallback)', {
             to: e164Target.replace(/\d{4}$/, '****'),

@@ -94,7 +94,7 @@ async function processSmsJob(job) {
   if (!transport) {
     logger.warn('[SmsWorker] Aucun transport SMS configuré — job ignoré', {
       jobId: job.id,
-      hint : 'Configurer SMS_GATEWAY_LOGIN + SMS_GATEWAY_PASSWORD (transport principal) ou INFOBIP_API_KEY + INFOBIP_BASE_URL (standby)',
+      hint : 'Configurer INFINIREACH_API_KEY + INFINIREACH_FROM_NUMBER (transport principal INfiniReach Z Fold2) ou INFOBIP_API_KEY + INFOBIP_BASE_URL (standby)',
     });
     // Ne pas jeter — éviter de remplir la queue si aucun provider n'est configuré
     return { skipped: true, reason: 'no_transport_configured' };
@@ -120,6 +120,9 @@ async function processSmsJob(job) {
   }
 
   // Si le transport principal (Gateway) échoue ET fallback Infobip activé
+  // ⚠️  Pendant la phase de test INfiniReach : mettre OFFLINE_SMS_FALLBACK_TO_INFOBIP=false
+  //     sur Render pour voir clairement les erreurs INfiniReach sans masquage Infobip.
+  //     Remettre à true en production pour la résilience.
   if (!result.success && transport.provider === 'sms_gateway') {
     const smsGateway = getSmsGateway();
     const infobip    = getInfobip();

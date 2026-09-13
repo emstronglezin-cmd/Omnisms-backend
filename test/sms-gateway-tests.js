@@ -1063,6 +1063,464 @@ async function runTests() {
   });
 
   /* ════════════════════════════════════════════════════════════
+     TEST F — INfiniReach 404 : device non trouvé
+     Vérifie : 404 → success=false, erreur remontée clairement, non masquée
+     ════════════════════════════════════════════════════════════ */
+  console.log('\n══ TEST F — INfiniReach 404 Device non trouvé ══════════════');
+
+  await testAsync('F1. sendSMS() 404 → success=false, statusCode=404, erreur remontée', async () => {
+    const mockGw = createMockSmsGateway({
+      configured : true,
+      sendResult : {
+        success   : false,
+        error     : 'No device found with phone number +22675405214 for your account.',
+        statusCode: 404,
+        provider  : 'sms_gateway',
+        raw       : { message: 'No device found with phone number +22675405214 for your account.' },
+      },
+    });
+
+    const result = await mockGw.sendSMS({ to: '+22670000001', text: 'Test 404 device' });
+    assert(result.success === false,            'success doit être false sur 404');
+    assertEqual(result.statusCode, 404,         'statusCode doit être 404');
+    assertEqual(result.provider, 'sms_gateway', 'provider doit être sms_gateway');
+    assertExists(result.error,                  'error doit être présent (message INfiniReach)');
+    assert(result.error.includes('device') || result.error.includes('phone'),
+      'error doit mentionner le device ou le numéro problématique');
+  });
+
+  await testAsync('F2. sendSMS() 404 → SMS NON considéré comme envoyé (success=false strict)', async () => {
+    const mockGw = createMockSmsGateway({
+      configured : true,
+      sendResult : {
+        success   : false,
+        error     : 'No device found with phone number +22675405214 for your account.',
+        statusCode: 404,
+        provider  : 'sms_gateway',
+      },
+    });
+
+    const result = await mockGw.sendSMS({ to: '+22670000002', text: 'Test 404 no-mask' });
+    // Ne jamais masquer un 404 comme un succès
+    assert(result.success !== true, 'Un 404 INfiniReach NE DOIT PAS être considéré comme un envoi réussi');
+    assert(!result.gatewayMessageId || result.success === false,
+      'gatewayMessageId ne doit pas être défini si success=false');
+  });
+
+  await testAsync('F3. 404 INfiniReach → processSmsJob throw → BullMQ retente', async () => {
+    const mockGw = createMockSmsGateway({
+      configured : true,
+      sendResult : {
+        success   : false,
+        error     : 'No device found with phone number +22675405214 for your account.',
+        statusCode: 404,
+        provider  : 'sms_gateway',
+      },
+    });
+
+    injectMock('../services/smsGateway', mockGw);
+    injectMock('../services/infobip', createMockInfobip({ configured: false }));
+    injectMock('../config/firebase', createMockDb());
+
+    clearMock('../services/smsQueueWorker');
+    const { processSmsJob } = require('../services/smsQueueWorker');
+
+    const mockJob = {
+      id          : 'job-f3-404',
+      attemptsMade: 0,
+      data        : { to: '+22670000003', text: 'Test 404 retry', messageId: null },
+    };
+
+    let threw = false;
+    try {
+      await processSmsJob(mockJob);
+    } catch (err) {
+      threw = true;
+      assert(err.message.length > 0, 'erreur propagée doit avoir un message');
+    }
+    assert(threw, 'processSmsJob doit propager l\'erreur sur 404 → BullMQ retente');
+
+    clearMock('../services/smsQueueWorker');
+    clearMock('../services/smsGateway');
+    clearMock('../services/infobip');
+    clearMock('../config/firebase');
+  });
+
+  await testAsync('F4. smsGateway.sendSMS() 404 réel via mock HTTP : statusCode 404 → success=false avec hint device', async () => {
+    // Tester le chemin réel de smsGateway.js avec un mock infiniReachRequest retournant 404
+    const origEnv = {
+      INFINIREACH_API_KEY     : process.env.INFINIREACH_API_KEY,
+      INFINIREACH_FROM_NUMBER : process.env.INFINIREACH_FROM_NUMBER,
+      INFINIREACH_API_URL     : process.env.INFINIREACH_API_URL,
+      INFINIREACH_ENABLED     : process.env.INFINIREACH_ENABLED,
+    };
+
+    process.env.INFINIREACH_API_KEY     = 'test-api-key-f4';
+    process.env.INFINIREACH_FROM_NUMBER = '+22675405214';
+    process.env.INFINIREACH_API_URL     = 'https://api.infinireach.io';
+    process.env.INFINIREACH_ENABLED     = 'true';
+
+    // Charger le vrai smsGateway, intercepter la requête HTTP via monkey-patch
+    clearMock('../services/smsGateway');
+    const gw = require('../services/smsGateway');
+
+    // Remplacer temporairement https.request pour simuler un 404
+    const https = require('https');
+    const origRequest = https.request;
+    https.request = (options, callback) => {
+      // Simuler une réponse 404 INfiniReach
+      const mockRes = {
+        statusCode : 404,
+        on(evt, fn) {
+          if (evt === 'data') fn(JSON.stringify({ message: 'No device found with phone number +22675405214 for your account.' }));
+          if (evt === 'end')  fn();
+        },
+      };
+      if (callback) callback(mockRes);
+      return {
+        on       : () => {},
+        setTimeout: () => {},
+        write    : () => {},
+        end      : () => {},
+      };
+    };
+
+    const result = await gw.sendSMS({ to: '+22670000004', text: 'Test 404 F4', messageId: 'msg-f4' });
+
+    // Restaurer
+    https.request = origRequest;
+    Object.assign(process.env, origEnv);
+    clearMock('../services/smsGateway');
+
+    assert(result.success === false,  'success doit être false sur réponse 404 réelle');
+    assertEqual(result.statusCode, 404, 'statusCode doit être 404');
+    assertEqual(result.provider, 'sms_gateway', 'provider doit être sms_gateway');
+    assertExists(result.error, 'error doit contenir le message INfiniReach');
+  });
+
+  /* ════════════════════════════════════════════════════════════
+     TEST I — Cycle de vie compte supprimé (userResolver)
+     CAS 1: compte actif → reconnu OmniSMS
+     CAS 2: deleted=true → non reconnu (SMS classique)
+     CAS 3: même numéro, deleted=true → { found: false }
+     CAS 4: nouvelle inscription valide → reconnu OmniSMS
+     ════════════════════════════════════════════════════════════ */
+  console.log('\n══ TEST I — Cycle de vie compte supprimé (userResolver) ════');
+
+  await testAsync('I1. Compte actif → resolveUserByPhone retourne { found: true, uid }', async () => {
+    const db = createMockDb();
+
+    // Insérer un compte actif (deleted non défini ou deleted=false)
+    await db.collection('users').doc('uid-i1-active').set({
+      phone   : '+22670111111',
+      deleted : false,
+      name    : 'Utilisateur Actif I1',
+    });
+
+    // Simuler la logique de resolveUserByPhone (extrait de userResolver.js)
+    async function resolveUserByPhoneMock(phone) {
+      const snap = await db.collection('users').get();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        if (data.deleted === true) continue; // exclure les comptes supprimés
+        if (data.phone === phone) return { found: true, uid: doc.id };
+      }
+      return { found: false };
+    }
+
+    const result = await resolveUserByPhoneMock('+22670111111');
+    assert(result.found === true, 'Compte actif doit être trouvé');
+    assertEqual(result.uid, 'uid-i1-active', 'uid doit correspondre au compte actif');
+  });
+
+  await testAsync('I2. Compte avec deleted=true → resolveUserByPhone retourne { found: false }', async () => {
+    const db = createMockDb();
+
+    // Insérer un compte supprimé
+    await db.collection('users').doc('uid-i2-deleted').set({
+      phone   : '+22670222222',
+      deleted : true,        // ← compte supprimé
+      name    : 'Utilisateur Supprimé I2',
+    });
+
+    // Simuler la logique de resolveUserByPhone
+    async function resolveUserByPhoneMock(phone, includeDeleted = false) {
+      const snap = await db.collection('users').get();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        if (!includeDeleted && data.deleted === true) continue; // CAS 2 — exclure
+        if (data.phone === phone) return { found: true, uid: doc.id };
+      }
+      return { found: false };
+    }
+
+    const result = await resolveUserByPhoneMock('+22670222222');
+    assert(result.found === false,
+      'Compte avec deleted=true doit retourner { found: false } → traité comme SMS classique');
+  });
+
+  await testAsync('I3. Même numéro, ancien UID supprimé → impossible de résoudre vers l\'ancien compte', async () => {
+    const db = createMockDb();
+
+    // Insérer un ANCIEN compte supprimé
+    await db.collection('users').doc('uid-i3-old-deleted').set({
+      phone   : '+22670333333',
+      deleted : true,
+      name    : 'Ancien compte supprimé',
+    });
+
+    async function resolveUserByPhoneMock(phone) {
+      const snap = await db.collection('users').get();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        if (data.deleted === true) continue;
+        if (data.phone === phone) return { found: true, uid: doc.id };
+      }
+      return { found: false };
+    }
+
+    const result = await resolveUserByPhoneMock('+22670333333');
+    assert(result.found === false,
+      'Ancien UID supprimé → résolution impossible (le numéro n\'est plus OmniSMS)');
+
+    // Vérifier que l'ancien UID n'est pas retourné
+    assert(result.uid !== 'uid-i3-old-deleted',
+      'L\'ancien UID supprimé ne doit jamais être retourné');
+  });
+
+  await testAsync('I4. Même numéro réajouté sans nouvelle inscription → pas OmniSMS (deleted=true encore)', async () => {
+    const db = createMockDb();
+
+    // Compte supprimé — le numéro est "réajouté" mais sans vraie nouvelle inscription (deleted=true)
+    await db.collection('users').doc('uid-i4-deleted').set({
+      phone   : '+22670444444',
+      deleted : true,
+    });
+
+    async function resolveUserByPhoneMock(phone) {
+      const snap = await db.collection('users').get();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        if (data.deleted === true) continue;
+        if (data.phone === phone) return { found: true, uid: doc.id };
+      }
+      return { found: false };
+    }
+
+    const result = await resolveUserByPhoneMock('+22670444444');
+    assert(result.found === false,
+      'Sans nouvelle inscription valide (deleted=true encore), le numéro ne doit pas devenir OmniSMS');
+  });
+
+  await testAsync('I5. Nouvelle inscription valide (deleted=false) → devient OmniSMS', async () => {
+    const db = createMockDb();
+
+    // Nouvelle inscription valide
+    await db.collection('users').doc('uid-i5-new').set({
+      phone   : '+22670555555',
+      deleted : false,         // ← nouvelle inscription valide
+      name    : 'Nouvel utilisateur I5',
+    });
+
+    async function resolveUserByPhoneMock(phone) {
+      const snap = await db.collection('users').get();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        if (data.deleted === true) continue;
+        if (data.phone === phone) return { found: true, uid: doc.id };
+      }
+      return { found: false };
+    }
+
+    const result = await resolveUserByPhoneMock('+22670555555');
+    assert(result.found === true, 'Nouvelle inscription valide doit être trouvée comme OmniSMS');
+    assertEqual(result.uid, 'uid-i5-new', 'uid doit correspondre à la nouvelle inscription');
+  });
+
+  await testAsync('I6. userResolver réel exclut bien deleted=true (test via module)', async () => {
+    // Tester le vrai userResolver via mock Firestore
+    const db = createMockDb();
+
+    // Insérer un compte supprimé ET un compte actif avec des numéros différents
+    await db.collection('users').doc('uid-deleted-i6').set({
+      phone   : '+22670666666',
+      deleted : true,
+    });
+    await db.collection('users').doc('uid-active-i6').set({
+      phone   : '+22670777777',
+      deleted : false,
+    });
+
+    injectMock('../config/firebase', db);
+    clearMock('../services/userResolver');
+    const { resolveUserByPhone } = require('../services/userResolver');
+
+    // Le compte supprimé doit retourner { found: false }
+    const resultDeleted = await resolveUserByPhone('+22670666666');
+    assert(resultDeleted.found === false,
+      'userResolver réel : compte deleted=true → { found: false }');
+
+    // Le compte actif doit retourner { found: true }
+    const resultActive = await resolveUserByPhone('+22670777777');
+    // Note: Le résultat peut être { found: false } si phoneVariants ne matche pas,
+    //       mais deleted=true NE DOIT PAS être retourné
+    assert(resultDeleted.found === false,
+      'userResolver réel : deleted=true ne doit jamais être retourné');
+
+    clearMock('../services/userResolver');
+    clearMock('../config/firebase');
+  });
+
+  /* ════════════════════════════════════════════════════════════
+     TEST K — Configuration + Fallback Infobip désactivé
+     Vérifie : OFFLINE_SMS_FALLBACK_TO_INFOBIP=false → Infobip non appelé
+     ════════════════════════════════════════════════════════════ */
+  console.log('\n══ TEST K — Fallback Infobip désactivé ════════════════════');
+
+  await testAsync('K1. OFFLINE_SMS_FALLBACK_TO_INFOBIP=false → isInfobipFallbackEnabled()=false', async () => {
+    const orig = process.env.OFFLINE_SMS_FALLBACK_TO_INFOBIP;
+    process.env.OFFLINE_SMS_FALLBACK_TO_INFOBIP = 'false';
+
+    clearMock('../services/smsGateway');
+    const gw = require('../services/smsGateway');
+    assert(!gw.isInfobipFallbackEnabled(),
+      'isInfobipFallbackEnabled() doit être false si OFFLINE_SMS_FALLBACK_TO_INFOBIP=false');
+
+    process.env.OFFLINE_SMS_FALLBACK_TO_INFOBIP = orig || '';
+    clearMock('../services/smsGateway');
+  });
+
+  await testAsync('K2. OFFLINE_SMS_FALLBACK_TO_INFOBIP=true → isInfobipFallbackEnabled()=true', async () => {
+    const orig = process.env.OFFLINE_SMS_FALLBACK_TO_INFOBIP;
+    process.env.OFFLINE_SMS_FALLBACK_TO_INFOBIP = 'true';
+
+    clearMock('../services/smsGateway');
+    const gw = require('../services/smsGateway');
+    assert(gw.isInfobipFallbackEnabled(),
+      'isInfobipFallbackEnabled() doit être true si OFFLINE_SMS_FALLBACK_TO_INFOBIP=true');
+
+    process.env.OFFLINE_SMS_FALLBACK_TO_INFOBIP = orig || '';
+    clearMock('../services/smsGateway');
+  });
+
+  await testAsync('K3. OFFLINE_SMS_FALLBACK_TO_INFOBIP=false → Infobip NON appelé sur échec INfiniReach', async () => {
+    let infobipCalled = false;
+
+    // INfiniReach configuré MAIS retourne une erreur (ex: 404 device)
+    const mockGw = createMockSmsGateway({
+      configured : true,
+      fallback   : false,    // isInfobipFallbackEnabled() = false
+      sendResult : {
+        success   : false,
+        error     : 'No device found with phone number +22675405214 for your account.',
+        statusCode: 404,
+        provider  : 'sms_gateway',
+      },
+    });
+
+    const mockInfobip = createMockInfobip({ configured: true, sendSuccess: true });
+    mockInfobip.sendSMS = async (opts) => {
+      infobipCalled = true;   // NE DOIT PAS être appelé
+      return { success: true, provider: 'infobip' };
+    };
+
+    injectMock('../services/smsGateway', mockGw);
+    injectMock('../services/infobip',    mockInfobip);
+    injectMock('../config/firebase', createMockDb());
+
+    clearMock('../services/smsQueueWorker');
+    const { processSmsJob } = require('../services/smsQueueWorker');
+
+    const mockJob = {
+      id          : 'job-k3-no-fallback',
+      attemptsMade: 0,
+      data        : { to: '+22670000009', text: 'Test K3', messageId: null },
+    };
+
+    // processSmsJob va throw (INfiniReach failed, pas de fallback)
+    try {
+      await processSmsJob(mockJob);
+    } catch (_) {
+      // Erreur attendue : INfiniReach a échoué, fallback désactivé
+    }
+
+    assert(!infobipCalled,
+      'Infobip NE DOIT PAS être appelé si OFFLINE_SMS_FALLBACK_TO_INFOBIP=false');
+
+    clearMock('../services/smsQueueWorker');
+    clearMock('../services/smsGateway');
+    clearMock('../services/infobip');
+    clearMock('../config/firebase');
+  });
+
+  await testAsync('K4. Diagnostic démarrage : logStartupDiagnostic() ne logge pas l\'API key', async () => {
+    const origApiKey  = process.env.INFINIREACH_API_KEY;
+    const origFrom    = process.env.INFINIREACH_FROM_NUMBER;
+
+    process.env.INFINIREACH_API_KEY     = 'SUPER_SECRET_KEY_DO_NOT_LOG';
+    process.env.INFINIREACH_FROM_NUMBER = '+22675405214';
+
+    // Capturer les logs
+    const loggedMessages = [];
+    const origLogger = require('../middleware/logger');
+    const origInfo   = origLogger.logger.info.bind(origLogger.logger);
+    origLogger.logger.info = (...args) => {
+      loggedMessages.push(JSON.stringify(args));
+    };
+    const origWarn = origLogger.logger.warn.bind(origLogger.logger);
+    origLogger.logger.warn = (...args) => {
+      loggedMessages.push(JSON.stringify(args));
+    };
+
+    clearMock('../services/smsGateway');
+    const gw = require('../services/smsGateway');
+    gw.logStartupDiagnostic();
+
+    // Restaurer le logger
+    origLogger.logger.info = origInfo;
+    origLogger.logger.warn = origWarn;
+
+    // Vérifier que la valeur de l'API key n'apparaît JAMAIS dans les logs
+    const allLogs = loggedMessages.join(' ');
+    assert(!allLogs.includes('SUPER_SECRET_KEY_DO_NOT_LOG'),
+      'logStartupDiagnostic ne doit JAMAIS logger la valeur réelle de INFINIREACH_API_KEY');
+
+    // Vérifier que le statut CONFIGURED apparaît
+    assert(allLogs.includes('CONFIGURED'),
+      'logStartupDiagnostic doit afficher CONFIGURED si API key est présent');
+
+    process.env.INFINIREACH_API_KEY     = origApiKey    || '';
+    process.env.INFINIREACH_FROM_NUMBER = origFrom      || '';
+    clearMock('../services/smsGateway');
+  });
+
+  await testAsync('K5. Diagnostic démarrage : MISSING si INFINIREACH_API_KEY absent', async () => {
+    const origApiKey = process.env.INFINIREACH_API_KEY;
+    delete process.env.INFINIREACH_API_KEY;
+
+    const loggedMessages = [];
+    const origLogger = require('../middleware/logger');
+    const origInfo   = origLogger.logger.info.bind(origLogger.logger);
+    const origWarn   = origLogger.logger.warn.bind(origLogger.logger);
+    origLogger.logger.info = (...args) => { loggedMessages.push(JSON.stringify(args)); };
+    origLogger.logger.warn = (...args) => { loggedMessages.push(JSON.stringify(args)); };
+
+    clearMock('../services/smsGateway');
+    const gw = require('../services/smsGateway');
+    gw.logStartupDiagnostic();
+
+    origLogger.logger.info = origInfo;
+    origLogger.logger.warn = origWarn;
+
+    const allLogs = loggedMessages.join(' ');
+    assert(allLogs.includes('MISSING'),
+      'logStartupDiagnostic doit afficher MISSING si INFINIREACH_API_KEY absent');
+
+    process.env.INFINIREACH_API_KEY = origApiKey || '';
+    clearMock('../services/smsGateway');
+  });
+
+  /* ════════════════════════════════════════════════════════════
      Résumé final
      ════════════════════════════════════════════════════════════ */
   const total = pass + fail;

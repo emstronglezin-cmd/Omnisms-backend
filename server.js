@@ -477,6 +477,14 @@ try {
   logger.warn('[Worker] Could not start SMS worker.', { error: err.message });
 }
 
+/* ── INfiniReach : diagnostic de démarrage (logs sûrs, jamais la clé) ── */
+try {
+  const smsGateway = require('./services/smsGateway');
+  smsGateway.logStartupDiagnostic();
+} catch (err) {
+  logger.warn('[InfiniReach] Impossible d\'émettre le diagnostic de démarrage.', { error: err.message });
+}
+
 /* ── Démarrage serveur ───────────────────────────────────── */
 server.keepAliveTimeout = 65000;
 server.headersTimeout   = 66000;

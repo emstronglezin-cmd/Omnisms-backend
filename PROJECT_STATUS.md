@@ -1,7 +1,7 @@
 # OmniSMS Backend — Statut du Projet
 
-**Version**: 4.5.0  
-**Date**: 2026-09-11  
+**Version**: 4.6.0  
+**Date**: 2026-09-13  
 **Environnement**: Production (Render)  
 **URL**: https://omnisms-backend.onrender.com
 
@@ -113,6 +113,38 @@ Suite de tests remplacée : 26 tests G1-G10 (sms-gate.app) → 33 tests A-E + r�
 
 **Régression G (7 tests)** : déduplication Redis, Firestore champs, `makeExternalConvId`, normalisation E.164, `makeConversationId`, Online isolation
 
+---
+
+### Phase INfiniReach-5 — Audit et Finalisation (Session 2026-09-13)
+
+#### Correctifs appliqués
+
+1. **`services/smsQueueWorker.js` (ligne 97)** — Hint stale corrigé  
+   `SMS_GATEWAY_LOGIN + SMS_GATEWAY_PASSWORD` → `INFINIREACH_API_KEY + INFINIREACH_FROM_NUMBER (transport principal INfiniReach Z Fold2)`
+
+2. **`services/messageRouter.js` (ligne 416)** — Hint stale corrigé  
+   `SMS_GATEWAY_LOGIN + SMS_GATEWAY_PASSWORD` → `INFINIREACH_API_KEY + INFINIREACH_FROM_NUMBER (INfiniReach Z Fold2)`
+
+3. **`services/smsGateway.js`** — `logStartupDiagnostic()` ajouté  
+   Logs sûrs au démarrage : enabled/api key configured/from number/api url — jamais la valeur réelle de la clé
+
+4. **`services/smsGateway.js`** — Hint 404 spécifique ajouté  
+   Sur `statusCode === 404` : message explicatif sur le device non enregistré dans INfiniReach
+
+5. **`routes/sms.gateway.inbound.js`** — Log webhook entrant ajouté  
+   `[InfiniReach Webhook] received { event, messageId, from, to, bodyLength, direction, deviceId, ip }` à l'entrée HTTP du POST handler (avant le 200)
+
+6. **`services/smsQueueWorker.js` + `services/messageRouter.js`** — Commentaire fallback Infobip  
+   Comment `⚠️ Pendant la phase de test INfiniReach : OFFLINE_SMS_FALLBACK_TO_INFOBIP=false` ajouté
+
+7. **`server.js`** — Appel `logStartupDiagnostic()` au démarrage
+
+#### Nouveaux tests ajoutés (15 tests)
+
+- **F (4 tests)** — 404 device non trouvé : `success=false` strict, erreur remontée, `processSmsJob` throw, mock HTTP 404 réel
+- **I (6 tests)** — Cycle de vie compte supprimé (CAS 1-4) : actif, `deleted=true`, même numéro réajouté, nouvelle inscription
+- **K (5 tests)** — Fallback désactivé + diagnostic démarrage : `OFFLINE_SMS_FALLBACK_TO_INFOBIP`, Infobip non appelé, `logStartupDiagnostic` sans secret
+
 ### Précédentes implémentations (Session 2026-09-07)
 
 - `services/smsGateway.js` — transport sms-gate.app (remplacé par INfiniReach)
@@ -132,17 +164,20 @@ Suite de tests remplacée : 26 tests G1-G10 (sms-gate.app) → 33 tests A-E + r�
 
 ## 4. Résultats de tests
 
-### Tests INfiniReach (2026-09-11) — NOUVEAU
+### Tests INfiniReach (2026-09-13) — Audit + Nouveaux tests F/I/K
 
 ```
-33 PASS / 0 FAIL / 33 total ✅
+48 PASS / 0 FAIL / 48 total ✅
 
-══ TEST A — Envoi SMS INfiniReach       : 6 PASS
-══ TEST B — Webhook entrant INfiniReach : 5 PASS
-══ TEST C — Erreurs API INfiniReach     : 6 PASS
-══ TEST D — Online — Isolation          : 4 PASS
-══ TEST E — Offline — Retry             : 5 PASS
-══ RÉGRESSION G — Interface + Routage  : 7 PASS
+══ TEST A — Envoi SMS INfiniReach                    : 6 PASS
+══ TEST B — Webhook entrant INfiniReach              : 5 PASS
+══ TEST C — Erreurs API INfiniReach                  : 6 PASS
+══ TEST D — Online — Isolation                        : 4 PASS
+══ TEST E — Offline — Retry                           : 5 PASS
+══ RÉGRESSION G — Interface + Routage                : 7 PASS
+══ TEST F — 404 Device non trouvé                    : 4 PASS  ← NOUVEAU
+══ TEST I — Cycle de vie compte supprimé (CAS 1-4)  : 6 PASS  ← NOUVEAU
+══ TEST K — Fallback Infobip désactivé + diagnostic  : 5 PASS  ← NOUVEAU
 ```
 
 ### Tests Offline SMS (2026-09-05) — Régression ✅
@@ -163,7 +198,7 @@ Suite de tests remplacée : 26 tests G1-G10 (sms-gate.app) → 33 tests A-E + r�
 ── Bonus hybridSms.js                : 5 PASS
 ```
 
-**Total automatisé : 70/70 PASS ✅**
+**Total automatisé : 85/85 PASS ✅** (48 INfiniReach + 37 régression)
 
 ---
 
@@ -209,23 +244,46 @@ La migration du transport SMS Gateway (sms-gate.app) vers INfiniReach est **comp
 - ✅ `services/smsGateway.js` réécrit pour INfiniReach (X-API-Key, `/api/v1/messages`, `INFINIREACH_*` vars)
 - ✅ `routes/sms.gateway.inbound.js` adapté payload `data.*` + events `message.*`
 - ✅ `.env.example` mis à jour (INFINIREACH_* vars)
-- ✅ `test/sms-gateway-tests.js` réécrit — tests A-E INfiniReach — **33/33 PASS**
+- ✅ `test/sms-gateway-tests.js` réécrit — tests A-E INfiniReach + F/I/K audit — **48/48 PASS**
 - ✅ Régression `test/offline-sms-tests.js` — **37/37 PASS**
 - ✅ `CONTEXT.md` et `PROJECT_STATUS.md` mis à jour
+- ✅ Hints stales `SMS_GATEWAY_LOGIN` corrigés dans `smsQueueWorker.js` et `messageRouter.js`
+- ✅ Logs démarrage sûrs (`logStartupDiagnostic`) + logs webhook entrant (`[InfiniReach Webhook] received`)
+- ✅ Hint 404 device non trouvé explicatif dans `smsGateway.js`
+- ✅ Commentaire fallback Infobip pause dans `smsQueueWorker.js` + `messageRouter.js`
 
 **Reste côté utilisateur** (non bloquant pour le backend) :
 - [ ] Configurer le webhook dans l'application INfiniReach sur le Z Fold2
 - [ ] Renseigner les variables d'environnement dans Render
 - [ ] Effectuer les tests hardware H-A1 à H-A5
 
+### ⚠️ DIAGNOSTIC — Erreur 404 observée en production
+
+**Symptôme** : Backend atteint `POST https://api.infinireach.io/api/v1/messages` (✅ réseau OK) mais INfiniReach répond :
+```
+HTTP 404 — "No device found with phone number +22675405214 for your account."
+```
+
+**Cause** : Le numéro `+22675405214` configuré dans `INFINIREACH_FROM_NUMBER` n'est pas reconnu comme device enregistré dans le compte INfiniReach.
+
+**Le code backend est CORRECT** — il transmet directement `INFINIREACH_FROM_NUMBER` au champ `"from"` sans transformation.
+
+**Action requise (côté utilisateur)** :
+1. Ouvrir l'app INfiniReach sur le Z Fold2
+2. Vérifier que le device est bien enregistré et actif
+3. Confirmer que le numéro SIM affiché dans l'app correspond EXACTEMENT à `+22675405214`
+4. Si différent → mettre à jour `INFINIREACH_FROM_NUMBER` avec le numéro exact
+5. Si le device n'est pas enregistré → reconnecter/réenregistrer le Z Fold2
+
 ### ⚠️ CONFIG REQUISE Render — Variables INfiniReach
 
 ```
 INFINIREACH_API_KEY=votre_cle_api_infinireach
-INFINIREACH_FROM_NUMBER=+226xxxxxxxx
+INFINIREACH_FROM_NUMBER=+226xxxxxxxx       # DOIT correspondre au numéro SIM du Z Fold2 dans INfiniReach
 INFINIREACH_API_URL=https://api.infinireach.io
 INFINIREACH_ENABLED=true
 OFFLINE_SMS_PROVIDER=sms_gateway
+OFFLINE_SMS_FALLBACK_TO_INFOBIP=false      # false pendant test INfiniReach pour voir les erreurs clairement
 ```
 
 ### ⚠️ CONFIG OPTIONNELLE mais recommandée
