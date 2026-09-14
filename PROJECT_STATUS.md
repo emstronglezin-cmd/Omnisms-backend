@@ -1,7 +1,7 @@
 # OmniSMS Backend — Statut du Projet
 
-**Version**: 4.6.0  
-**Date**: 2026-09-13  
+**Version**: 4.7.0  
+**Date**: 2026-09-14  
 **Environnement**: Production (Render)  
 **URL**: https://omnisms-backend.onrender.com
 
@@ -145,6 +145,21 @@ Suite de tests remplacée : 26 tests G1-G10 (sms-gate.app) → 33 tests A-E + r�
 - **I (6 tests)** — Cycle de vie compte supprimé (CAS 1-4) : actif, `deleted=true`, même numéro réajouté, nouvelle inscription
 - **K (5 tests)** — Fallback désactivé + diagnostic démarrage : `OFFLINE_SMS_FALLBACK_TO_INFOBIP`, Infobip non appelé, `logStartupDiagnostic` sans secret
 
+### Phase INfiniReach-6 — Corrections Réception + Flutter (Session 2026-09-14)
+
+**Backend :**
+- `services/messageRouter.js` — `findExternalConvByPhone()` : filtre `infobipNumber` (= SIM `to`) appliqué TOUJOURS (avant : seulement si `docs.length > 1`). Garantit que `ownerUid` = propriétaire réel du SIM destinataire.
+- `test/sms-inbound-tests.js` — 23 nouveaux tests (A-M) : normalisation, résolution utilisateur, compte supprimé, conversation externe, flow inbound complet, déduplication, protocole #.
+
+**Flutter (`/home/user/frontend/`) :**
+- `android/app/src/main/AndroidManifest.xml` — Permission `RECORD_AUDIO` ré-activée (était commentée).
+- `ios/Runner/Info.plist` — Clé `NSMicrophoneUsageDescription` ajoutée (manquante → crash iOS).
+- `pubspec.yaml` — Ajout `record: ^5.1.2` + `permission_handler: ^11.3.1`.
+- `lib/widgets/audio/voice_recorder_widget.dart` — Demande permission avant enregistrement, gestion refus sans blocage, suppression double `SafeArea`.
+- `lib/services/audio_recording_service.dart` — Refactoring complet avec vraie gestion permission.
+- `lib/screens/messaging/conversation_screen.dart` — Correction scroll perpétuel (flag `_hasScrolledToBottom`) : scroll auto seulement au premier chargement et sur nouveaux messages. Empêche les sauts visuels iOS.
+- `lib/providers/messaging_provider.dart` — `_pollMessages()` fusionne les messages (merge) au lieu de remplacer entièrement la liste : évite la perte de scroll et les doublons.
+
 ### Précédentes implémentations (Session 2026-09-07)
 
 - `services/smsGateway.js` — transport sms-gate.app (remplacé par INfiniReach)
@@ -163,6 +178,14 @@ Suite de tests remplacée : 26 tests G1-G10 (sms-gate.app) → 33 tests A-E + r�
 ---
 
 ## 4. Résultats de tests
+
+### Tests Inbound SMS (2026-09-14) — Session 5 — NOUVEAU
+
+```
+23 PASS / 0 FAIL / 23 total ✅
+```
+
+Fichier : `test/sms-inbound-tests.js`
 
 ### Tests INfiniReach (2026-09-13) — Audit + Nouveaux tests F/I/K
 

@@ -165,19 +165,33 @@ async function findExternalConvByPhone(db, externalPhone, infobipNumber = null) 
 
     if (snap.empty) return null;
 
-    // Si on a le numéro Infobip, filtrer par le propriétaire qui possède ce numéro
-    // (dans le cas où plusieurs utilisateurs OmniSMS utilisent le même service Infobip,
-    //  ce qui est rare mais possible)
-    if (infobipNumber && snap.docs.length > 1) {
-      // Trouver le propriétaire du numéro Infobip
+    // Si on a le numéro SIM destinataire (infobipNumber = to = numéro du Z Fold2),
+    // filtrer par le propriétaire OmniSMS qui possède ce numéro SIM.
+    // IMPORTANT: on applique ce filtre TOUJOURS (pas seulement quand docs.length > 1)
+    // pour garantir que le bon ownerUid est retourné même s'il n'y a qu'un seul résultat.
+    if (infobipNumber) {
       const owner = await resolveUserByPhone(infobipNumber);
       if (owner.found) {
         const owned = snap.docs.find(d => d.data().ownerUid === owner.uid);
-        if (owned) return { conversationId: owned.id, ...owned.data() };
+        if (owned) {
+          logger.info('[MessageRouter] findExternalConvByPhone → filtre SIM owner appliqué', {
+            ownerUid : owner.uid,
+            convId   : owned.id,
+          });
+          return { conversationId: owned.id, ...owned.data() };
+        }
+        // Propriétaire du numéro SIM trouvé mais aucune conversation externe pour ce couple
+        // → retourner null pour que l'appelant crée/retrouve la conv via ownerUid
+        logger.info('[MessageRouter] findExternalConvByPhone → owner SIM trouvé, pas de conv externe pour ce couple', {
+          ownerUid   : owner.uid,
+          externalPhone: e164.replace(/\d{4}$/, '****'),
+        });
+        return null;
       }
     }
 
-    // Retourner la conversation la plus récente
+    // Pas de numéro SIM fourni ou owner non résolu :
+    // retourner la conversation la plus récente (comportement dégradé)
     const sorted = snap.docs
       .map(d => ({ conversationId: d.id, ...d.data() }))
       .sort((a, b) => new Date(b.lastMessageAt || b.updatedAt || 0) - new Date(a.lastMessageAt || a.updatedAt || 0));

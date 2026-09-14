@@ -567,3 +567,99 @@ Une nouvelle inscription crée un nouveau document avec `deleted: false` (ou san
 Le numéro est de nouveau résolu → redevient OmniSMS.
 
 **Pas de cache** : `resolveUserByPhone()` interroge Firestore à chaque appel. Aucun état mis en cache qui pourrait retourner un ancien UID supprimé.
+
+---
+
+## 17. Correction inbound SMS — ownerUid (Session 5)
+
+### Problème identifié
+
+`findExternalConvByPhone(db, fromE164, recipientE164)` retournait la conversation
+la plus récente par `lastMessageAt` sans vérifier que `ownerUid` correspond au
+propriétaire du numéro SIM destinataire (`to` = INFINIREACH_FROM_NUMBER).
+
+Cas concret : si deux conversations existaient pour le même numéro expéditeur
+(ex: une ancienne de test avec un mauvais `ownerUid`), le message arrivait dans
+le mauvais compte OmniSMS.
+
+### Correction apportée (`services/messageRouter.js`)
+
+Le filtre `infobipNumber` (= champ `to` du webhook = numéro SIM Z Fold2) est
+maintenant appliqué **toujours** (pas seulement quand `docs.length > 1`) :
+
+1. Si `infobipNumber` est fourni → `resolveUserByPhone(infobipNumber)` → `ownerUid`
+2. Chercher la conversation avec cet `ownerUid` exact
+3. Si aucune conversation n'appartient au bon `ownerUid` → retourner `null`
+   (force l'appelant à créer une nouvelle conversation avec le bon UID)
+4. Si `infobipNumber` est absent → fallback ancienne logique (conv la plus récente)
+
+### Priorité des cas (sms.gateway.inbound.js — inchangé)
+
+```
+Cas A : Protocole # → resolveUserByPhone(hashParsed.targetPhone)
+Cas B : findExternalConvByPhone(db, from, to) → ownerUid depuis conv FILTRÉE
+Cas C : resolveUserByPhone(to) → propriétaire du SIM Z Fold2
+```
+
+### Tests ajoutés (test/sms-inbound-tests.js — 23 tests)
+
+- E1/E2/E3 : correction findExternalConvByPhone (filtre SIM owner)
+- I1/I2 : flow inbound complet (Cas B + Cas C)
+- K1/L1 : ownerUid + Socket.IO au bon UID
+- A1-A4 : normalisation numéros BF
+- B1/B2 : resolveUserByPhone E.164 + variante courte
+- C1 : numéro non trouvé
+- D1/D2 : compte deleted=true
+- F1/F2 : création conversation externe
+- M1-M3 : protocole #
+- J1/J2 : déduplication Redis
+
+---
+
+## 18. Corrections Flutter (Session 5)
+
+### B — iOS/Safari/PWA
+
+Framework : **Flutter** (pas React/web). Fichiers dans `/home/user/frontend/`.
+
+**Cause principale : scroll automatique perpétuel**
+Dans `conversation_screen.dart`, `addPostFrameCallback((_) => _scrollToBottom())`
+était appelé à CHAQUE rebuild du `ListView.builder`, empêchant l'utilisateur de
+remonter dans l'historique et causant des sauts visuels sur iOS.
+
+**Correction :**
+- Nouveau flag `_hasScrolledToBottom` : scroll automatique seulement au premier
+  chargement et à l'arrivée de nouveaux messages (quand l'utilisateur est en bas).
+- Si l'utilisateur a remonté dans l'historique, le scroll ne force plus le bas.
+
+**SafeArea :**
+- `VoiceRecorderWidget` avait son propre `SafeArea` imbriqué dans celui du
+  `ConversationScreen` → double inset sur iPhone avec encoche. Supprimé.
+
+### C — Microphone Android + iOS
+
+**Android (`android/app/src/main/AndroidManifest.xml`) :**
+- Permission `RECORD_AUDIO` était commentée → ajoutée.
+
+**iOS (`ios/Runner/Info.plist`) :**
+- Clé `NSMicrophoneUsageDescription` absente → ajoutée.
+- Sans cette clé, iOS refuse l'accès au microphone et peut crasher l'application.
+
+**`pubspec.yaml` :**
+- Ajout de `record: ^5.1.2` (enregistrement audio mobile).
+- Ajout de `permission_handler: ^11.3.1` (demande permission runtime Android/iOS).
+
+**`voice_recorder_widget.dart` :**
+- Demande de permission avant démarrage de l'enregistrement.
+- Gestion gracieuse du refus (SnackBar explicatif, pas de blocage de l'interface).
+
+### D — Historique des messages
+
+**Cause : remplacement de liste lors du polling**
+`_pollMessages()` dans `MessagingProvider` remplaçait entièrement
+`_messagesMap[conversationId]` à chaque appel (toutes les 15s).
+
+**Correction :**
+- Fusion intelligente : seuls les messages absents de la liste locale sont ajoutés.
+- Tri chronologique préservé.
+- L'utilisateur peut remonter dans l'historique sans que les messages disparaissent.
