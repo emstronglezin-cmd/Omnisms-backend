@@ -440,8 +440,13 @@ async function processSmsReceived(webhookBody) {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // ÉTAPE 4 : Notifier le propriétaire via Socket.IO
+  // ÉTAPE 4 : Vérifier la présence puis livrer le message
   // ─────────────────────────────────────────────────────────────
+  // Règle de routage :
+  //   ownerUid trouvé + connecté  → OmniSMS (Socket.IO)
+  //   ownerUid trouvé + déconnecté → SMS ordinaire (fallback)
+  //   ownerUid absent              → message en Firestore seulement
+
   const socketPayload = {
     id            : savedMsgId || `infinireach-inbound-${Date.now()}`,
     type          : 'text',
@@ -461,13 +466,61 @@ async function processSmsReceived(webhookBody) {
   };
 
   if (ownerUid) {
-    emitFn(ownerUid, 'message:receive', socketPayload);
-    emitFn(ownerUid, 'new_message',     socketPayload); // rétrocompat
-    logger.info('[INfiniReach] webhook:inbound message:receive émis', {
-      uid   : ownerUid,
-      from  : fromE164.replace(/\d{4}$/, '****'),
-      convId,
-    });
+    // Vérifier la présence réelle de l'utilisateur via Socket.IO / Redis
+    let ownerIsOnline = false;
+    try {
+      const { isUserOnline } = require('../services/socketService');
+      ownerIsOnline = await isUserOnline(ownerUid);
+    } catch (_) {
+      // socketService non disponible → supposer offline pour sécurité
+      ownerIsOnline = false;
+    }
+
+    if (ownerIsOnline) {
+      // Utilisateur connecté → livraison OmniSMS temps réel
+      emitFn(ownerUid, 'message:receive', socketPayload);
+      emitFn(ownerUid, 'new_message',     socketPayload); // rétrocompat
+      logger.info('[INfiniReach] webhook:inbound → OmniSMS (utilisateur connecté)', {
+        uid   : ownerUid,
+        from  : fromE164.replace(/\d{4}$/, '****'),
+        convId,
+      });
+    } else {
+      // Utilisateur déconnecté → SMS ordinaire (fallback)
+      // Message déjà en Firestore, sera récupéré à la reconnexion
+      logger.info('[INfiniReach] webhook:inbound → SMS ordinaire (utilisateur déconnecté)', {
+        uid   : ownerUid,
+        from  : fromE164.replace(/\d{4}$/, '****'),
+        convId,
+      });
+
+      const smsGateway = getSmsGateway();
+      if (smsGateway && smsGateway.isConfigured()) {
+        try {
+          const senderDisplay = fromE164;
+          const smsText = `[OmniSMS] Message de ${senderDisplay} : ${finalText}`;
+          const smsResult = await smsGateway.sendSMS({
+            to       : fromE164,                  // répondre à l'expéditeur original
+            text     : smsText,
+            messageId: savedMsgId || null,
+            ttl      : 3600,
+          });
+          logger.info('[INfiniReach] webhook:inbound SMS fallback envoyé', {
+            to       : fromE164.replace(/\d{4}$/, '****'),
+            success  : smsResult?.success,
+          });
+        } catch (smsErr) {
+          logger.warn('[INfiniReach] webhook:inbound SMS fallback échoué', {
+            error: smsErr.message,
+          });
+        }
+      } else {
+        // Pas de SMS Gateway configuré — message stocké uniquement en Firestore
+        logger.warn('[INfiniReach] webhook:inbound Pas de SMS Gateway → message en Firestore seulement', {
+          hint: 'Configurer INFINIREACH_API_KEY pour le fallback SMS',
+        });
+      }
+    }
   }
 
   // Broadcast général (debug, clients non identifiés)

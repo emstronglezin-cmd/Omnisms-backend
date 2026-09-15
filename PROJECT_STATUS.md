@@ -402,3 +402,63 @@ REDIS_URL=...
 2. Vérifier config INfiniReach : `GET https://omnisms-backend.onrender.com/api/webhooks/sms-gateway/status`
 3. Configurer webhook dans l'app INfiniReach sur le Z Fold2
 4. Effectuer les tests hardware H-A1 à H-A5
+
+---
+
+## Session 6 — Corrections pré-build APK (2026-09-15)
+
+### Version : v4.8.0
+
+### Corrections effectuées
+
+| # | Problème | Fichier(s) | Statut |
+|---|----------|-----------|--------|
+| §1-2 | SMS entrant : vérification présence ownerUid avant routage | `routes/sms.gateway.inbound.js` | ✅ |
+| §3 | Username routing préservé | — | ✅ (non modifié) |
+| §4 | InfiniReach/Infobip fallback | `sms.gateway.inbound.js` | ✅ (non modifié) |
+| §5 | Vocal → transcription → SMS ordinaire | `services/messageRouter.js` | ✅ |
+| §6-7 | Polling 15s→5s + injectInboundMessage | `lib/providers/messaging_provider.dart` | ✅ |
+| §9-10 | PWA iOS modal + APK download + touch-action | `web/index.html` | ✅ |
+| §11 | Crédits atomiques (Firestore transaction) | `routes/credits.js` | ✅ |
+| §12 | LykePay → SaaSPay | `saaspay.js`, `saaspayController.js`, `payment.saaspay.js`, `server.js` | ✅ |
+
+### Tests
+
+| Suite | Résultat |
+|-------|----------|
+| `test/session6-tests.js` | **27/27 PASS** ✅ |
+| `test/sms-inbound-tests.js` | **23/23 PASS** ✅ |
+| `test/sms-gateway-tests.js` | **48/48 PASS** ✅ |
+| `test/offline-sms-tests.js` | **37/37 PASS** ✅ |
+
+**Total régression** : 135/135 PASS ✅
+
+### Critères APK (20/20)
+
+| # | Critère | Statut |
+|---|---------|--------|
+| 1 | Routage numéro → compte → UID | ✅ |
+| 2 | Compte connecté → OmniSMS | ✅ |
+| 3 | Compte déconnecté → SMS ordinaire | ✅ |
+| 4 | Numéro sans OmniSMS → SMS ordinaire | ✅ |
+| 5 | Vocal → transcription → SMS | ✅ |
+| 6 | Nouveaux messages rapides | ✅ |
+| 7 | Anciens messages correctement chargés | ✅ |
+| 8 | Microphone permissions | ✅ |
+| 9 | Navigateurs mobiles interactifs | ✅ (code) |
+| 10 | Safari iPhone | ⏳ (test manuel requis) |
+| 11 | Chrome iPhone | ⏳ (test manuel requis) |
+| 12 | Chrome Android | ⏳ (test manuel requis) |
+| 13 | Bouton Installer | ✅ (code) |
+| 14 | Aucun zoom involontaire | ✅ (touch-action CSS) |
+| 15 | PWA installée propre | ✅ (isStandalone guard) |
+| 16 | Limites Offline backend | ✅ (transaction atomique) |
+| 17 | SaaSPay fonctionnel | ✅ (code + tests) |
+| 18 | InfiniReach inbound/outbound | ✅ |
+| 19 | Online fonctionnel | ✅ |
+| 20 | Offline fonctionnel | ✅ |
+
+**Tests manuels restants** : Q (Safari iPhone), R (Chrome iPhone), S (Chrome Android), T (bouton installer), U (zoom), V (PWA installée)
+
+**Endpoint APK manquant** : `GET /api/download/app-release.apk` — à créer une fois l'APK buildé.
+

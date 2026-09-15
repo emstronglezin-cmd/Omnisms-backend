@@ -583,8 +583,116 @@ async function routeMessage(opts = {}) {
         logger.warn('[ROUTING] Could not enqueue SMS retry job after exception', { error: qErr.message });
       }
     }
+  } else if (type === 'audio' && audioUrl) {
+    // ── Message vocal → destinataire sans OmniSMS ou déconnecté ──────────
+    // Règle : NE PAS envoyer le fichier audio par SMS.
+    // Utiliser la transcription existante → envoyer le texte en SMS ordinaire.
+
+    logger.info('[ROUTING] Message audio → destinataire SMS externe, transcription nécessaire', {
+      senderUid, convId, audioUrl: (audioUrl || '').substring(0, 60),
+    });
+
+    let transcribedText = null;
+    try {
+      const transcriptionService = require('./transcriptionService');
+      // L'audioUrl peut être une URL https ou un chemin local
+      let audioPath = null;
+
+      if (audioUrl && (audioUrl.startsWith('/') || audioUrl.startsWith('./') || audioUrl.startsWith('uploads/'))) {
+        // Chemin relatif local → absolu
+        const path = require('path');
+        audioPath = audioUrl.startsWith('/') ? audioUrl : path.join(__dirname, '..', audioUrl);
+      } else if (audioUrl && audioUrl.startsWith('https://')) {
+        // URL distante → télécharger dans un fichier temp avant transcription
+        const https = require('https');
+        const fs    = require('fs');
+        const os    = require('os');
+        const path  = require('path');
+        const ext   = audioUrl.split('.').pop().split('?')[0] || 'mp3';
+        audioPath   = path.join(os.tmpdir(), `omnisms-audio-${Date.now()}.${ext}`);
+        await new Promise((resolve, reject) => {
+          const file = fs.createWriteStream(audioPath);
+          https.get(audioUrl, (res) => {
+            res.pipe(file);
+            file.on('finish', () => { file.close(); resolve(); });
+          }).on('error', (err) => {
+            fs.unlink(audioPath, () => {});
+            reject(err);
+          });
+        });
+      }
+
+      if (audioPath) {
+        const result = await transcriptionService.transcribe({ audioPath, language: 'fr' });
+        if (result && result.text && result.text.trim()) {
+          transcribedText = result.text.trim();
+          logger.info('[ROUTING] Transcription réussie', {
+            senderUid, chars: transcribedText.length, method: result.method,
+          });
+        }
+      }
+    } catch (transcribeErr) {
+      logger.warn('[ROUTING] Transcription échouée — message audio non délivré par SMS', {
+        error: transcribeErr.message,
+        senderUid,
+      });
+    }
+
+    if (transcribedText && transport !== 'none') {
+      // Envoyer le texte transcrit en SMS
+      const senderDisplay = senderName
+        ? `${senderName}${senderPhone ? ` (${senderPhone})` : ''}`
+        : (senderPhone || 'Un utilisateur OmniSMS');
+      const smsTextAudio = `[OmniSMS Vocal] ${senderDisplay} : ${transcribedText}`;
+
+      try {
+        let audioSmsResult = null;
+        if (transport === 'sms_gateway') {
+          audioSmsResult = await smsGateway.sendSMS({
+            to       : e164Target,
+            text     : smsTextAudio,
+            messageId: savedId !== msgId ? savedId : null,
+            ttl      : 3600,
+          });
+        } else if (transport === 'infobip') {
+          const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
+          audioSmsResult = await infobip.sendSMS({
+            to       : e164Target,
+            text     : smsTextAudio,
+            notifyUrl: deliveryUrl,
+          });
+        }
+
+        // Mettre à jour le message Firestore avec la transcription et le statut
+        if (db && savedId && savedId !== msgId) {
+          await db.collection('messages').doc(savedId).update({
+            transcription      : transcribedText,
+            transcriptionStatus: 'completed',
+            status             : audioSmsResult?.success ? 'sent' : 'pending',
+            smsProvider        : transport,
+            updatedAt          : new Date().toISOString(),
+          }).catch(() => {});
+        }
+
+        logger.info('[ROUTING] Message vocal transcrit → SMS envoyé', {
+          senderUid,
+          targetPhone   : e164Target.replace(/\d{4}$/, '****'),
+          transport,
+          smsSuccess    : audioSmsResult?.success,
+          transcriptLen : transcribedText.length,
+        });
+      } catch (audioSmsErr) {
+        logger.error('[ROUTING] Envoi SMS vocal échoué après transcription', {
+          error: audioSmsErr.message, senderUid,
+        });
+      }
+    } else if (!transcribedText) {
+      logger.warn('[ROUTING] Audio → SMS impossible : transcription vide ou échouée, message en Firestore seulement', {
+        senderUid, convId,
+      });
+    }
   } else if (type !== 'text') {
-    logger.info('[ROUTING] Audio/image → SMS non supporté, message enregistré uniquement', {
+    logger.info('[ROUTING] Type non supporté pour SMS externe, message enregistré uniquement', {
       senderUid, type, convId,
     });
   }

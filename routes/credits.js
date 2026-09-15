@@ -73,6 +73,11 @@ router.post('/add', authenticate, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // POST /credits/decrement
 // Décrémenter des crédits (envoi de message)
+//
+// ATOMICITÉ : utilise une transaction Firestore pour éviter les
+// race conditions lors d'envois simultanés (§11 — monétisation Offline).
+// Un utilisateur ne peut pas contourner la limite en envoyant plusieurs
+// messages en parallèle.
 // ─────────────────────────────────────────────────────────────
 router.post('/decrement', authenticate, async (req, res) => {
   const { amount = 1 } = req.body;
@@ -86,46 +91,66 @@ router.post('/decrement', authenticate, async (req, res) => {
   }
 
   try {
-    const user = await getUserDoc(uid);
+    const userRef = db.collection('users').doc(uid);
 
-    if (!user) {
-      return res.status(404).json({ error: 'Utilisateur non trouvé.', code: 'NOT_FOUND' });
-    }
+    // ── Transaction atomique ──────────────────────────────────
+    // Garantit qu'un seul envoi simultané ne bypasse pas le solde.
+    // Si le solde est insuffisant → abort → HTTP 400 (pas de décrément).
+    let newTotal;
 
-    // Les abonnés premium ne consomment pas de crédits
-    if (user.isSubscribed) {
-      return res.status(200).json({
-        success: true,
-        message: 'Utilisateur Premium — crédits non consommés.',
-        credits: user.credits || 0,
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+
+      if (!snap.exists) {
+        const error = new Error('NOT_FOUND');
+        error.code = 'NOT_FOUND';
+        throw error;
+      }
+
+      const user = snap.data();
+
+      // Premium : ne pas consommer de crédits — sortir sans modification
+      if (user.isSubscribed) {
+        newTotal = user.credits || 0;
+        return; // transaction commit sans modification
+      }
+
+      const current = user.credits || 0;
+
+      if (current < amount) {
+        const error = new Error(`Crédits insuffisants (solde : ${current}, requis : ${amount}).`);
+        error.code    = 'INSUFFICIENT_CREDITS';
+        error.credits = current;
+        throw error;
+      }
+
+      newTotal = current - amount;
+
+      tx.update(userRef, {
+        credits  : newTotal,
+        updatedAt: new Date().toISOString(),
       });
-    }
-
-    const current = user.credits || 0;
-
-    if (current < amount) {
-      return res.status(400).json({
-        error  : `Crédits insuffisants (solde : ${current}, requis : ${amount}).`,
-        code   : 'INSUFFICIENT_CREDITS',
-        credits: current,
-      });
-    }
-
-    const newTotal = current - amount;
-
-    await db.collection('users').doc(uid).update({
-      credits  : newTotal,
-      updatedAt: new Date().toISOString(),
     });
 
-    logger.info('Crédits décrémentés', { uid, used: amount, remaining: newTotal });
+    logger.info('Crédits décrémentés (atomique)', { uid, used: amount, remaining: newTotal });
 
     return res.status(200).json({
       success : true,
       message : `${amount} crédit(s) consommé(s).`,
       credits : newTotal,
     });
+
   } catch (err) {
+    if (err.code === 'NOT_FOUND') {
+      return res.status(404).json({ error: 'Utilisateur non trouvé.', code: 'NOT_FOUND' });
+    }
+    if (err.code === 'INSUFFICIENT_CREDITS') {
+      return res.status(400).json({
+        error  : err.message,
+        code   : 'INSUFFICIENT_CREDITS',
+        credits: err.credits || 0,
+      });
+    }
     logger.error('Erreur POST /credits/decrement', { error: err.message, uid });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }

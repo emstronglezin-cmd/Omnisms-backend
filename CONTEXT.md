@@ -663,3 +663,93 @@ remonter dans l'historique et causant des sauts visuels sur iOS.
 - Fusion intelligente : seuls les messages absents de la liste locale sont ajoutés.
 - Tri chronologique préservé.
 - L'utilisateur peut remonter dans l'historique sans que les messages disparaissent.
+
+---
+
+## 19. Corrections Session 6 — Pré-build APK
+
+### §1-2 : Présence SMS entrant (routage online/offline)
+
+**Problème** : `processSmsReceived()` émettait toujours vers Socket.IO, sans vérifier si l'utilisateur était réellement connecté.
+
+**Correction** (`routes/sms.gateway.inbound.js`) :
+- ÉTAPE 4 appelle `isUserOnline(ownerUid)` depuis `socketService.js` (Redis hash `online_users`).
+- Connecté → `emitFn(ownerUid, 'message:receive', ...)` OmniSMS temps réel.
+- Déconnecté → `smsGateway.sendSMS()` fallback SMS ordinaire.
+- `isUserOnline()` retourne `false` si Redis absent (dégradation sécurisée).
+
+### §3 : Username routing
+
+Logique `#username` et `resolveUserByUsername` préservée intégralement — aucune modification.
+
+### §4 : SMS fallback (InfiniReach/Infobip)
+
+InfiniReach et Infobip **non modifiés**. Le fallback dans `sms.gateway.inbound.js` appelle `smsGateway.sendSMS()` (chemin déjà validé).
+
+### §5 : Message vocal → destinataire sans OmniSMS
+
+**Problème** : `routeMessage()` avait un `else if (type !== 'text')` qui ne faisait rien pour les messages audio vers des destinataires externes.
+
+**Correction** (`services/messageRouter.js`) :
+- Nouvelle branche `else if (type === 'audio' && audioUrl)`.
+- Si audioUrl = chemin local → `audioPath` direct.
+- Si audioUrl = URL https → téléchargement dans fichier temp.
+- `transcriptionService.transcribe({ audioPath, language: 'fr' })` → `transcribedText`.
+- `smsGateway.sendSMS()` ou `infobip.sendSMS()` avec `[OmniSMS Vocal] ... : ${transcribedText}`.
+- Mise à jour Firestore avec `transcription`, `transcriptionStatus: 'completed'`.
+- Pas d'envoi si transcription vide ou échouée (log warn + message Firestore seulement).
+
+### §6-7 : Actualisation rapide des messages (Flutter)
+
+**Correction** (`lib/providers/messaging_provider.dart`) :
+- Polling réduit de 15s → **5s** (`Duration(seconds: 5)`).
+- Nouvelle méthode `injectInboundMessage(conversationId, message)` : injection immédiate sans attendre le prochain cycle de polling. Déduplication par `message.id`, tri chronologique, `notifyListeners()`.
+- `_pollMessages()` utilise déjà la fusion (merge, pas replace) — correction Session 5 préservée.
+
+### §9-10 : PWA navigateur mobile
+
+**Correction** (`web/index.html`) :
+- Détection plateforme : `isIOS`, `isAndroid`, `isStandalone`.
+- Guard `isStandalone` : ne montre pas le prompt si PWA déjà installée.
+- **Chrome Android** : `beforeinstallprompt` → `deferredPrompt.prompt()`.
+- **Safari iOS** : `showIOSInstructions()` → modal `#ios-install-modal` avec guide 3 étapes (Partager → Ajouter à l'écran d'accueil).
+- **Android autres navigateurs** : `downloadAPK()` → `APK_DOWNLOAD_URL`.
+- CSS : `touch-action: manipulation`, `min-height: 44px`, `pointer-events: auto` sur boutons → supprime zoom involontaire Safari.
+
+### §11 : Monétisation Offline atomique
+
+**Problème** : `ref.update({ credits: newTotal })` était non-atomique, permettant des race conditions sur envois simultanés.
+
+**Correction** (`routes/credits.js`) :
+- `POST /credits/decrement` utilise `db.runTransaction(async (tx) => { tx.get(); tx.update(); })`.
+- Si crédits insuffisants → `throw` dans la transaction → abort → HTTP 400.
+- Utilisateurs premium (`isSubscribed: true`) exemptés sans modification du solde.
+
+### §12 : LykePay → SaaSPay
+
+**Nouveaux fichiers** :
+- `services/saaspay.js` — service SaaSPay, env vars `SAASPAY_*`, URL `https://saaspay.me/api/v1/checkout`, signature `X-SaaSPay-Signature`. Toute la logique métier (montants, retry, validation) copiée depuis `leekpay.js`.
+- `controllers/saaspayController.js` — contrôleur SaaSPay, collection Firestore `leekpay_payments` conservée pour rétrocompatibilité.
+- `routes/payment.saaspay.js` — routes SaaSPay avec alias `/webhook/saaspay` ET `/webhook/leekpay` (backward compat).
+
+**Fichiers modifiés** :
+- `server.js` : `checkLeekPay()` vérifie `SAASPAY_API_KEY && SAASPAY_SECRET_KEY` OR `LEEKPAY_API_KEY && LEEKPAY_SECRET_KEY`. Route `app.use('/api/payment', saasPayRoutes)` montée.
+- `lib/services/payment_service.dart` : commentaires et gestion d'erreur mis à jour pour référencer SaaSPay.
+
+**Fichiers anciens conservés** : `leekpay.js`, `leekpayController.js`, `payment.leekpay.js` — backward compat, non modifiés.
+
+### Tests Session 6
+
+Fichier : `test/session6-tests.js` (28 tests A–AB)
+
+**Résultats** : **27/27 PASS** ✅ (test AB = 28ème, numérotation interne 27 total)
+
+**Régression** :
+- `node test/sms-inbound-tests.js` → **23/23 PASS** ✅
+- `node test/sms-gateway-tests.js` → **48/48 PASS** ✅
+- `node test/offline-sms-tests.js` → **37/37 PASS** ✅
+
+### Dépendances installées
+
+- `axios` — requis par `services/saaspay.js`
+- `accepts` — requis transitif de `socket.io` (déjà présent, résolu par `npm install`)

@@ -83,7 +83,10 @@ app.use(
 
 /* ── Checks de configuration ─────────────────────────────── */
 function checkLeekPay() {
-  return !!(process.env.LEEKPAY_API_KEY && process.env.LEEKPAY_SECRET_KEY);
+  // Vérifier SaaSPay (nouveau) OU LeekPay (legacy backward compat)
+  const saaspayOk = !!(process.env.SAASPAY_API_KEY && process.env.SAASPAY_SECRET_KEY);
+  const leekpayOk = !!(process.env.LEEKPAY_API_KEY && process.env.LEEKPAY_SECRET_KEY);
+  return saaspayOk || leekpayOk;
 }
 function checkInfobip() {
   return !!(process.env.INFOBIP_API_KEY && process.env.INFOBIP_BASE_URL);
@@ -116,7 +119,7 @@ app.get('/', (_req, res) => {
     payments : lpOk,
     sms      : infobipOk,
     realtime : true,
-    leekpay  : lpOk      ? 'ACTIVE' : 'INACTIVE — set LEEKPAY_API_KEY + LEEKPAY_SECRET_KEY',
+    payments : lpOk      ? 'ACTIVE' : 'INACTIVE — set SAASPAY_API_KEY + SAASPAY_SECRET_KEY (or legacy LEEKPAY_*)',
     infobip  : infobipOk ? 'ACTIVE' : 'INACTIVE — set INFOBIP_API_KEY + INFOBIP_BASE_URL',
     env      : process.env.NODE_ENV || 'development',
     time     : new Date().toISOString(),
@@ -157,7 +160,7 @@ app.get('/health', (_req, res) => {
     checks  : {
       firebase      : firebaseOk      ? 'ok' : 'MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON',
       jwt           : jwtOk           ? 'ok' : 'MISSING — set JWT_SECRET',
-      leekpay       : lpOk            ? 'ACTIVE' : 'INACTIVE — set LEEKPAY_API_KEY + LEEKPAY_SECRET_KEY',
+      payments      : lpOk            ? 'ACTIVE' : 'INACTIVE — set SAASPAY_API_KEY + SAASPAY_SECRET_KEY',
       infobip       : infobipOk       ? 'ACTIVE' : 'INACTIVE — set INFOBIP_API_KEY + INFOBIP_BASE_URL',
       redis         : redisOk         ? 'CONFIGURED' : 'MISSING — using memory fallback (set REDIS_URL)',
       socketio      : 'ACTIVE',
@@ -207,7 +210,8 @@ app.get('/health', (_req, res) => {
 /* ── Route imports ───────────────────────────────────────── */
 const authRoutes         = require('./routes/auth');
 // OTP routes supprimées — inscription directe sans OTP
-const leekPayRoutes      = require('./routes/payment.leekpay');
+const leekPayRoutes      = require('./routes/payment.leekpay');   // backward compat
+const saasPayRoutes      = require('./routes/payment.saaspay');   // SaaSPay (nouveau)
 const webhookRoutes      = require('./routes/webhook');
 const infobipRoutes        = require('./routes/sms.infobip');
 const infobipInboundRoutes = require('./routes/infobip.inbound');
@@ -260,15 +264,16 @@ app.use('/api/webhooks', infobipInboundRoutes);
 /* ── SMS Gateway Z Fold2 webhooks entrants (principal) ───── */
 app.use('/api/webhooks', smsGatewayInboundRoutes);
 
-/* ── LeekPay payments ─────────────────────────────────────── */
-app.use('/api/payment', leekPayLimiter, leekPayRoutes);
+/* ── SaaSPay payments (nouveau — remplace LeekPay) ────────── */
+app.use('/api/payment', leekPayLimiter, saasPayRoutes);
+app.use('/api/payment', leekPayLimiter, leekPayRoutes);  // backward compat — garder pendant transition
 app.use('/api/payment', webhookRoutes);   // retrocompat webhook
 
 /* ── Infobip SMS ─────────────────────────────────────────── */
 app.use('/', infobipRoutes);
 
-/* ── Premium user status (via LeekPay controller) ────────── */
-const { getUserPremiumStatus } = require('./controllers/leekpayController');
+/* ── Premium user status (via SaaSPay controller) ────────── */
+const { getUserPremiumStatus } = require('./controllers/saaspayController');
 app.get('/api/user/status', (req, res) => getUserPremiumStatus(req, res));
 
 /* ── Admin & feature routes ──────────────────────────────── */
@@ -322,7 +327,7 @@ app.get('/api/diag', (_req, res) => {
     'REDIS_URL',
     'GROQ_API_KEY', 'GROQ_WHISPER_MODEL',
     'INFOBIP_API_KEY', 'INFOBIP_BASE_URL', 'INFOBIP_SENDER_ID', 'INFOBIP_SENDER',
-    'LEEKPAY_API_KEY', 'LEEKPAY_SECRET_KEY', 'LEEKPAY_BASE_URL',
+    'SAASPAY_API_KEY', 'SAASPAY_SECRET_KEY', 'SAASPAY_BASE_URL',
     'DEFAULT_PHONE_COUNTRY', 'WHISPER_MODEL', 'WHISPER_LANGUAGE',
   ];
 
@@ -522,7 +527,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('🌍 ENV        : ' + (process.env.NODE_ENV || 'development'));
   console.log('🔥 Firebase   : ' + (firebaseOk ? '✅ configured' : '❌ MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON'));
   console.log('🔑 JWT        : ' + (jwtOk ? '✅ configured' : '❌ MISSING — set JWT_SECRET'));
-  console.log('💳 LeekPay    : ' + (lpOk  ? '✅ ACTIVE' : '⚠️  INACTIVE — set LEEKPAY_API_KEY + LEEKPAY_SECRET_KEY'));
+  console.log('💳 SaaSPay    : ' + (lpOk  ? '✅ ACTIVE' : '⚠️  INACTIVE — set SAASPAY_API_KEY + SAASPAY_SECRET_KEY'));
   console.log('📡 Infobip    : ' + (infobipOk
     ? `✅ ACTIVE — key:${infobipKeyPrefix}... url:${infobipNormUrl} hasHttps:${!!infobipHasHttps}`
     : '❌ INACTIVE — set INFOBIP_API_KEY and INFOBIP_BASE_URL'));
