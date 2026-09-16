@@ -462,3 +462,42 @@ REDIS_URL=...
 
 **Endpoint APK manquant** : `GET /api/download/app-release.apk` — à créer une fois l'APK buildé.
 
+
+---
+
+## Session 7 — Bugs critiques routage SMS entrant (2026-09-16)
+
+### Version : v4.9.0
+
+### Bugs corrigés
+
+| Bug | Description | Fichier | Fix |
+|-----|-------------|---------|-----|
+| Bug 1 | `smsGateway.sendSMS({ to: fromE164 })` — fallback vers l'expéditeur au lieu du destinataire | `routes/sms.gateway.inbound.js` | `to: recipientE164` ✅ |
+| Bug 2 | Présence vérifiée mais Socket.IO room non consultée si Redis vide | `routes/sms.gateway.inbound.js` | Double check Redis + `io.in('user:{ownerUid}').fetchSockets()` ✅ |
+
+### Tests Session 7
+
+| Suite | Résultat |
+|-------|----------|
+| `test/routing-presence-tests.js` (T1–T7, 34 tests) | **34/34 PASS** ✅ |
+| `test/session6-tests.js` (A–AB) | **27/27 PASS** ✅ |
+| `test/sms-inbound-tests.js` | **23/23 PASS** ✅ |
+| `test/sms-gateway-tests.js` | **48/48 PASS** ✅ |
+| `test/offline-sms-tests.js` | **37/37 PASS** ✅ |
+| **Total** | **169/169 PASS** ✅ |
+
+### Logs diagnostic ajoutés
+
+```
+[INfiniReach] ROUTING — diagnostic { incomingFrom, incomingTo, resolvedRecipientUid, recipientOmniSms }
+[INfiniReach] ROUTING — décision  { recipientPresence, routingDecision, fallbackTo, fallbackFrom }
+```
+
+### Invariants garantis
+
+1. `fallbackTo` = **toujours** `recipientE164` (destinataire du SMS entrant)
+2. Présence vérifiée pour `ownerUid` UNIQUEMENT (pas d'isolation par contagion d'autres UIDs)
+3. InfiniReach outbound inchangé (numéro SIM passerelle `INFINIREACH_FROM_NUMBER`)
+4. Toutes les fonctionnalités existantes non touchées
+

@@ -753,3 +753,72 @@ Fichier : `test/session6-tests.js` (28 tests A–AB)
 
 - `axios` — requis par `services/saaspay.js`
 - `accepts` — requis transitif de `socket.io` (déjà présent, résolu par `npm install`)
+
+---
+
+## 20. Corrections Session 7 — Bugs critiques routage SMS entrant
+
+### Bugs identifiés en production (logs réels)
+
+**Cas réel observé** :
+```
+SMS entrant :  FROM = +2265767****  (expéditeur)
+               TO   = +2267540****  (destinataire)
+[USER_RESOLUTION] Phone resolved → OmniSMS
+  phone: +2267540****
+  uid: MGvh4dYLlwJhv5jQbBB9
+```
+
+**Bug 1 — Mauvais destinataire dans le fallback SMS** :
+Le code utilisait `to: fromE164` dans `smsGateway.sendSMS()` — soit l'**expéditeur** (+226 57...) au lieu du **destinataire** (+226 75...).
+
+**Bug 2 — Présence non isolée par UID** :
+`isUserOnline(ownerUid)` est correct dans son implémentation (Redis `hget('online_users', uid)`), mais si Redis est vide et que Socket.IO n'a pas de sockets dans la room `user:{ownerUid}`, l'utilisateur est marqué offline même s'il vient de se connecter. Ajout d'une double vérification Socket.IO room comme fallback.
+
+### Corrections (`routes/sms.gateway.inbound.js`)
+
+**Bug 1 — Fix** : `to: fromE164` → `to: recipientE164` dans `smsGateway.sendSMS()`.
+
+**Bug 2 — Fix** : Double vérification de présence :
+1. `isUserOnline(ownerUid)` → Redis `hget('online_users', ownerUid)` (par UID)
+2. Si Redis ne connaît pas encore ce UID → `io.in('user:{ownerUid}').fetchSockets()` (Socket.IO room spécifique)
+- La présence d'un UID B connecté (ex: `rvVb...`) ne peut pas rendre le UID A (`MGvh...`) online.
+
+### Logs de diagnostic ajoutés
+
+```
+[INfiniReach] ROUTING — diagnostic
+  incomingFrom: +2265767****
+  incomingTo: +2267540****
+  resolvedRecipientPhone: +2267540****
+  resolvedRecipientUid: MGvh4dYLlwJhv5jQbBB9
+  recipientOmniSms: true
+
+[INfiniReach] ROUTING — décision
+  recipientPresence: online | offline
+  routingDecision: omnisms | sms_fallback
+  fallbackTo: +2267540****       ← TOUJOURS le destinataire
+  fallbackFrom: (SIM passerelle) ← numéro InfiniReach validé
+```
+
+### Règle absolue du routage (documentée dans le code)
+
+```
+SMS entrant :  from = expéditeur / to = destinataire
+Si fallback :  send(to = recipientE164) ← DESTINATAIRE
+               JAMAIS send(to = fromE164) ← EXPÉDITEUR
+```
+
+### Tests Session 7
+
+Fichier : `test/routing-presence-tests.js` (34 tests T1–T7)
+
+**Résultats** : **34/34 PASS** ✅
+
+**Régression complète** :
+- `test/routing-presence-tests.js` → **34/34 PASS** ✅
+- `test/session6-tests.js` → **27/27 PASS** ✅
+- `test/sms-inbound-tests.js` → **23/23 PASS** ✅
+- `test/sms-gateway-tests.js` → **48/48 PASS** ✅
+- `test/offline-sms-tests.js` → **37/37 PASS** ✅
+- **Total** : **169/169 PASS** ✅

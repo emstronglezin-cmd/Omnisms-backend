@@ -55,8 +55,10 @@ test('C. sms.gateway.inbound.js contient la vérification de présence', () => {
   const src = fs.readFileSync(__dirname + '/../routes/sms.gateway.inbound.js', 'utf8');
   assert(src.includes('isUserOnline'), 'isUserOnline call must be present');
   assert(src.includes('ownerIsOnline'), 'ownerIsOnline variable must be present');
-  assert(src.includes('OmniSMS (utilisateur connecté)'), 'OmniSMS connected log must be present');
-  assert(src.includes('SMS ordinaire (utilisateur déconnecté)'), 'SMS fallback log must be present');
+  // Session 7 : logs restructurés avec routingDecision (plus précis que les anciennes chaînes)
+  assert(src.includes('routingDecision'), 'routingDecision log must be present');
+  assert(src.includes("'omnisms'") || src.includes('"omnisms"'), 'OmniSMS routing decision log must be present');
+  assert(src.includes("'sms_fallback'") || src.includes('"sms_fallback"'), 'SMS fallback routing decision log must be present');
 });
 
 // ── §3 — Username routing ────────────────────────────────────
