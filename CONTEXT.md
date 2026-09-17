@@ -822,3 +822,103 @@ Fichier : `test/routing-presence-tests.js` (34 tests T1–T7)
 - `test/sms-gateway-tests.js` → **48/48 PASS** ✅
 - `test/offline-sms-tests.js` → **37/37 PASS** ✅
 - **Total** : **169/169 PASS** ✅
+
+---
+
+## §21 — Session 8 — Audit complet et correction routage (2026-09-17)
+
+### Audit effectué
+
+Lecture complète de :
+- `services/messageRouter.js` (718 lignes)
+- `routes/messages.v2.js` (857 lignes)
+- `services/socketService.js` (handler `message:send`)
+- `routes/sms.gateway.inbound.js` (état post-Session 7)
+- `services/smsHandler.js` et `services/hybridSms.js` (pas de bug FROM/TO)
+- Frontend : `messaging_provider.dart`, `conversation_screen.dart`, `auth_service.dart`, `messaging_service.dart`, `web/index.html`
+
+### Bug critique corrigé — `routeMessage()` (messageRouter.js)
+
+**Problème** : à la ligne 309 (avant correction), `if (resolvedUid)` routait vers OMNISMS immédiatement dès qu'un compte OmniSMS était trouvé, **sans vérifier si l'utilisateur était réellement connecté**. Messages perdus pour destinataires offline.
+
+**Correction** :
+1. Vérification de présence `isUserOnline(resolvedUid)` ajoutée **avant** la route OMNISMS
+2. Double check : Redis → Socket.IO room `user:{resolvedUid}` (comme dans `sms.gateway.inbound.js`)
+3. Si offline : fallback SMS vers `resolvedUserInfo.phone` (numéro réel du destinataire — JAMAIS le numéro de l'expéditeur)
+4. Récupération du phone via `resolveUserByUid(resolvedUid)` quand `targetUid` préresolu sans userInfo
+
+**Règle maintenant codée** :
+```
+Compte existant ≠ utilisateur connecté
+→ OMNISMS uniquement si resolvedUid && recipientIsOnline
+→ SMS fallback si resolvedUid && !recipientIsOnline
+```
+
+### Logs structurés ajoutés
+
+```javascript
+// Présence destinataire
+[ROUTING] Vérification présence destinataire
+  senderUid, resolvedUid, recipientOnline (true/false), targetPhone
+
+// Route OMNISMS
+[ROUTING] Message routed → OMNISMS
+  senderUid, senderPhone, targetPhone, resolvedUid, recipientOnline: true, route, conversationId, messageId
+
+// Route SMS_EXTERNE
+[ROUTING] Message routed → SMS_EXTERNE
+  senderUid, senderPhone, targetPhone, normalizedTarget, resolvedUid, recipientOnline: false,
+  route, transport, conversationId, messageId, smsSuccess, smsMessageId
+
+// Fallback offline
+[ROUTING] Destinataire OmniSMS OFFLINE → fallback SMS vers son numéro réel
+  senderUid, resolvedUid, recipientPhone
+```
+
+### Règle FROM/TO (déjà corrigée Sessions 6+7 — confirmée)
+
+```
+SMS entrant 67 → 75 :
+  fromE164      = 67 (expéditeur)
+  recipientE164 = 75 (destinataire OmniSMS)
+  externalPhone = 67 (stocké dans external_conversations)
+  fallback SMS  → to: recipientE164 (75), jamais fromE164 (67)
+
+Réponse OmniSMS → 67 :
+  targetPhone   = externalPhone = 67
+  e164Target    = normalizePhone(67)
+  SMS to: 67   ← CORRECT
+```
+
+### Tests mis à jour
+
+- `test/sms-gateway-tests.js` : D1, D2, G10 — ajout de `isUserOnline: async () => true` dans les mocks socketService pour les scénarios "Online" (adaptation à la nouvelle logique de présence)
+
+### Nouveau fichier de tests
+
+`test/routing-matrix-tests.js` — **57 tests** couvrant :
+- Sections 1–3 : présence dans routeMessage(), fallback offline, résolution UID
+- Sections 4–5 : mapping FROM/TO inbound, réponse SMS
+- Sections 6–7 : logs structurés ROUTING, double check présence inbound
+- Sections 8–9 : isolation UIDs, intégrité globale (Infobip/InfiniReach non supprimés)
+- Section 10 : matrice A–H comportement
+- Section 11 : sécurité logs (pas de secrets)
+
+### Résultats régression complète
+
+| Fichier de test | Session 8 |
+|---|---|
+| `test/session6-tests.js` | **27/27** ✅ |
+| `test/routing-presence-tests.js` | **34/34** ✅ |
+| `test/routing-matrix-tests.js` | **57/57** ✅ (nouveau) |
+| `test/sms-inbound-tests.js` | **23/23** ✅ |
+| `test/sms-gateway-tests.js` | **48/48** ✅ |
+| `test/offline-sms-tests.js` | **37/37** ✅ |
+| **TOTAL** | **226/226** ✅ |
+
+### Frontend — État (navigateur / PWA)
+
+- `messaging_provider.dart` : merge correctement (pas de replace), polling 5s, `injectInboundMessage()` avec dédup ✅ (Session 6)
+- `web/index.html` : `touch-action: manipulation`, iOS modal, APK download, `isStandalone` guard ✅ (Session 6)
+- Auth token : stocké dans SharedPreferences (persistant entre sessions), `_authHeaders()` récupère avant chaque requête — pas de race condition sur les rechargements normaux
+- Note : le 401 observé sur Safari peut survenir si SharedPreferences vide (premier login ou token expiré) — géré par `catch` dans `_pollConversations()`

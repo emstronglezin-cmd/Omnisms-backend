@@ -305,8 +305,61 @@ async function routeMessage(opts = {}) {
     resolvedUid = targetPhone;
   }
 
+  // Si on a un UID (préresolu ou via targetUid) mais pas d'info utilisateur,
+  // récupérer les infos pour obtenir le numéro de téléphone (nécessaire pour
+  // le fallback SMS si le destinataire est offline).
+  if (resolvedUid && !resolvedUserInfo) {
+    try {
+      const { resolveUserByUid } = require('./userResolver');
+      const userInfo = await resolveUserByUid(resolvedUid);
+      if (userInfo && userInfo.found) {
+        resolvedUserInfo = userInfo;
+      }
+    } catch (_) { /* userResolver non disponible */ }
+  }
+
   /* ── 2. Route : OmniSMS ──────────────────────────────────── */
+  // RÈGLE ABSOLUE : "Compte existant ≠ utilisateur connecté."
+  // On ne route vers OmniSMS QUE si l'utilisateur est réellement connecté
+  // (session Socket.IO active). Sinon → SMS fallback vers son numéro réel.
+  let recipientIsOnline = false;
   if (resolvedUid) {
+    try {
+      const socketSvc = require('./socketService');
+
+      // 1. Vérification Redis (source de vérité principale)
+      recipientIsOnline = await socketSvc.isUserOnline(resolvedUid);
+
+      // 2. Fallback Socket.IO room si Redis vide (connexion récente)
+      if (!recipientIsOnline) {
+        const io = socketSvc.getIO ? socketSvc.getIO() : null;
+        if (io) {
+          try {
+            const sockets = await io.in(`user:${resolvedUid}`).fetchSockets();
+            recipientIsOnline = sockets.length > 0;
+            if (recipientIsOnline) {
+              logger.info('[ROUTING] Présence confirmée via Socket.IO room (Redis vide)', {
+                resolvedUid,
+                socketsCount: sockets.length,
+              });
+            }
+          } catch (_) { /* fetchSockets non disponible */ }
+        }
+      }
+    } catch (_) {
+      // socketService non disponible → supposer offline (dégradation sécurisée)
+      recipientIsOnline = false;
+    }
+
+    logger.info('[ROUTING] Vérification présence destinataire', {
+      senderUid,
+      resolvedUid,
+      recipientOnline: recipientIsOnline,
+      targetPhone: targetPhone ? targetPhone.replace(/\d{4}$/, '****') : '(uid direct)',
+    });
+  }
+
+  if (resolvedUid && recipientIsOnline) {
     const convId = makeConversationId(senderUid, resolvedUid);
 
     const msg = {
@@ -384,11 +437,14 @@ async function routeMessage(opts = {}) {
 
     logger.info('[ROUTING] Message routed → OMNISMS', {
       senderUid,
-      targetPhone: targetPhone ? targetPhone.replace(/\d{4}$/, '****') : '(uid direct)',
+      senderPhone   : opts.senderPhone ? opts.senderPhone.replace(/\d{4}$/, '****') : null,
+      targetPhone   : targetPhone ? targetPhone.replace(/\d{4}$/, '****') : '(uid direct)',
       resolvedUid,
-      conversationId: convId,
+      recipientOnline: true,
+      route          : 'OMNISMS',
+      conversationId : convId,
       type,
-      messageId: savedId,
+      messageId      : savedId,
     });
 
     return {
@@ -401,8 +457,29 @@ async function routeMessage(opts = {}) {
   }
 
   /* ── 3. Route : SMS externe ──────────────────────────────── */
-  // Destinataire n'a pas OmniSMS → SMS via SMS Gateway (Z Fold2) ou Infobip (standby)
-  const e164Target = normalizePhone(targetPhone) || (targetPhone || '').replace(/\s/g, '');
+  // Destinataire n'a pas OmniSMS OU possède OmniSMS mais est DÉCONNECTÉ.
+  // → SMS via SMS Gateway (Z Fold2) ou Infobip (standby).
+  //
+  // RÈGLE CRITIQUE pour fallback offline :
+  //   Si resolvedUid trouvé mais offline → utiliser resolvedUserInfo.phone comme destination.
+  //   JAMAIS le numéro de l'expéditeur (senderUid/senderPhone) comme destination.
+  //
+  // e164Target = numéro DESTINATAIRE en E.164
+
+  // Si le destinataire a un compte OmniSMS mais est offline : utiliser son numéro réel
+  let e164Target;
+  if (resolvedUid && !recipientIsOnline && resolvedUserInfo && resolvedUserInfo.phone) {
+    // Compte OmniSMS existant mais déconnecté → SMS vers son numéro de téléphone réel
+    e164Target = normalizePhone(resolvedUserInfo.phone) || resolvedUserInfo.phone;
+    logger.info('[ROUTING] Destinataire OmniSMS OFFLINE → fallback SMS vers son numéro réel', {
+      senderUid,
+      resolvedUid,
+      recipientPhone: e164Target ? e164Target.replace(/\d{4}$/, '****') : null,
+    });
+  } else {
+    // Destinataire sans compte OmniSMS → utiliser le targetPhone fourni directement
+    e164Target = normalizePhone(targetPhone) || (targetPhone || '').replace(/\s/g, '');
+  }
 
   // Déterminer le transport Offline actif
   let smsGateway = null;
@@ -556,11 +633,17 @@ async function routeMessage(opts = {}) {
 
       logger.info('[ROUTING] Message routed → SMS_EXTERNE', {
         senderUid,
-        targetPhone   : e164Target.replace(/\d{4}$/, '****'),
+        senderPhone      : opts.senderPhone ? opts.senderPhone.replace(/\d{4}$/, '****') : null,
+        targetPhone      : targetPhone ? targetPhone.replace(/\d{4}$/, '****') : null,
+        normalizedTarget : e164Target ? e164Target.replace(/\d{4}$/, '****') : null,
+        resolvedUid      : resolvedUid || null,
+        recipientOnline  : false,
+        route            : 'SMS_EXTERNE',
         transport,
-        conversationId: convId,
-        smsSuccess    : smsResult?.success,
-        smsMessageId  : smsResult?.messageId || smsResult?.gatewayMessageId || null,
+        conversationId   : convId,
+        messageId        : savedId,
+        smsSuccess       : smsResult?.success,
+        smsMessageId     : smsResult?.messageId || smsResult?.gatewayMessageId || null,
       });
 
     } catch (smsErr) {

@@ -660,18 +660,21 @@ async function runTests() {
      ════════════════════════════════════════════════════════════ */
   console.log('\n══ TEST D — Online — Isolation INfiniReach ═════════════════');
 
-  await testAsync('D1. Route OMNISMS si destinataire a un compte OmniSMS', async () => {
+  await testAsync('D1. Route OMNISMS si destinataire a un compte OmniSMS ET est connecté', async () => {
     const db        = createMockDb();
     const emitted   = [];
     const targetUid = 'uid-online-target-d1';
 
     injectMock('../config/firebase', db);
     injectMock('../services/socketService', {
-      emitToUser: (uid, event, data) => emitted.push({ uid, event }),
-      getIO     : () => null,
+      emitToUser  : (uid, event, data) => emitted.push({ uid, event }),
+      getIO       : () => null,
+      // IMPORTANT : destinataire CONNECTÉ → isUserOnline doit retourner true
+      isUserOnline: async () => true,
     });
     injectMock('../services/userResolver', {
       resolveUserByPhone: async () => ({ found: true, uid: targetUid }),
+      resolveUserByUid  : async () => ({ found: true, uid: targetUid, phone: '+22670999999' }),
     });
 
     clearMock('../services/messageRouter');
@@ -706,9 +709,15 @@ async function runTests() {
 
     injectMock('../services/smsGateway', mockGw);
     injectMock('../config/firebase', db);
-    injectMock('../services/socketService', { emitToUser: () => {}, getIO: () => null });
+    injectMock('../services/socketService', {
+      emitToUser  : () => {},
+      getIO       : () => null,
+      // Destinataire CONNECTÉ → isUserOnline doit retourner true
+      isUserOnline: async () => true,
+    });
     injectMock('../services/userResolver', {
       resolveUserByPhone: async () => ({ found: true, uid: 'uid-online-d2' }),
+      resolveUserByUid  : async () => ({ found: true, uid: 'uid-online-d2', phone: '+22670101010' }),
     });
 
     clearMock('../services/messageRouter');
@@ -1038,9 +1047,15 @@ async function runTests() {
 
     injectMock('../services/smsGateway', mockGw);
     injectMock('../config/firebase', db);
-    injectMock('../services/socketService', { emitToUser: () => {}, getIO: () => null });
+    injectMock('../services/socketService', {
+      emitToUser  : () => {},
+      getIO       : () => null,
+      // Destinataire CONNECTÉ → isUserOnline doit retourner true
+      isUserOnline: async () => true,
+    });
     injectMock('../services/userResolver', {
       resolveUserByPhone: async () => ({ found: true, uid: 'uid-online-g10' }),
+      resolveUserByUid  : async () => ({ found: true, uid: 'uid-online-g10', phone: '+22670101010' }),
     });
 
     clearMock('../services/messageRouter');

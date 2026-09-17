@@ -501,3 +501,61 @@ REDIS_URL=...
 3. InfiniReach outbound inchangé (numéro SIM passerelle `INFINIREACH_FROM_NUMBER`)
 4. Toutes les fonctionnalités existantes non touchées
 
+
+---
+
+## v5.0.0 — Session 8 — Audit complet + Correction routage présence (2026-09-17)
+
+### Bug critique corrigé : routeMessage() sans vérification de présence
+
+**Fichier** : `services/messageRouter.js`
+
+**Problème** : `if (resolvedUid)` à la ligne 309 routait vers OMNISMS dès qu'un compte existait, sans vérifier si l'utilisateur était connecté. Résultat : messages perdus pour destinataires offline.
+
+**Correction** :
+- `isUserOnline(resolvedUid)` vérifié avant OMNISMS
+- Double check : Redis + `io.in('user:{resolvedUid}').fetchSockets()`
+- Offline → fallback SMS vers `resolvedUserInfo.phone` (numéro DESTINATAIRE, jamais expéditeur)
+- `resolveUserByUid(resolvedUid)` pour récupérer le phone quand `targetUid` préresolu
+
+### Logs structurés ajoutés
+
+`[ROUTING]` : `senderUid`, `senderPhone`, `targetPhone`, `normalizedTarget`, `resolvedUid`, `recipientOnline`, `route`, `conversationId`, `messageId`
+
+### Tests mis à jour
+
+`test/sms-gateway-tests.js` : D1, D2, G10 — mock `isUserOnline: async () => true` pour scénarios Online
+
+### Nouveau fichier de tests
+
+`test/routing-matrix-tests.js` — **57 tests** (matrice A–H complète)
+
+### Régression complète Session 8
+
+| Fichier | Résultat |
+|---|---|
+| `test/session6-tests.js` | **27/27** ✅ |
+| `test/routing-presence-tests.js` | **34/34** ✅ |
+| `test/routing-matrix-tests.js` | **57/57** ✅ (nouveau) |
+| `test/sms-inbound-tests.js` | **23/23** ✅ |
+| `test/sms-gateway-tests.js` | **48/48** ✅ |
+| `test/offline-sms-tests.js` | **37/37** ✅ |
+| **TOTAL** | **226/226** ✅ |
+
+### Règles de routage documentées et codées
+
+```
+SMS entrant 67→75 : externalPhone=67, fallback SMS to: 75 (jamais 67)
+Réponse OmniSMS  : targetPhone=67 → e164Target=67 → SMS to: 67 ✅
+Online→Online    : resolvedUid && recipientIsOnline=true → OMNISMS ✅
+Online→Offline   : resolvedUid && recipientIsOnline=false → SMS_EXTERNE vers resolvedUserInfo.phone ✅
+Online→No account: resolvedUid=null → SMS_EXTERNE vers normalizePhone(targetPhone) ✅
+```
+
+### Non modifié (volontairement)
+
+- InfiniReach outbound (validé, inchangé)
+- Infobip (standby, inchangé)
+- Système de paiement SaaSPay
+- Architecture Socket.IO
+- PWA installée / Android APK
