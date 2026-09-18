@@ -922,3 +922,122 @@ Réponse OmniSMS → 67 :
 - `web/index.html` : `touch-action: manipulation`, iOS modal, APK download, `isStandalone` guard ✅ (Session 6)
 - Auth token : stocké dans SharedPreferences (persistant entre sessions), `_authHeaders()` récupère avant chaque requête — pas de race condition sur les rechargements normaux
 - Note : le 401 observé sur Safari peut survenir si SharedPreferences vide (premier login ou token expiré) — géré par `catch` dans `_pollConversations()`
+
+---
+
+## §22 — Audit et corrections frontend navigateur (Session 9 — 2026-09-18)
+
+### Contexte
+
+Session de corrections ciblées sur le frontend Flutter Web suite aux tests réels sur Safari iPhone en mode navigateur (non-PWA).
+
+### Problèmes identifiés et causes exactes
+
+#### 1. Race condition auth (401 sur /conversations — Safari iPhone)
+
+**Cause exacte** :
+- `MessagingProvider` est instancié dans `MultiProvider` au niveau racine (avant toute navigation).
+- Son constructeur appelle `_init()` immédiatement → `loadConversations()`.
+- À ce moment, `AuthProvider._checkLoginStatus()` est encore en cours (async SharedPreferences).
+- `getToken()` retourne `null` → header Authorization absent → 401.
+- Sur Safari iOS, `SharedPreferences.getInstance()` est plus lent → race plus fréquente.
+
+**Correction** (`messaging_provider.dart`) :
+- `_init()` lit maintenant le token **avant** d'appeler `loadConversations()`.
+- Si token absent : skip `loadConversations()` (sera déclenché via `reinitialize()`).
+- Nouvelle méthode `reinitialize()` : appelée depuis `LoginScreen` après login réussi.
+
+**Correction** (`login_screen.dart`) :
+- Import de `MessagingProvider`.
+- Après login réussi : `context.read<MessagingProvider>().reinitialize()`.
+- `initState` : si `auth.isLoading` → attendre la fin via `addListener` avant de naviguer.
+- Évite le cas où `addPostFrameCallback` s'exécute avant que `_checkLoginStatus()` complète.
+
+#### 2. Bottom navigation coupée — Safari iPhone
+
+**Cause exacte** :
+- `_buildMobileLayout()` utilise `NavigationBar` directement dans `Scaffold.bottomNavigationBar`.
+- Flutter Web ne propage pas automatiquement `env(safe-area-inset-bottom)` au `NavigationBar`.
+- Sans `viewport-fit=cover` dans le viewport meta, Safari ignore les variables `env(safe-area-inset-*)`.
+
+**Correction** (`dashboard_screen.dart`) :
+- `NavigationBar` enveloppé dans `Column` avec `SizedBox(height: bottomPadding)`.
+- `bottomPadding = MediaQuery.of(context).viewPadding.bottom` (0 sur PWA installée).
+- Sur PWA installée : `viewPadding.bottom = 0` → aucun changement de comportement.
+
+**Correction** (`web/index.html`) :
+- Viewport meta : ajout de `viewport-fit=cover`.
+- CSS `body { padding-bottom: env(safe-area-inset-bottom, 0px); }`.
+- CSS `#install-prompt { bottom: calc(80px + env(safe-area-inset-bottom, 0px)); }`.
+- CSS `flt-glass-pane, flt-scene-host, flutter-view { pointer-events: auto !important; }`.
+
+#### 3. Microphone non fonctionnel en mode navigateur
+
+**Cause exacte** :
+- `VoiceRecorderWidget.initState()` vérifiait `kIsWeb` → annulait immédiatement.
+- `VoiceRecorderWidget.build()` retournait `SizedBox.shrink()` sur web.
+- `MessagingProvider.sendVoiceMessage()` avait `if (kIsWeb) { return false; }`.
+
+**Correction** (`voice_recorder_widget.dart`) :
+- Suppression du bloc `kIsWeb → annulation` dans `initState`.
+- Suppression du `SizedBox.shrink()` dans `build()`.
+- Ajout de `_requestWebMicrophonePermission()` via `navigator.mediaDevices.getUserMedia`.
+- Ajout de `_startRecording()` web : utilise `dart:html MediaRecorder`.
+- Ajout de `_stopRecording()` web : collecte les chunks Blob, crée une URL `Blob`.
+- Permission demandée uniquement au moment où l'utilisateur déclenche l'enregistrement.
+- Gestion propre des erreurs permission refusée / microphone indisponible.
+- `dispose()` libère le `MediaStream` (getTracks().forEach(stop)).
+
+**Correction** (`messaging_provider.dart`) :
+- Suppression du `if (kIsWeb) { return false; }` dans `sendVoiceMessage()`.
+
+#### 4. Pointer-events bloquant les clics (navigateur)
+
+**Correction** (`web/index.html`) :
+- Ajout de règle CSS pour forcer `pointer-events: auto` sur les conteneurs Flutter :
+  `flt-glass-pane, flt-scene-host, flutter-view { pointer-events: auto !important; }`
+
+### Tests effectués (automatisables)
+
+| Suite | Résultat |
+|---|---|
+| `test/session6-tests.js` | **27/27** ✅ |
+| `test/routing-presence-tests.js` | **34/34** ✅ |
+| `test/routing-matrix-tests.js` | **57/57** ✅ |
+| `test/sms-inbound-tests.js` | **23/23** ✅ |
+| `test/sms-gateway-tests.js` | **48/48** ✅ |
+| `test/offline-sms-tests.js` | **37/37** ✅ |
+| **TOTAL** | **226/226** ✅ |
+
+### Tests à effectuer sur appareil réel (non automatisables)
+
+- TEST Safari iPhone navigateur : `/conversations → 200` (plus de 401 après login)
+- TEST PWA installée : vérifier que la PWA reste fonctionnelle (viewPadding.bottom=0)
+- TEST Android Chrome : navigation bottom visible, microphone, messages
+- TEST Microphone web : getUserMedia déclenché à la demande, Blob URL créé correctement
+- TEST Safe-area : bottom nav visible sur Safari iPhone (pas coupée)
+- TEST Online→Online : messages livrés temps réel ✅ (non modifié)
+- TEST Online→Offline : SMS fallback vers numéro de B ✅ (non modifié)
+- TEST SMS entrant 67→75 : message visible dans bon compte ✅ (non modifié)
+- TEST Réponse SMS : SMS sortant vers 67, jamais vers 75 ✅ (non modifié)
+
+### Fichiers modifiés
+
+| Fichier | Changement |
+|---|---|
+| `frontend/lib/providers/messaging_provider.dart` | `_init()` : check token avant `loadConversations()`; `reinitialize()` ajouté; `sendVoiceMessage` kIsWeb block supprimé |
+| `frontend/lib/screens/auth/login_screen.dart` | Import `MessagingProvider`; `reinitialize()` après login; `initState` attend fin auth si `isLoading` |
+| `frontend/lib/screens/dashboard_screen.dart` | `_buildMobileLayout()` : `NavigationBar` + safe-area `SizedBox` |
+| `frontend/lib/widgets/audio/voice_recorder_widget.dart` | Web : `getUserMedia` + `MediaRecorder`; suppression `kIsWeb → annulation` |
+| `frontend/web/index.html` | `viewport-fit=cover`; CSS `env(safe-area-inset-bottom)`; pointer-events Flutter |
+
+### Règles absolues respectées
+
+- ✅ SaaSPay non modifié
+- ✅ Infobip non supprimé
+- ✅ InfiniReach non modifié
+- ✅ SMS envoi/réception non modifié
+- ✅ Socket.IO architecture non modifiée
+- ✅ Android/PWA installée non cassé (viewPadding.bottom=0 sur PWA)
+- ✅ Design non modifié
+- ✅ Backend non modifié (déjà correct depuis Session 8)

@@ -559,3 +559,67 @@ Online→No account: resolvedUid=null → SMS_EXTERNE vers normalizePhone(target
 - Système de paiement SaaSPay
 - Architecture Socket.IO
 - PWA installée / Android APK
+
+---
+
+## v5.1.0 — Corrections frontend navigateur (Session 9 — 2026-09-18)
+
+### Problèmes corrigés
+
+#### Auth race condition (401 sur /conversations — Safari iPhone)
+
+**Cause** : `MessagingProvider._init()` appelait `loadConversations()` avant que le token soit disponible dans SharedPreferences.
+
+**Fix** :
+- `messaging_provider.dart` : `_init()` vérifie le token avant `loadConversations()`. Nouvelle méthode `reinitialize()`.
+- `login_screen.dart` : appel à `reinitialize()` après login réussi. `initState` attend la fin de `auth.isLoading` avant de naviguer.
+
+#### Bottom navigation coupée — Safari iPhone (mode navigateur)
+
+**Cause** : `NavigationBar` dans `Scaffold.bottomNavigationBar` sans gestion de `env(safe-area-inset-bottom)`. Vue port meta sans `viewport-fit=cover`.
+
+**Fix** :
+- `dashboard_screen.dart` : `NavigationBar` + `SizedBox(height: viewPadding.bottom)`.
+- `web/index.html` : `viewport-fit=cover`, CSS `env(safe-area-inset-bottom)`, pointer-events Flutter.
+
+#### Microphone non fonctionnel en mode navigateur
+
+**Cause** : `kIsWeb → return false / SizedBox.shrink()` bloquait toute fonctionnalité vocale sur web.
+
+**Fix** :
+- `voice_recorder_widget.dart` : implémentation web via `dart:html` `navigator.mediaDevices.getUserMedia` + `MediaRecorder` API.
+- `messaging_provider.dart` : suppression du bloc `if (kIsWeb) { return false; }`.
+
+#### Pointer-events bloquant les clics
+
+**Fix** : CSS `flt-glass-pane, flt-scene-host, flutter-view { pointer-events: auto !important; }` dans `index.html`.
+
+### Fichiers modifiés
+
+| Fichier | Modification |
+|---|---|
+| `frontend/lib/providers/messaging_provider.dart` | Auth-aware `_init()`, `reinitialize()`, kIsWeb voice block supprimé |
+| `frontend/lib/screens/auth/login_screen.dart` | `reinitialize()` post-login, wait-for-auth dans `initState` |
+| `frontend/lib/screens/dashboard_screen.dart` | Safe-area `NavigationBar` |
+| `frontend/lib/widgets/audio/voice_recorder_widget.dart` | Web `getUserMedia` + `MediaRecorder` |
+| `frontend/web/index.html` | `viewport-fit=cover`, safe-area CSS, pointer-events fix |
+
+### Régression backend (226/226 ✅ — inchangé)
+
+| Fichier | Résultat |
+|---|---|
+| `test/session6-tests.js` | **27/27** ✅ |
+| `test/routing-presence-tests.js` | **34/34** ✅ |
+| `test/routing-matrix-tests.js` | **57/57** ✅ |
+| `test/sms-inbound-tests.js` | **23/23** ✅ |
+| `test/sms-gateway-tests.js` | **48/48** ✅ |
+| `test/offline-sms-tests.js` | **37/37** ✅ |
+| **TOTAL** | **226/226** ✅ |
+
+### Non modifié (volontairement)
+
+- Backend routing (correct depuis Session 8)
+- InfiniReach, Infobip, SaaSPay
+- Socket.IO architecture
+- PWA installée Android (backward compatible)
+- Design / UI
