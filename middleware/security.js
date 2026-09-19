@@ -27,8 +27,9 @@ const allowedOrigins = [
   // Netlify / Firebase
   'https://omnisms.netlify.app',
   'https://omnisms.web.app',
-  // Vercel — URL principale + previews
+  // Vercel — URL principale + déploiements connus
   'https://omnisms-frontend.vercel.app',
+  'https://omnisms-frontend-drab.vercel.app',              // FIX Session10 : déploiement actif
   'https://omnisms-frontend-qx1u5k6h9-emmanuel-lezin.vercel.app',
   // Dev local
   'http://localhost:3000',
@@ -39,8 +40,15 @@ const allowedOrigins = [
     : []),
 ];
 
-// Regex pour autoriser tous les sous-domaines vercel.app du projet
-const vercelPattern = /^https:\/\/omnisms-frontend(-[a-z0-9]+-emmanuel-lezin)?(\.vercel\.app)$/;
+// Regex pour autoriser tous les déploiements vercel.app du projet omnisms-frontend
+// Matches : omnisms-frontend.vercel.app
+//           omnisms-frontend-drab.vercel.app
+//           omnisms-frontend-abc123.vercel.app
+//           omnisms-frontend-abc123-emmanuel-lezin.vercel.app
+//           omnisms-frontend-qx1u5k6h9-emmanuel-lezin.vercel.app
+// FIX Session10 : l'ancien pattern exigeait le suffixe -emmanuel-lezin, ce qui
+//   bloquait omnisms-frontend-drab.vercel.app → CORS rejeté → auth impossible.
+const vercelPattern = /^https:\/\/omnisms-frontend(-[a-z0-9]+)*\.vercel\.app$/;
 
 // ── 1. Helmet — headers HTTP sécurisés ───────────────────────
 const helmetMiddleware = helmet({

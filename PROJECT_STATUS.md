@@ -623,3 +623,65 @@ Online→No account: resolvedUid=null → SMS_EXTERNE vers normalizePhone(target
 - Socket.IO architecture
 - PWA installée Android (backward compatible)
 - Design / UI
+
+---
+
+## v5.2.0 — Session 10 : Stabilisation Globale (2026-09-19)
+
+### Statut : ✅ Déployable
+
+### Corrections critiques
+
+| # | Problème | Fichier | Correction |
+|---|---|---|---|
+| 1 | CORS bloqué pour `omnisms-frontend-drab.vercel.app` | `middleware/security.js` | `vercelPattern` élargi + domaine ajouté explicitement |
+| 2 | CORS bloqué Socket.IO | `services/socketService.js` | Même fix pattern + domaine |
+| 3 | 404 sur `GET /api/messages/ext-uid-+phone` | `routes/messages.v2.js` | Regex route + `decodeURIComponent` |
+| 4 | Boucle infinie gateway InfiniReach | `routes/sms.gateway.inbound.js` | Double guard anti-loop |
+| 5 | Présence TTL partagé (tous offline en même temps) | `services/socketService.js` | Clé TTL individuelle `online_ttl:{uid}` |
+
+### Tests
+
+| Suite | Résultat |
+|---|---|
+| session6-tests.js | 27/27 ✅ |
+| routing-presence-tests.js | 34/34 ✅ |
+| routing-matrix-tests.js | 57/57 ✅ |
+| sms-inbound-tests.js | 23/23 ✅ |
+| sms-gateway-tests.js | 48/48 ✅ |
+| offline-sms-tests.js | 37/37 ✅ |
+| **session10-stabilization-tests.js** | **62/62** ✅ NEW |
+| **TOTAL** | **288/288** ✅ |
+
+### Variables Render nécessaires (production)
+
+| Variable | Usage | Secret | Obligatoire |
+|---|---|---|---|
+| `PORT` | Port Express | Non | Non (défaut 3000) |
+| `NODE_ENV` | Environnement | Non | Oui → `production` |
+| `JWT_SECRET` | Signature tokens JWT | **Oui** | Oui |
+| `FIREBASE_SERVICE_ACCOUNT` | JSON credentials Firebase Admin | **Oui** | Oui |
+| `REDIS_URL` | URL Redis (upstash ou autre) | **Oui** | Oui |
+| `CORS_ORIGIN` | Origines CORS supplémentaires (CSV) | Non | Non |
+| `FRONTEND_URL` | URL frontend principale | Non | Non |
+| `INFINIREACH_API_KEY` | Clé API InfiniReach | **Oui** | Oui |
+| `INFINIREACH_FROM_NUMBER` | Numéro SIM Z Fold2 (E.164) | Non | Oui |
+| `INFINIREACH_API_URL` | URL API InfiniReach | Non | Non (défaut https://api.infinireach.io) |
+| `INFINIREACH_ENABLED` | Activer InfiniReach | Non | Non (défaut true) |
+| `INFINIREACH_WEBHOOK_SECRET` | Secret HMAC webhook | **Oui** | Non (mode permissif si absent) |
+| `SAASPAY_SECRET_KEY` | Bearer token SaaSPay `sk_live_xxx` | **Oui** | Oui (paiements) |
+| `SAASPAY_API_KEY` | Clé publique SaaSPay `pk_live_xxx` | **Oui** | Oui (paiements) |
+| `SAASPAY_BASE_URL` | URL base SaaSPay | Non | Non (défaut https://saaspay.me) |
+| `SAASPAY_WEBHOOK_SECRET` | HMAC webhook SaaSPay | **Oui** | Non (remplace SAASPAY_API_KEY si présent) |
+| `SAASPAY_PREMIUM_AMOUNT` | Montant premium (entier) | Non | Non (défaut 2000) |
+| `SAASPAY_PREMIUM_CURRENCY` | Devise premium | Non | Non (défaut XOF) |
+| `OFFLINE_SMS_PROVIDER` | `sms_gateway` ou `infobip` | Non | Non (défaut sms_gateway) |
+| `OFFLINE_SMS_FALLBACK_TO_INFOBIP` | Fallback Infobip si InfiniReach échoue | Non | Non |
+| `INFOBIP_API_KEY` | Clé Infobip (standby) | **Oui** | Non |
+| `INFOBIP_BASE_URL` | URL Infobip | Non | Non |
+| `INFOBIP_FROM_NUMBER` | Numéro expéditeur Infobip | Non | Non |
+| `GROQ_API_KEY` | Clé Groq pour transcription Whisper | **Oui** | Non (transcription) |
+| `OPENAI_API_KEY` | Clé OpenAI (fallback transcription) | **Oui** | Non |
+| `RENDER_EXTERNAL_URL` | URL publique Render | Non | Non (auto-injecté) |
+
+> **Secrets** : ne jamais afficher dans les logs ni dans le code. Configurer uniquement via le dashboard Render.

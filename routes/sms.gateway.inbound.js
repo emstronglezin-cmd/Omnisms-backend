@@ -280,6 +280,36 @@ async function processSmsReceived(webhookBody) {
     direction,                 // "inbound"
   } = data;
 
+  // ─────────────────────────────────────────────────────────────
+  // ANTI-BOUCLE GATEWAY — FIX Session10
+  // ─────────────────────────────────────────────────────────────
+  // Problème observé : le numéro de la SIM InfiniReach (+22675...) est aussi
+  // enregistré comme compte OmniSMS de test.
+  //
+  // Scénario boucle :
+  //   SMS entrant : from=67..., to=75... (SIM gateway)
+  //   Backend → resolve to=75... → ownerUid OK
+  //   ownerUid offline → SMS fallback vers recipientE164 (= to = 75...)
+  //   InfiniReach reçoit le SMS → déclenche webhook → boucle infinie
+  //
+  // Règle : si from == to (le gateway se parle à lui-même), ignorer.
+  //         La protection fallback (ne pas renvoyer vers le gateway) est
+  //         appliquée séparément à l'étape 4.
+  //
+  // NB : On ne bloque PAS les SMS légitimes d'un utilisateur externe (67...)
+  //      vers le gateway (75...) — seul le cas from==to est bloqué ici.
+  const fromRawNorm   = senderRaw   ? normalizePhone(senderRaw)   || senderRaw   : '';
+  const toRawNorm     = recipientRaw ? normalizePhone(recipientRaw) || recipientRaw : '';
+  const gatewayNumber = (process.env.INFINIREACH_FROM_NUMBER || '').trim();
+
+  if (fromRawNorm && toRawNorm && fromRawNorm === toRawNorm) {
+    logger.warn('[INfiniReach] ANTI-BOUCLE — from == to → message ignoré (auto-envoi gateway)', {
+      from: fromRawNorm.replace(/\d{4}$/, '****'),
+      to  : toRawNorm.replace(/\d{4}$/, '****'),
+    });
+    return;
+  }
+
   // ── Déduplication ────────────────────────────────────────────
   // Utiliser data.messageId comme clé principale (recommandé INfiniReach)
   const dedupKey = gwMessageId;
@@ -574,6 +604,20 @@ async function processSmsReceived(webhookBody) {
         // pendant son absence. Le `from` d'InfiniReach est le numéro SIM
         // passerelle (INFINIREACH_FROM_NUMBER) — inchangé, validé.
         if (recipientE164) {
+          // ── ANTI-BOUCLE GATEWAY (fallback) — FIX Session10 ───────────
+          // Si recipientE164 == numéro de la SIM gateway, envoyer un SMS
+          // vers ce même numéro déclencherait un nouveau webhook → boucle.
+          // Dans ce cas, le message est déjà en Firestore → pas de fallback SMS.
+          const gwNum = (process.env.INFINIREACH_FROM_NUMBER || '').trim();
+          const normalizedGw = gwNum ? (normalizePhone(gwNum) || gwNum) : '';
+          const normalizedRec = normalizePhone(recipientE164) || recipientE164;
+
+          if (normalizedGw && normalizedRec === normalizedGw) {
+            logger.warn('[INfiniReach] ANTI-BOUCLE (fallback) — recipientE164 == gateway number → SMS fallback annulé', {
+              recipientE164: recipientE164.replace(/\d{4}$/, '****'),
+              hint         : 'Le propriétaire du gateway est offline, mais envoyer un SMS vers le gateway lui-même créerait une boucle. Message conservé en Firestore.',
+            });
+          } else {
           try {
             const smsText = `[OmniSMS] Message reçu de ${fromE164} : ${finalText}`;
             const smsResult = await smsGateway.sendSMS({
@@ -593,6 +637,7 @@ async function processSmsReceived(webhookBody) {
               error     : smsErr.message,
             });
           }
+          } // fin else anti-boucle
         } else {
           logger.warn('[INfiniReach] SMS fallback impossible — recipientE164 non résolu', {
             hint: 'Le numéro SIM destinataire (to) doit être configuré dans InfiniReach',

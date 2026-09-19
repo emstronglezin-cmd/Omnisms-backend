@@ -284,11 +284,16 @@ router.get('/', auth, async (req, res) => {
    Doit être AVANT les routes /:id/* pour éviter le conflit
    ─────────────────────────────────────────────────────────── */
 router.get(
-  '/:conversationId([a-zA-Z0-9_\\-]{10,})',   // pattern large : uid1-uid2 ou IDs Firestore
+  // FIX Session10 : l'ancien pattern [a-zA-Z0-9_\\-]{10,} excluait le '+' présent
+  // dans les conversationId externes : ext-{uid}-+22676580024 → 404.
+  // Ajout de + et % (pour +URL-encodé en %2B) dans la classe de caractères.
+  '/:conversationId([a-zA-Z0-9_+%\\-]{10,})',  // uid1-uid2, IDs Firestore, ext-uid-+phone
   auth,
   async (req, res) => {
     const uid            = req.user.uid;
-    const { conversationId } = req.params;
+    // FIX Session10 : décoder %2B → + dans le conversationId
+    // (le frontend peut envoyer ext-uid-%2B22676580024 ou ext-uid-+22676580024)
+    const conversationId = decodeURIComponent(req.params.conversationId);
     const limit          = Math.min(parseInt(req.query.limit  || '50', 10), 200);
     const page           = Math.max(parseInt(req.query.page   || '1',  10), 1);
     const before         = req.query.before || null;

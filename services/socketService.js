@@ -80,11 +80,18 @@ async function authenticateSocket(socket) {
 
 async function setUserOnline(uid) {
   try {
+    // Stocker l'état online de l'utilisateur dans un hash global
     await redis.hset('online_users', uid, JSON.stringify({
       uid,
       onlineSince: new Date().toISOString(),
       lastSeen   : new Date().toISOString(),
     }));
+    // FIX Session10 : l'ancien code appliquait expire() sur le hash ENTIER
+    // ce qui réinitialisait le TTL de TOUS les utilisateurs à chaque connexion.
+    // Correction : on utilise une clé par utilisateur pour gérer son TTL
+    // individuellement, ET on maintient le hash global avec une expiration longue.
+    await redis.set(`online_ttl:${uid}`, '1', 'EX', ONLINE_TTL);
+    // Le hash global expire dans 50 min (filet de sécurité mémoire Redis)
     await redis.expire('online_users', ONLINE_TTL * 10);
   } catch (_) {}
 }
@@ -92,6 +99,8 @@ async function setUserOnline(uid) {
 async function setUserOffline(uid) {
   try {
     await redis.hdel('online_users', uid);
+    // FIX Session10 : supprimer aussi la clé TTL individuelle
+    await redis.del(`online_ttl:${uid}`);
     // Sauvegarder la dernière connexion
     await redis.set(`last_seen:${uid}`, new Date().toISOString(), 'EX', 30 * 24 * 3600);
   } catch (_) {}
@@ -99,6 +108,16 @@ async function setUserOffline(uid) {
 
 async function isUserOnline(uid) {
   try {
+    // FIX Session10 : double vérification
+    //  1. La clé TTL individuelle (expire au bout de ONLINE_TTL si pas de heartbeat)
+    //  2. Le hash global (fallback si la clé TTL a disparu mais le hash reste)
+    const ttlKey = await redis.get(`online_ttl:${uid}`);
+    if (!ttlKey) {
+      // La clé TTL individuelle a expiré → l'utilisateur est offline
+      // Nettoyer aussi le hash global pour cohérence
+      await redis.hdel('online_users', uid).catch(() => {});
+      return false;
+    }
     const data = await redis.hget('online_users', uid);
     return !!data;
   } catch (_) {
@@ -122,8 +141,9 @@ function initSocketIO(httpServer) {
   const corsOrigins = [
     'https://omnisms.netlify.app',
     'https://omnisms.web.app',
-    // Vercel — URL principale et previews dynamiques
+    // Vercel — URL principale et déploiements connus
     'https://omnisms-frontend.vercel.app',
+    'https://omnisms-frontend-drab.vercel.app',              // FIX Session10 : déploiement actif
     'https://omnisms-frontend-qx1u5k6h9-emmanuel-lezin.vercel.app',
     // Dev local
     'http://localhost:3000',
@@ -132,8 +152,10 @@ function initSocketIO(httpServer) {
     ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(o => o.trim()) : []),
   ];
 
-  // Regex pour autoriser tous les previews Vercel du projet
-  const vercelPattern = /^https:\/\/omnisms-frontend(-[a-z0-9]+-emmanuel-lezin)?\.vercel\.app$/;
+  // Regex pour autoriser tous les déploiements vercel.app du projet omnisms-frontend
+  // FIX Session10 : l'ancien pattern exigeait -emmanuel-lezin → bloquait
+  //   omnisms-frontend-drab.vercel.app (Socket.IO rejeté, même CORS root cause).
+  const vercelPattern = /^https:\/\/omnisms-frontend(-[a-z0-9]+)*\.vercel\.app$/;
 
   _io = new Server(httpServer, {
     cors: {

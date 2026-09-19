@@ -1041,3 +1041,83 @@ Session de corrections ciblées sur le frontend Flutter Web suite aux tests rée
 - ✅ Android/PWA installée non cassé (viewPadding.bottom=0 sur PWA)
 - ✅ Design non modifié
 - ✅ Backend non modifié (déjà correct depuis Session 8)
+
+---
+
+## 23. Session 10 — Stabilisation Globale (2026-09-19)
+
+### Problèmes identifiés et corrigés
+
+#### 1. CORS bloqué pour omnisms-frontend-drab.vercel.app
+
+**Cause racine** : `vercelPattern` dans `security.js` ET `socketService.js` :
+```js
+// AVANT (cassé)
+/^https:\/\/omnisms-frontend(-[a-z0-9]+-emmanuel-lezin)?(\.vercel\.app)$/
+// 'drab' ne finit pas par '-emmanuel-lezin' → rejeté
+```
+**Correction** :
+- `security.js` : nouveau pattern `/^https:\/\/omnisms-frontend(-[a-z0-9]+)*\.vercel\.app$/`
+- `socketService.js` : même correction
+- Ajout explicite de `https://omnisms-frontend-drab.vercel.app` dans les deux tableaux `allowedOrigins`/`corsOrigins`
+
+**Conséquence** : OPTIONS/POST `/api/auth/login` et `/api/auth/register` maintenant autorisés.
+
+#### 2. 404 sur GET /api/messages/ext-uid-+22676580024
+
+**Cause racine** : Route Express `/:conversationId([a-zA-Z0-9_\\-]{10,})` excluait `+`.
+**Correction** : `routes/messages.v2.js`
+- Pattern : `[a-zA-Z0-9_+%\\-]{10,}` (ajout `+` et `%` pour `%2B`)
+- Handler : `decodeURIComponent(req.params.conversationId)` pour normaliser
+
+#### 3. Boucle infinie gateway InfiniReach
+
+**Cause racine** : Numéro SIM gateway = compte OmniSMS de test → owner offline → SMS fallback vers SIM gateway → nouveau webhook → boucle.
+
+**Correction** dans `routes/sms.gateway.inbound.js` :
+- Guard 1 : `fromE164 === toE164` → message ignoré (auto-envoi)
+- Guard 2 : `recipientE164 === INFINIREACH_FROM_NUMBER` → fallback SMS annulé
+
+#### 4. Présence TTL par utilisateur
+
+**Cause racine** : `redis.expire('online_users', ONLINE_TTL * 10)` réinitialisait le TTL du hash entier à chaque connexion.
+
+**Correction** dans `services/socketService.js` :
+- `setUserOnline` : `redis.set('online_ttl:{uid}', '1', 'EX', ONLINE_TTL)` (TTL individuel)
+- `isUserOnline` : vérifie `online_ttl:{uid}` en premier, nettoie le hash si expiré
+- `setUserOffline` : `redis.del('online_ttl:{uid}')` en plus du `hdel`
+
+### Tests Session 10
+
+| Suite | Résultat |
+|---|---|
+| `test/session6-tests.js` | **27/27** ✅ |
+| `test/routing-presence-tests.js` | **34/34** ✅ |
+| `test/routing-matrix-tests.js` | **57/57** ✅ |
+| `test/sms-inbound-tests.js` | **23/23** ✅ |
+| `test/sms-gateway-tests.js` | **48/48** ✅ |
+| `test/offline-sms-tests.js` | **37/37** ✅ |
+| `test/session10-stabilization-tests.js` | **62/62** ✅ |
+| **TOTAL** | **288/288** ✅ |
+
+### Fichiers modifiés
+
+| Fichier | Modification |
+|---|---|
+| `middleware/security.js` | CORS regex + domaine drab ajouté |
+| `services/socketService.js` | CORS regex + domaine drab + TTL individuel |
+| `routes/messages.v2.js` | Pattern route + decodeURIComponent |
+| `routes/sms.gateway.inbound.js` | Anti-boucle double guard |
+| `test/session10-stabilization-tests.js` | Nouveau fichier 62 tests A–P |
+
+### Tests réels restants (à effectuer après déploiement Render)
+
+1. Vérifier `OPTIONS /api/auth/login` depuis `omnisms-frontend-drab.vercel.app` → 200
+2. Vérifier login/register dans navigateur → plus d'erreur CORS
+3. Ouvrir conversation avec numéro externe → historique charge (plus de 404)
+4. Tester SMS entrant depuis numéro 67 vers gateway 75 quand owner offline → pas de boucle dans les logs
+5. Vérifier présence : connexion, heartbeat, déconnexion, TTL individuels
+
+### Variables Render à configurer
+
+Voir §14 de ce document et PROJECT_STATUS.md v5.2.0.
