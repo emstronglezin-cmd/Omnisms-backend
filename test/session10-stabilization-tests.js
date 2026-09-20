@@ -382,7 +382,11 @@ test('J5 — code anti-boucle présent dans sms.gateway.inbound.js', () => {
   const content = fs.readFileSync('/home/user/webapp/routes/sms.gateway.inbound.js', 'utf8');
   assert(content.includes('ANTI-BOUCLE'), 'commentaire ANTI-BOUCLE doit être présent');
   assert(content.includes('fromRawNorm === toRawNorm'), 'guard from==to doit être présent');
-  assert(content.includes('normalizedRec === normalizedGw'), 'guard fallback→gateway doit être présent');
+  // Session 11 : la variable a été renommée normalizedFallback (fallbackTo = recipientPhone)
+  assert(
+    content.includes('normalizedFallback === normalizedGw') || content.includes('normalizedRec === normalizedGw'),
+    'guard fallback→gateway doit être présent'
+  );
 });
 
 /* ════════════════════════════════════════════════════════════

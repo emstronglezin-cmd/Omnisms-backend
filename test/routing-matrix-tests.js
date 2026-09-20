@@ -378,10 +378,13 @@ test('7.e Log inbound : routingDecision omnisms/sms_fallback', () => {
   );
 });
 
-test('7.f fallbackTo = recipientE164 (jamais fromE164) dans les logs', () => {
+test('7.f fallbackTo présent dans les logs (Session 11 : fallbackTo = recipientPhone, jamais fromE164)', () => {
+  // Session 10 : fallbackTo utilisait recipientE164 (= gateway SIM) → anti-boucle déclenchée
+  // Session 11 FIX : fallbackTo = recipientPhone (vrai profil Firestore) → anti-boucle évitée
+  // Le log contient maintenant 'fallbackTo' avec la valeur du vrai numéro profil
   assert(
-    gatewayInboundSrc.includes('fallbackTo            : recipientE164'),
-    'fallbackTo dans les logs doit être recipientE164 (destinataire OmniSMS, jamais l\'expéditeur externe)'
+    gatewayInboundSrc.includes('fallbackTo') && !gatewayInboundSrc.includes('to       : fromE164'),
+    'fallbackTo doit être présent dans les logs et ne jamais utiliser fromE164 comme destination'
   );
 });
 

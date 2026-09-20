@@ -1121,3 +1121,74 @@ Session de corrections ciblées sur le frontend Flutter Web suite aux tests rée
 ### Variables Render à configurer
 
 Voir §14 de ce document et PROJECT_STATUS.md v5.2.0.
+
+---
+
+## §24 — Session 11 : Correction Routage SMS Entrant + Notifications Gratuites
+
+**Date** : 2026-09-20  
+**Commit** : (voir PROJECT_STATUS.md v5.3.0)
+
+### 1. Routage SMS Entrant — Cause racine et correction
+
+**Bug confirmé** (logs production) :
+```
+incomingTo   : +2267540****   ← SIM gateway InfiniReach (numéro TECHNIQUE)
+fallbackTo   : +2267540****   ← MÊME numéro → ANTI-BOUCLE → SMS annulé
+```
+
+**Cause** : `fallbackTo = recipientE164 = incomingTo = gatewayNumber`. La résolution UID → profil (`resolveUserByUid`) n'était pas appelée.
+
+**Correction appliquée** dans `routes/sms.gateway.inbound.js` :
+1. Import ajouté : `const { resolveUserByPhone, resolveUserByUid } = require('../services/userResolver');`
+2. Après résolution `ownerUid`, appel de `resolveUserByUid(ownerUid)` → `recipientPhone` (vrai profil Firestore)
+3. Fallback offline : `fallbackTo = recipientPhone` (JAMAIS `recipientE164` = gateway)
+4. Anti-boucle 2 préservée : si `recipientPhone === gatewayNumber` → message en Firestore, log explicite
+5. Logs enrichis : `gatewayNumber` et `recipientPhone` comme champs distincts
+
+**Distinctions de variables** :
+- `incomingTo` / `recipientE164` / `gatewayNumber` = numéro SIM InfiniReach (TECHNIQUE)
+- `recipientPhone` = vrai numéro de téléphone du profil Firestore du propriétaire
+- Ces deux valeurs doivent être différentes pour le fallback SMS
+
+### 2. Système de Notifications Gratuites
+
+**Fichiers créés/modifiés** :
+
+| Fichier | Rôle |
+|---|---|
+| `frontend/lib/services/notification_service.dart` | Service central de notifications (singleton) |
+| `frontend/lib/services/notification_web.dart` | Stub web (référence pour future implémentation dart:html) |
+| `frontend/lib/providers/messaging_provider.dart` | Dispatch notification à chaque nouveau message entrant |
+| `frontend/lib/screens/settings/notifications_settings_screen.dart` | Toggle + état permission + UI enrichie |
+| `frontend/lib/main.dart` | InAppNotificationWrapper + initialize() |
+| `frontend/web/sw.js` | v2.4.0 : push handler + notificationclick handler |
+| `frontend/android/app/src/main/AndroidManifest.xml` | POST_NOTIFICATIONS permission (Android 13+) |
+
+**Architecture** :
+- Android app premier plan → bannière in-app overlay (InAppNotificationWrapper)
+- Web/PWA page ouverte → même bannière in-app overlay
+- Déduplication : `Set<String> _notifiedIds` dans NotificationService
+- Skip si `_activeConversationId == conversationId`
+- Permission : `permission_handler` (déjà en pubspec.yaml) sur Android
+- **Gratuit** — aucun FCM, aucun service payant
+
+**Limitations documentées** :
+- Android arrière-plan : sans `flutter_local_notifications`, pas de notification système (limitiation Flutter sans FCM/push service)
+- Web/PWA fermée : Push API nécessite infrastructure VAPID — non implémentée (aucun service payant)
+- Les bannières in-app couvrent le cas app ouverte sur toutes plateformes
+
+### 3. Tests
+
+| Suite | Tests | Résultat |
+|---|---|---|
+| `session11-inbound-routing-tests.js` | 19 (A1–D4) | ✅ 19/19 |
+| `session11-notification-tests.js` | 25 (N1–N9) | ✅ 25/25 |
+| `session6-tests.js` | 27 | ✅ 27/27 |
+| `routing-presence-tests.js` | 34 | ✅ 34/34 |
+| `routing-matrix-tests.js` | 57 | ✅ 57/57 |
+| `sms-inbound-tests.js` | 23 | ✅ 23/23 |
+| `sms-gateway-tests.js` | 48 | ✅ 48/48 |
+| `offline-sms-tests.js` | 37 | ✅ 37/37 |
+| `session10-stabilization-tests.js` | 62 | ✅ 62/62 |
+| **TOTAL** | **332** | **✅ 332/332** |

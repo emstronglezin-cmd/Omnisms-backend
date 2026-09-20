@@ -69,7 +69,7 @@ const router  = express.Router();
 
 const { logger }              = require('../middleware/logger');
 const { normalizePhone }      = require('../services/phoneNormalizer');
-const { resolveUserByPhone }  = require('../services/userResolver');
+const { resolveUserByPhone, resolveUserByUid } = require('../services/userResolver');
 const {
   findExternalConvByPhone,
   getOrCreateExternalConv,
@@ -415,6 +415,46 @@ async function processSmsReceived(webhookBody) {
   }
 
   // ─────────────────────────────────────────────────────────────
+  // RÉSOLUTION DU VRAI NUMÉRO DE TÉLÉPHONE DU PROPRIÉTAIRE
+  // ─────────────────────────────────────────────────────────────
+  // Le gatewayNumber (= incomingTo / recipientE164) est un numéro TECHNIQUE
+  // qui identifie la SIM InfiniReach. Il NE représente PAS forcément le numéro
+  // personnel du propriétaire du compte OmniSMS.
+  //
+  // Après résolution de ownerUid, on récupère le vrai profil utilisateur
+  // pour obtenir son numéro de téléphone réel (champ `phone` dans Firestore).
+  //
+  // Ce numéro (recipientPhone) sera utilisé comme fallbackTo en cas d'offline,
+  // à la place de recipientE164 (= gateway SIM number) qui déclenchait l'anti-boucle.
+  let recipientPhone = null; // vrai numéro de téléphone du destinataire (profil Firestore)
+
+  if (ownerUid) {
+    try {
+      const ownerProfile = await resolveUserByUid(ownerUid);
+      if (ownerProfile.found && ownerProfile.phone) {
+        const normalized = normalizePhone(ownerProfile.phone);
+        recipientPhone = normalized || ownerProfile.phone;
+        logger.info('[INfiniReach] webhook:inbound Profil propriétaire résolu', {
+          ownerUid,
+          recipientPhoneMasked : recipientPhone.replace(/\d{4}$/, '****'),
+          gatewayNumberMasked  : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
+          phoneDistinct        : recipientPhone !== (normalizePhone(recipientE164) || recipientE164),
+        });
+      } else {
+        logger.warn('[INfiniReach] webhook:inbound Profil propriétaire sans numéro valide', {
+          ownerUid,
+          profileFound: ownerProfile.found,
+        });
+      }
+    } catch (profileErr) {
+      logger.warn('[INfiniReach] webhook:inbound Erreur résolution profil propriétaire', {
+        ownerUid,
+        error: profileErr.message,
+      });
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // ÉTAPE 2 : Créer/récupérer la conversation externe
   // ─────────────────────────────────────────────────────────────
   if (ownerUid && !convId) {
@@ -515,10 +555,15 @@ async function processSmsReceived(webhookBody) {
   //                    recipientPresence, routingDecision, fallbackTo
 
   // ── Log de routage structuré ─────────────────────────────────
+  // incomingTo    = numéro SIM passerelle InfiniReach (TECHNIQUE)
+  // recipientPhone = vrai numéro de l'utilisateur OmniSMS (PROFIL Firestore)
+  // Ces deux valeurs sont maintenant distinctes — c'était le bug Session 11.
   logger.info('[INfiniReach] ROUTING — diagnostic', {
     incomingFrom          : fromE164.replace(/\d{4}$/, '****'),
     incomingTo            : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
-    resolvedRecipientPhone: recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
+    gatewayNumber         : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
+    recipientPhone        : recipientPhone ? recipientPhone.replace(/\d{4}$/, '****') : '(non résolu)',
+    recipientPhoneDistinct: recipientPhone !== (normalizePhone(recipientE164) || recipientE164),
     resolvedRecipientUid  : ownerUid || null,
     recipientOmniSms      : !!ownerUid,
     convId,
@@ -579,68 +624,83 @@ async function processSmsReceived(webhookBody) {
       });
 
     } else {
-      // ── OFFLINE → SMS ordinaire vers le numéro DESTINATAIRE ────
+      // ── OFFLINE → SMS ordinaire vers le VRAI NUMÉRO du destinataire ─
       //
-      // RÈGLE CRITIQUE : to = recipientE164 (le destinataire du SMS entrant)
-      //                  JAMAIS fromE164 (l'expéditeur)
+      // RÈGLE CRITIQUE (FIX Session 11) :
+      //   fallbackTo = recipientPhone (vrai profil Firestore du destinataire)
+      //   JAMAIS recipientE164 (= numéro SIM passerelle InfiniReach)
+      //   JAMAIS fromE164 (l'expéditeur)
+      //
+      // recipientPhone provient de resolveUserByUid(ownerUid).phone
+      // Si recipientPhone est absent (compte sans profil complet) :
+      //   → pas de fallback, message conservé en Firestore
       //
       // Le message est déjà en Firestore → sera récupéré à la reconnexion.
       const smsGateway = getSmsGateway();
 
+      // Choisir le fallbackTo : vrai numéro de profil en priorité
+      const fallbackTo = recipientPhone || null;
+
       logger.info('[INfiniReach] ROUTING — décision', {
         incomingFrom          : fromE164.replace(/\d{4}$/, '****'),
         incomingTo            : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
+        gatewayNumber         : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
         resolvedRecipientUid  : ownerUid,
         recipientPresence     : 'offline',
         routingDecision       : 'sms_fallback',
-        fallbackTo            : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : '(non résolu)',
-        fallbackFrom          : '(numéro SIM passerelle InfiniReach)',
-        // NE JAMAIS utiliser fromE164 comme destination du fallback
+        fallbackTo            : fallbackTo ? fallbackTo.replace(/\d{4}$/, '****') : '(non résolu)',
+        recipientPhone        : recipientPhone ? recipientPhone.replace(/\d{4}$/, '****') : '(non résolu)',
+        fallbackDistinctGateway: fallbackTo !== (normalizePhone(recipientE164) || recipientE164),
+        // NE JAMAIS utiliser fromE164 ou recipientE164 (= gateway) comme destination du fallback
         smsGatewayConfigured  : !!(smsGateway && smsGateway.isConfigured()),
       });
 
       if (smsGateway && smsGateway.isConfigured()) {
-        // Notifier le DESTINATAIRE (recipientE164) qu'il a reçu un message
-        // pendant son absence. Le `from` d'InfiniReach est le numéro SIM
-        // passerelle (INFINIREACH_FROM_NUMBER) — inchangé, validé.
-        if (recipientE164) {
-          // ── ANTI-BOUCLE GATEWAY (fallback) — FIX Session10 ───────────
-          // Si recipientE164 == numéro de la SIM gateway, envoyer un SMS
-          // vers ce même numéro déclencherait un nouveau webhook → boucle.
-          // Dans ce cas, le message est déjà en Firestore → pas de fallback SMS.
+        // Notifier le DESTINATAIRE (recipientPhone = vrai numéro profil) qu'il a
+        // reçu un message pendant son absence.
+        if (fallbackTo) {
+          // ── ANTI-BOUCLE GATEWAY (fallback) — FIX Session10 + Session11 ──
+          // Si fallbackTo == numéro de la SIM gateway, envoyer un SMS vers ce
+          // même numéro déclencherait un nouveau webhook → boucle infinie.
+          // Grâce à la résolution UID→profil, ce cas ne devrait plus se produire
+          // (le vrai profil != gateway), mais l'anti-boucle reste en dernier rempart.
           const gwNum = (process.env.INFINIREACH_FROM_NUMBER || '').trim();
-          const normalizedGw = gwNum ? (normalizePhone(gwNum) || gwNum) : '';
-          const normalizedRec = normalizePhone(recipientE164) || recipientE164;
+          const normalizedGw  = gwNum ? (normalizePhone(gwNum) || gwNum) : '';
+          const normalizedFallback = normalizePhone(fallbackTo) || fallbackTo;
 
-          if (normalizedGw && normalizedRec === normalizedGw) {
-            logger.warn('[INfiniReach] ANTI-BOUCLE (fallback) — recipientE164 == gateway number → SMS fallback annulé', {
-              recipientE164: recipientE164.replace(/\d{4}$/, '****'),
-              hint         : 'Le propriétaire du gateway est offline, mais envoyer un SMS vers le gateway lui-même créerait une boucle. Message conservé en Firestore.',
+          if (normalizedGw && normalizedFallback === normalizedGw) {
+            logger.warn('[INfiniReach] ANTI-BOUCLE (fallback) — fallbackTo == gateway number → SMS fallback annulé', {
+              fallbackTo   : fallbackTo.replace(/\d{4}$/, '****'),
+              gatewayNumber: normalizedGw.replace(/\d{4}$/, '****'),
+              hint         : 'recipientPhone == gatewayNumber : le profil Firestore contient le même numéro que la SIM passerelle. Message conservé en Firestore.',
             });
           } else {
-          try {
-            const smsText = `[OmniSMS] Message reçu de ${fromE164} : ${finalText}`;
-            const smsResult = await smsGateway.sendSMS({
-              to       : recipientE164,   // ← DESTINATAIRE ORIGINAL (75...) — JAMAIS l'expéditeur (57...)
-              text     : smsText,
-              messageId: savedMsgId || null,
-              ttl      : 3600,
-            });
-            logger.info('[INfiniReach] SMS fallback envoyé', {
-              fallbackTo  : recipientE164.replace(/\d{4}$/, '****'),  // toujours le destinataire
-              fallbackFrom: '(SIM passerelle)',
-              success     : smsResult?.success,
-            });
-          } catch (smsErr) {
-            logger.warn('[INfiniReach] SMS fallback échoué', {
-              fallbackTo: recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
-              error     : smsErr.message,
-            });
-          }
+            try {
+              const smsText = `[OmniSMS] Message reçu de ${fromE164} : ${finalText}`;
+              const smsResult = await smsGateway.sendSMS({
+                to       : fallbackTo,  // ← VRAI numéro profil (pas le gateway)
+                text     : smsText,
+                messageId: savedMsgId || null,
+                ttl      : 3600,
+              });
+              logger.info('[INfiniReach] SMS fallback envoyé', {
+                fallbackTo  : fallbackTo.replace(/\d{4}$/, '****'),
+                fallbackFrom: '(SIM passerelle)',
+                success     : smsResult?.success,
+              });
+            } catch (smsErr) {
+              logger.warn('[INfiniReach] SMS fallback échoué', {
+                fallbackTo: fallbackTo.replace(/\d{4}$/, '****'),
+                error     : smsErr.message,
+              });
+            }
           } // fin else anti-boucle
         } else {
-          logger.warn('[INfiniReach] SMS fallback impossible — recipientE164 non résolu', {
-            hint: 'Le numéro SIM destinataire (to) doit être configuré dans InfiniReach',
+          // recipientPhone non résolu (profil Firestore sans numéro)
+          // → pas de fallback SMS, message déjà en Firestore
+          logger.warn('[INfiniReach] SMS fallback impossible — recipientPhone non résolu', {
+            ownerUid,
+            hint: 'Le profil Firestore du propriétaire ne contient pas de numéro de téléphone valide. Message conservé en Firestore.',
           });
         }
       } else {

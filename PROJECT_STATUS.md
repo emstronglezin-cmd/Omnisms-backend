@@ -685,3 +685,61 @@ Online→No account: resolvedUid=null → SMS_EXTERNE vers normalizePhone(target
 | `RENDER_EXTERNAL_URL` | URL publique Render | Non | Non (auto-injecté) |
 
 > **Secrets** : ne jamais afficher dans les logs ni dans le code. Configurer uniquement via le dashboard Render.
+
+---
+
+## v5.3.0 — Session 11 : Routage Inbound + Notifications (2026-09-20)
+
+### FIX 1 — Routage SMS Entrant InfiniReach
+
+**Fichier** : `routes/sms.gateway.inbound.js`
+
+**Cause racine** : `fallbackTo = recipientE164 = incomingTo = gatewayNumber` → ANTI-BOUCLE → SMS jamais livré.
+
+**Correction** :
+- Import `resolveUserByUid` ajouté (ligne 72)
+- Après résolution `ownerUid` : appel `resolveUserByUid(ownerUid)` → `recipientPhone` (profil Firestore)
+- `fallbackTo = recipientPhone` (JAMAIS `recipientE164` = gateway SIM)
+- Anti-boucle 2 maintenue : si `recipientPhone === gatewayNumber` → Firestore seulement
+- Logs : `gatewayNumber` et `recipientPhone` comme champs distincts
+
+**Flux corrigé** :
+```
+SMS entrant → gateway SIM (+2267540****)
+  ↓ webhook
+  ownerUid résolu → MGvh4dYL...
+  recipientPhone résolu → +22601234567 (vrai profil)
+  ┌─ ONLINE  → Socket.IO vers ownerUid
+  └─ OFFLINE → SMS vers +22601234567 (PAS le gateway)
+```
+
+### FIX 2 — Notifications Gratuites
+
+**Fichiers créés/modifiés** :
+- `frontend/lib/services/notification_service.dart` (nouveau)
+- `frontend/lib/services/notification_web.dart` (nouveau)  
+- `frontend/lib/providers/messaging_provider.dart` (modifié)
+- `frontend/lib/screens/settings/notifications_settings_screen.dart` (modifié)
+- `frontend/lib/main.dart` (modifié)
+- `frontend/web/sw.js` → v2.4.0 (modifié)
+- `frontend/android/app/src/main/AndroidManifest.xml` (modifié)
+
+**Architecture** : Bannières in-app overlay (gratuit, sans FCM)
+- Déduplication par messageId (`Set<String> _notifiedIds`)
+- Skip si conversation active visible
+- Toggle ON/OFF dans Paramètres → Notifications
+- Permission Android : `POST_NOTIFICATIONS` (API 33+) via `permission_handler`
+- sw.js : handlers `push` et `notificationclick` ajoutés
+
+**Limitations documentées** :
+- Android arrière-plan : pas de notification système sans FCM/flutter_local_notifications
+- PWA fermée : nécessite Push API + VAPID (non implémenté — gratuit)
+
+### Tests Session 11
+
+| Suite | Tests | Résultat |
+|---|---|---|
+| `session11-inbound-routing-tests.js` | 19 | ✅ 19/19 |
+| `session11-notification-tests.js` | 25 | ✅ 25/25 |
+| 7 suites existantes | 288 | ✅ 288/288 |
+| **TOTAL** | **332** | **✅ 332/332** |

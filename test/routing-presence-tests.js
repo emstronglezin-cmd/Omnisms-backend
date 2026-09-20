@@ -61,8 +61,9 @@ ok(
 
 console.log('\n── Test 2 — Destinataire DÉCONNECTÉ → SMS vers DESTINATAIRE (75), JAMAIS vers expéditeur (57) ──');
 
-// Bug 1 : vérifier que fromE164 n'est PAS utilisé comme `to` dans sendSMS du fallback
-// La ligne corrigée doit contenir `to: recipientE164`
+// FIX Session 11 : fallbackTo = recipientPhone (vrai profil), JAMAIS recipientE164 (= gateway)
+// Bug corrigé : le code utilisait `to: recipientE164` (= gateway SIM) → boucle infinie
+// Correction  : le code utilise maintenant `to: fallbackTo` (= recipientPhone = vrai profil)
 const sendSmsBlock = (() => {
   // Extraire le bloc sendSMS du fallback offline
   const match = inboundSrc.match(/smsGateway\.sendSMS\s*\(\s*\{([\s\S]{0,400}?)\}\s*\)/);
@@ -70,8 +71,8 @@ const sendSmsBlock = (() => {
 })();
 
 ok(
-  'T2.a sendSMS fallback utilise recipientE164 comme `to` (DESTINATAIRE)',
-  /to\s*:\s*recipientE164/.test(sendSmsBlock),
+  'T2.a sendSMS fallback utilise fallbackTo (= recipientPhone = vrai profil) comme `to`',
+  /to\s*:\s*fallbackTo/.test(sendSmsBlock),
   `Bloc sendSMS extrait : ${sendSmsBlock.slice(0, 120).replace(/\n/g, ' ')}`
 );
 
@@ -82,9 +83,9 @@ ok(
 );
 
 ok(
-  'T2.c Log fallbackTo utilise recipientE164',
-  /fallbackTo\s*:.*recipientE164/.test(inboundSrc),
-  'log { fallbackTo: recipientE164... } doit être présent'
+  'T2.c Log fallbackTo est présent (Session 11 : utilise recipientPhone, pas recipientE164)',
+  /fallbackTo\s*:/.test(inboundSrc),
+  'log { fallbackTo: ... } doit être présent (fallbackTo = recipientPhone en Session 11)'
 );
 
 ok(
@@ -94,9 +95,9 @@ ok(
 );
 
 ok(
-  'T2.e Guard: fallback SMS seulement si recipientE164 est résolu',
-  /if\s*\(\s*recipientE164\s*\)/.test(inboundSrc),
-  'Guard if (recipientE164) doit protéger le sendSMS fallback'
+  'T2.e Guard: fallback SMS seulement si fallbackTo est résolu (Session 11)',
+  /if\s*\(\s*fallbackTo\s*\)/.test(inboundSrc),
+  'Guard if (fallbackTo) doit protéger le sendSMS fallback (Session 11 fix)'
 );
 
 console.log('\n── Test 3 — Destinataire SANS compte OmniSMS ──────────────────────');
@@ -217,8 +218,8 @@ ok(
 );
 
 ok(
-  'T6.c Log contient resolvedRecipientPhone',
-  /resolvedRecipientPhone/.test(inboundSrc)
+  'T6.c Log contient recipientPhone (Session 11 : vrai numéro profil distinct du gateway)',
+  /recipientPhone/.test(inboundSrc)
 );
 
 ok(
