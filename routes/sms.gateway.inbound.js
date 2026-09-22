@@ -69,7 +69,7 @@ const router  = express.Router();
 
 const { logger }              = require('../middleware/logger');
 const { normalizePhone }      = require('../services/phoneNormalizer');
-const { resolveUserByPhone, resolveUserByUid } = require('../services/userResolver');
+const { resolveUserByPhone, resolveUserByUid, resolveUserByUsername, normalizeUsername } = require('../services/userResolver');
 const {
   findExternalConvByPhone,
   getOrCreateExternalConv,
@@ -148,22 +148,52 @@ async function isAlreadyProcessed(eventId) {
 
 /* ── Parsing du préfixe # ──────────────────────────────────── */
 /**
- * Protocole # : premier SMS peut commencer par "#NUMERO message"
+ * Protocole # : premier SMS peut commencer par "#CIBLE message"
  * pour indiquer le destinataire OmniSMS.
- * Identique au protocole de infobip.inbound.js — cohérence maintenue.
+ *
+ * Deux formats acceptés :
+ *   #NUMERO  message → ex: #+22670123456 Bonjour
+ *   #username message → ex: #petit-test Bonjour
+ *
+ * Retourne :
+ *   { targetPhone, cleanText }    si NUMERO (résolution directe)
+ *   { targetUsername, cleanText } si username (résolution async via resolveUserByUsername)
+ *
+ * Règles username :
+ *   - Commence par une lettre ou un chiffre (pas par +)
+ *   - Contient lettres, chiffres, tirets et underscores
+ *   - Longueur 2–50 caractères
+ *   - Pas uniquement des chiffres (pour distinguer d'un numéro court)
  */
 function parseHashPrefix(text) {
   if (!text || typeof text !== 'string') return null;
   const trimmed = text.trim();
-  const match   = trimmed.match(/^[#]?\s*(\+?[\d]{6,15})\s+([\s\S]+)$/);
-  if (!match) return null;
 
-  const rawPhone  = match[1];
-  const cleanText = match[2].trim();
-  const e164      = normalizePhone(rawPhone);
+  // ── Cas 1 : numéro de téléphone (#NUMERO message ou #+NUMERO message)
+  const phoneMatch = trimmed.match(/^#?\s*(\+?[\d]{6,15})\s+([\s\S]+)$/);
+  if (phoneMatch) {
+    const rawPhone  = phoneMatch[1];
+    const cleanText = phoneMatch[2].trim();
+    const e164      = normalizePhone(rawPhone);
+    if (!e164 || !cleanText) return null;
+    return { targetPhone: e164, cleanText };
+  }
 
-  if (!e164 || !cleanText) return null;
-  return { targetPhone: e164, cleanText };
+  // ── Cas 2 : username (#username message)
+  // Format : #username<espace>message
+  // username = [a-zA-Z0-9][a-zA-Z0-9_-]{1,49}  (pas uniquement des chiffres)
+  const usernameMatch = trimmed.match(/^#\s*([a-zA-Z0-9][a-zA-Z0-9_-]{1,49})\s+([\s\S]+)$/);
+  if (usernameMatch) {
+    const rawUsername = usernameMatch[1];
+    const cleanText   = usernameMatch[2].trim();
+    // Exclure les chaînes purement numériques (déjà gérées par le cas 1 ou non pertinentes)
+    if (/^\d+$/.test(rawUsername)) return null;
+    const normalized = normalizeUsername(rawUsername);
+    if (!normalized || !cleanText) return null;
+    return { targetUsername: normalized, cleanText };
+  }
+
+  return null;
 }
 
 /* ── Mise à jour statut livraison ───────────────────────────── */
@@ -360,22 +390,46 @@ async function processSmsReceived(webhookBody) {
   // Cas A : Protocole #
   const hashParsed = parseHashPrefix(finalText);
   if (hashParsed) {
-    logger.info('[INfiniReach] webhook:inbound Protocole # détecté', {
-      targetPhone: hashParsed.targetPhone.replace(/\d{4}$/, '****'),
-    });
-
-    const targetUser = await resolveUserByPhone(hashParsed.targetPhone);
-    if (targetUser.found) {
-      ownerUid  = targetUser.uid;
-      finalText = hashParsed.cleanText;
-      isNewConv = true;
-      logger.info('[INfiniReach] webhook:inbound # protocol → OmniSMS user trouvé', {
-        targetUid: ownerUid,
-      });
-    } else {
-      logger.warn('[INfiniReach] webhook:inbound # protocol : numéro cible non OmniSMS', {
+    if (hashParsed.targetPhone) {
+      // ── Protocole #NUMERO ────────────────────────────────────
+      logger.info('[INfiniReach] webhook:inbound Protocole #NUMERO détecté', {
         targetPhone: hashParsed.targetPhone.replace(/\d{4}$/, '****'),
       });
+
+      const targetUser = await resolveUserByPhone(hashParsed.targetPhone);
+      if (targetUser.found) {
+        ownerUid  = targetUser.uid;
+        finalText = hashParsed.cleanText;
+        isNewConv = true;
+        logger.info('[INfiniReach] webhook:inbound # protocol (phone) → OmniSMS user trouvé', {
+          targetUid: ownerUid,
+        });
+      } else {
+        logger.warn('[INfiniReach] webhook:inbound # protocol (phone) : numéro cible non OmniSMS', {
+          targetPhone: hashParsed.targetPhone.replace(/\d{4}$/, '****'),
+        });
+      }
+
+    } else if (hashParsed.targetUsername) {
+      // ── Protocole #username ──────────────────────────────────
+      logger.info('[INfiniReach] webhook:inbound Protocole #username détecté', {
+        targetUsername: hashParsed.targetUsername,
+      });
+
+      const targetUser = await resolveUserByUsername(hashParsed.targetUsername);
+      if (targetUser.found) {
+        ownerUid  = targetUser.uid;
+        finalText = hashParsed.cleanText;
+        isNewConv = true;
+        logger.info('[INfiniReach] webhook:inbound # protocol (username) → OmniSMS user trouvé', {
+          targetUsername: hashParsed.targetUsername,
+          targetUid     : ownerUid,
+        });
+      } else {
+        logger.warn('[INfiniReach] webhook:inbound # protocol (username) : username non trouvé', {
+          targetUsername: hashParsed.targetUsername,
+        });
+      }
     }
   }
 

@@ -1192,3 +1192,91 @@ fallbackTo   : +2267540****   ← MÊME numéro → ANTI-BOUCLE → SMS annulé
 | `offline-sms-tests.js` | 37 | ✅ 37/37 |
 | `session10-stabilization-tests.js` | 62 | ✅ 62/62 |
 | **TOTAL** | **332** | **✅ 332/332** |
+
+---
+
+## §25 — Session 12 : #username + notifications + paiement (2026-09-22)
+
+### 1. Résolution #username (CORRIGÉ)
+
+**Problème** : `#petit-test` → utilisateur non trouvé. `#+226xxxxxxxx` → fonctionnel.
+
+**Cause racine** : `parseHashPrefix()` dans `sms.gateway.inbound.js` utilisait le regex `\+?[\d]{6,15}` qui ne matche que des chiffres. Les usernames (`petit-test`, `user_test`, `user123`) ne matchaient jamais.
+
+**Correction** :
+- `parseHashPrefix()` étendue avec un deuxième pattern : `#[a-zA-Z0-9][a-zA-Z0-9_-]{1,49} message`
+- Retourne `{ targetUsername, cleanText }` pour les usernames (vs `{ targetPhone, cleanText }` pour les numéros)
+- Import ajouté : `resolveUserByUsername, normalizeUsername` depuis `userResolver.js`
+- Cas A dans `processSmsReceived` : branche `if (hashParsed.targetPhone)` et `else if (hashParsed.targetUsername)` — résolution via `resolveUserByUsername()` qui requête Firestore `users.username`
+- Le routage après résolution est identique au cas téléphone : `ownerUid` → présence → ONLINE/OFFLINE → même logique
+
+**Champ Firestore** : `username` (lowercase, normalisé via `normalizeUsername` = `.toLowerCase().trim()`)
+
+**`resolveUserByUsername(username)`** : déjà existant dans `userResolver.js` — retourne `{ found, uid, username, phone, ... }`
+
+**Fichiers modifiés** :
+- `routes/sms.gateway.inbound.js` (parseHashPrefix + cas A username)
+
+### 2. Notifications (CORRIGÉ)
+
+**Problèmes** :
+1. `ConversationScreen.dispose()` n'appelait pas `setActiveConversation(null)` → `_activeConversationId` restait défini après avoir quitté la conversation → TOUTES les futures notifications pour cette conv étaient silencieusement bloquées par le guard `activeConvId == conversationId`
+2. `NotificationService.initialize()` n'essayait pas de demander la permission au démarrage → sur Android 13+, si l'utilisateur n'a jamais visité Settings → Notifications, `hasPermission()` retourne false et les notifications sont ignorées
+
+**Corrections** :
+- `ConversationScreen.dispose()` : ajout de `provider.setActiveConversation(null)` + log diagnostique `activeConv cleared`
+- `NotificationService.initialize()` : sur Android, vérifie `Permission.notification.status` — si `isDenied`, appelle `request()` dès le démarrage de l'app (dialogue système Android 13+)
+- Log diagnostic enrichi dans `show()` : `Permission check: true/false` + `overlayActive: true/false`
+
+**État réel** (TESTÉ PAR MOCK) :
+- Android app premier plan : bannière in-app → fonctionne (overlay StreamController)
+- Web/PWA page ouverte : bannière in-app → fonctionne (même overlay)
+- Android arrière-plan : non supporté sans `flutter_local_notifications` (limitation documentée)
+- Web/PWA page fermée : non supporté sans Push API/VAPID (limitation documentée)
+
+**Fichiers modifiés** :
+- `frontend/lib/screens/messaging/conversation_screen.dart` (dispose → setActiveConversation(null))
+- `frontend/lib/services/notification_service.dart` (initialize → permission request + diagnostics)
+
+### 3. Paiement SaaSPay (CORRIGÉ)
+
+**Problème** : `POST /leekpay → 503` avec log `[SaaSPay] Non configuré — LEEKPAY_SECRET_KEY ou LEEKPAY_API_KEY manquante`
+
+**Causes** :
+1. `controllers/saaspayController.js` avait un copy-paste bug : utilisait `leekpay.PREMIUM_AMOUNT`, `leekpay.PREMIUM_CURRENCY`, `leekpay.validateAmount` — mais `leekpay` n'était pas importé (seulement `saaspay` à la ligne 18) → ReferenceError à runtime
+2. Le log error disait `LEEKPAY_SECRET_KEY` alors que `saaspay.isConfigured()` vérifie `SAASPAY_SECRET_KEY`
+
+**Corrections** :
+- Remplacement de tous les `leekpay.*` par `saaspay.*` dans `saaspayController.js` : `.PREMIUM_AMOUNT`, `.PREMIUM_CURRENCY`, `.validateAmount`
+- Message d'erreur corrigé : `SAASPAY_SECRET_KEY ou SAASPAY_API_KEY manquante`
+- Code d'erreur JSON corrigé : `SAASPAY_NOT_CONFIGURED`
+
+**Variables Render à configurer** (si non encore fait) :
+```
+SAASPAY_SECRET_KEY = sk_live_xxx
+SAASPAY_API_KEY    = pk_live_xxx
+SAASPAY_BASE_URL   = https://saaspay.me  (facultatif, valeur par défaut)
+```
+STATUT : code corrigé — si le 503 persiste, vérifier que les variables sont bien dans Render Dashboard.
+
+### 4. Tests Session 12
+
+| Suite | Tests | Résultat |
+|---|---|---|
+| `session12-username-notif-payment-tests.js` | 80 (U1-U5, N1-N9, P1-P5) | ✅ 80/80 |
+
+**Total toutes sessions** : 412/412 ✅
+
+| Suite | Tests | Résultat |
+|---|---|---|
+| `session12-username-notif-payment-tests.js` | 80 | ✅ 80/80 |
+| `session11-inbound-routing-tests.js` | 19 | ✅ 19/19 |
+| `session11-notification-tests.js` | 25 | ✅ 25/25 |
+| `session6-tests.js` | 27 | ✅ 27/27 |
+| `routing-presence-tests.js` | 34 | ✅ 34/34 |
+| `routing-matrix-tests.js` | 57 | ✅ 57/57 |
+| `sms-inbound-tests.js` | 23 | ✅ 23/23 |
+| `sms-gateway-tests.js` | 48 | ✅ 48/48 |
+| `offline-sms-tests.js` | 37 | ✅ 37/37 |
+| `session10-stabilization-tests.js` | 62 | ✅ 62/62 |
+| **TOTAL** | **412** | **✅ 412/412** |

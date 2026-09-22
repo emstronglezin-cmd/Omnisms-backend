@@ -84,8 +84,8 @@ async function activatePremiumFirestore(userId, { checkoutId, transactionId, amo
       paymentMethod : 'leekpay',
       transactionId : transactionId || checkoutId,
       checkoutId,
-      amount        : amount   || leekpay.PREMIUM_AMOUNT,
-      currency      : currency || leekpay.PREMIUM_CURRENCY,
+      amount        : amount   || saaspay.PREMIUM_AMOUNT,
+      currency      : currency || saaspay.PREMIUM_CURRENCY,
       app           : 'OmniSMS',
       createdAt     : now,
     });
@@ -172,19 +172,19 @@ async function createPayment(req, res) {
   }
 
   if (!saaspay.isConfigured()) {
-    logger.error('[SaaSPay] Non configuré — LEEKPAY_SECRET_KEY ou LEEKPAY_API_KEY manquante');
+    logger.error('[SaaSPay] Non configuré — SAASPAY_SECRET_KEY ou SAASPAY_API_KEY manquante');
     return res.status(503).json({
       success: false,
       error  : 'Service de paiement non disponible.',
-      code   : 'LEEKPAY_NOT_CONFIGURED',
+      code   : 'SAASPAY_NOT_CONFIGURED',
     });
   }
 
   const cleanUserId = userId.trim();
-  const payAmount   = Number(amount)   || leekpay.PREMIUM_AMOUNT;
-  const payCurrency = (currency || leekpay.PREMIUM_CURRENCY).toUpperCase();
+  const payAmount   = Number(amount)   || saaspay.PREMIUM_AMOUNT;
+  const payCurrency = (currency || saaspay.PREMIUM_CURRENCY).toUpperCase();
 
-  try { leekpay.validateAmount(payAmount, payCurrency); }
+  try { saaspay.validateAmount(payAmount, payCurrency); }
   catch (err) {
     return res.status(400).json({ success: false, error: err.message, code: 'INVALID_AMOUNT' });
   }
@@ -345,7 +345,7 @@ async function processWebhookPayload(body, rawBody, signature, event) {
   const checkoutId    = data.checkout_id || data.id || null;
   const transactionId = data.transaction_id || checkoutId;
   const amount        = Number(data.amount) || 0;
-  const currency      = data.currency       || leekpay.PREMIUM_CURRENCY;
+  const currency      = data.currency       || saaspay.PREMIUM_CURRENCY;
   const paymentMethod = data.payment_method || null;
   const paidAt        = data.paid_at        || null;
   const metadata      = data.metadata       || {};
@@ -527,7 +527,7 @@ async function getPaymentStatus(req, res) {
         orderId         : d.orderId      || null,
         status          : d.status       || 'unknown',
         amount          : d.amount       || 0,
-        currency        : d.currency     || leekpay.PREMIUM_CURRENCY,
+        currency        : d.currency     || saaspay.PREMIUM_CURRENCY,
         premiumActivated: d.premiumActivated || false,
         paidAt          : d.paidAt       || null,
         paymentMethod   : d.paymentMethod || null,

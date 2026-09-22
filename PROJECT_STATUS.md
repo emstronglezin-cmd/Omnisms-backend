@@ -743,3 +743,50 @@ SMS entrant → gateway SIM (+2267540****)
 | `session11-notification-tests.js` | 25 | ✅ 25/25 |
 | 7 suites existantes | 288 | ✅ 288/288 |
 | **TOTAL** | **332** | **✅ 332/332** |
+
+---
+
+## v5.4.0 — Session 12 (2026-09-22)
+
+### 1. Résolution #username — PRODUCTION READY
+
+**Corrections** :
+- `parseHashPrefix()` dans `sms.gateway.inbound.js` étendue pour supporter deux formats :
+  - `#+226xxxxxxxx message` (existant — inchangé)
+  - `#username message` (nouveau — `[a-zA-Z0-9][a-zA-Z0-9_-]{1,49}`)
+- Résolution via `resolveUserByUsername(normalized)` → Firestore `users.username`
+- Routage identique après résolution (online → OmniSMS, offline → SMS fallback)
+- Import ajouté : `resolveUserByUsername, normalizeUsername`
+
+**État** : PRODUCTION READY — TESTÉ PAR MOCK
+
+### 2. Notifications — AMÉLIORÉ
+
+**Corrections critiques** :
+- `ConversationScreen.dispose()` appelle maintenant `setActiveConversation(null)` — sans ça, toutes les notifications futures pour une conversation étaient bloquées même après avoir quitté l'écran
+- `NotificationService.initialize()` demande la permission Android 13+ dès le démarrage
+
+**Limitations confirmées** :
+- Android arrière-plan : TESTÉ PAR MOCK (flutter_local_notifications non installé)
+- Web/PWA page fermée : NON TESTÉ (Push API/VAPID non implémenté)
+
+### 3. Paiement SaaSPay — CORRIGÉ
+
+**Correction** : `saaspayController.js` référençait `leekpay.*` non importé → ReferenceError runtime
+- Tous les `leekpay.PREMIUM_AMOUNT/CURRENCY/validateAmount` → `saaspay.*`
+- Log error corrigé : `SAASPAY_SECRET_KEY ou SAASPAY_API_KEY manquante`
+- Code erreur JSON : `SAASPAY_NOT_CONFIGURED`
+
+**Configuration Render requise** (si 503 persiste) :
+```
+SAASPAY_SECRET_KEY = sk_live_xxx
+SAASPAY_API_KEY    = pk_live_xxx
+```
+
+### Tests Session 12
+
+| Suite | Tests | Résultat |
+|---|---|---|
+| `session12-username-notif-payment-tests.js` | 80 | ✅ 80/80 |
+| Toutes suites précédentes | 332 | ✅ 332/332 |
+| **TOTAL** | **412** | **✅ 412/412** |
