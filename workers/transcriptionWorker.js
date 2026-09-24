@@ -44,6 +44,48 @@ function cleanupTempFile(tempFile) {
   }
 }
 
+/* ── SESSION 13 — Reprise Audio → SMS (messageRouter) ─────── */
+// Chargement paresseux : aucun risque au boot, aucune dépendance circulaire.
+function getAudioSmsRouter() {
+  try { return require('../services/messageRouter'); } catch (_) { return null; }
+}
+
+/** true si c'est la dernière tentative BullMQ (ou le mode inline, sans retry). */
+function isFinalAttempt(job) {
+  const maxAttempts = (job && job.opts && job.opts.attempts) || 1;
+  return ((job && job.attemptsMade) || 0) + 1 >= maxAttempts;
+}
+
+/**
+ * Après sauvegarde de la transcription : reprendre l'envoi SMS du TEXTE si le
+ * message vocal était routé vers un destinataire SMS. Ne lève jamais d'exception.
+ */
+async function resumeAudioSms(job, messageId, text, collection) {
+  const router = getAudioSmsRouter();
+  if (!router || typeof router.continueAudioSmsAfterTranscription !== 'function') return null;
+  try {
+    return await router.continueAudioSmsAfterTranscription({
+      messageId, transcription: text, collection, jobId: job && job.id,
+    });
+  } catch (err) {
+    logger.warn('[AUDIO_SMS] Reprise Audio → SMS : erreur inattendue', { messageId, error: err.message });
+    return null;
+  }
+}
+
+/** Échec de transcription : statut d'erreur propre côté SMS (aucun SMS envoyé). */
+async function recordAudioSmsFailure(job, messageId, collection, error) {
+  const router = getAudioSmsRouter();
+  if (!router || typeof router.markAudioSmsTranscriptionFailed !== 'function') return null;
+  try {
+    return await router.markAudioSmsTranscriptionFailed({
+      messageId, collection, error, finalAttempt: isFinalAttempt(job), jobId: job && job.id,
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
 /* ── Processor du job ─────────────────────────────────────── */
 async function transcriptionProcessor(job) {
   const {
@@ -82,6 +124,7 @@ async function transcriptionProcessor(job) {
       transcriptionStatus : 'error',
       transcriptionError  : error,
     }, collection);
+    await recordAudioSmsFailure(job, messageId, collection, error); // SESSION 13
     emitTranscriptionEvent(userId, messageId, { status: 'error', error, messageId });
     cleanupTempFile(tempFile);
     throw new Error(error);
@@ -103,6 +146,7 @@ async function transcriptionProcessor(job) {
     const error = 'Fichier audio vide (0 octets) — impossible de transcrire.';
     logger.error('[Transcription] FAILED — empty file', { jobId: job.id, messageId, audioFilePath });
     await updateMessageStatus(messageId, { transcriptionStatus: 'error', transcriptionError: error }, collection);
+    await recordAudioSmsFailure(job, messageId, collection, error); // SESSION 13
     emitTranscriptionEvent(userId, messageId, { status: 'error', error, messageId });
     cleanupTempFile(tempFile);
     throw new Error(error);
@@ -140,6 +184,7 @@ async function transcriptionProcessor(job) {
       transcriptionStatus: 'error',
       transcriptionError : err.message,
     }, collection);
+    await recordAudioSmsFailure(job, messageId, collection, err.message); // SESSION 13
     emitTranscriptionEvent(userId, messageId, { status: 'error', error: err.message, messageId });
     cleanupTempFile(tempFile);
     throw err;
@@ -168,6 +213,17 @@ async function transcriptionProcessor(job) {
     transcribedAt        : new Date().toISOString(),
   }, collection);
 
+  // ── Étape 6 bis (SESSION 13) : reprise du routage Audio → SMS ─
+  // La transcription est sauvegardée : si le vocal était adressé à un
+  // destinataire SMS (externe ou OmniSMS hors ligne), son TEXTE part
+  // maintenant via la file SMS existante (idempotent, jamais le fichier audio).
+  const audioSms = await resumeAudioSms(job, messageId, result.text, collection);
+  if (audioSms && audioSms.action !== 'skipped') {
+    logger.info('[Transcription] Reprise Audio → SMS', {
+      jobId: job.id, messageId, action: audioSms.action, reason: audioSms.reason || null, smsJobId: audioSms.jobId || null,
+    });
+  }
+
   // ── Étape 7 : Notification Socket.IO ─────────────────────
   logger.info('[Transcription] Socket notification sent', { jobId: job.id, messageId, userId });
   emitTranscriptionEvent(userId, messageId, {
@@ -192,7 +248,7 @@ async function transcriptionProcessor(job) {
     chars   : result.text?.length || 0,
   });
 
-  return { messageId, text: result.text, method: result.method };
+  return { messageId, text: result.text, method: result.method, audioSms: audioSms ? audioSms.action : null };
 }
 
 /* ── Helpers ──────────────────────────────────────────────── */

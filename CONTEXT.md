@@ -1280,3 +1280,130 @@ STATUT : code corrigé — si le 503 persiste, vérifier que les variables sont 
 | `offline-sms-tests.js` | 37 | ✅ 37/37 |
 | `session10-stabilization-tests.js` | 62 | ✅ 62/62 |
 | **TOTAL** | **412** | **✅ 412/412** |
+
+---
+
+## §26 — Session 13 : #username réel + Audio→SMS après transcription + diagnostic notifications (2026-09-24)
+
+### Problèmes constatés en production
+
+1. **USERNAME** : `#petit-test` → « utilisateur non trouvé » malgré le fix Session 12 (tests mockés passants).
+2. **AUDIO → SMS** : la transcription Groq réussissait (logs complets) mais le SMS n'était jamais envoyé : le routage SMS était déclenché **avant** la transcription asynchrone, et **jamais repris** après.
+3. **NOTIFICATIONS** : non fonctionnelles en test réel — diagnostic complet du chemin backend + ID de message incohérent entre payload Socket.IO et Firestore.
+
+### 1. USERNAME — cause réelle et correction
+
+**Causes réelles** (tracées dans le code, pas supposées) :
+- `POST /api/messages/send` (`routes/messages.v2.js`) traitait `receiverId` soit comme téléphone, soit comme UID Firestore. **Aucune branche username** → `#petit-test` était traité comme UID inconnu → message fantôme / aucun envoi.
+- `parseHashPrefix()` (inbound SMS) ne couvrait qu'un sous-ensemble : pas du point (`.`, charset officiel de l'inscription `[a-zA-Z0-9_.-]`), pas du préfixe `@`, pas des tirets Unicode des claviers mobiles, pas des usernames numériques courts.
+- `resolveUserByUsername()` était strictement lowercase : un compte ancien stocké avec sa casse d'origine ne serait jamais résolu par `#PetitTest`.
+- Champ Firestore vérifié dans le code : `users.username` (stocké en lowercase à l'inscription `routes/auth.js` et via `PUT /me/profile`). C'est bien ce champ que lit la résolution.
+
+**Correction** (étendre le système existant, pas en créer un nouveau) :
+- `services/userResolver.js` :
+  - `parseRecipientReference(raw)` — analyse `#…` / `@…` / `＃…` (NFKC) : `username` | `phone` | `invalid`. Un numéro (≥ 6 chiffres, sans lettre) reste **toujours** un numéro (priorité absolue téléphone).
+  - `resolveRecipientUsername(receiverId, opts)` — chaîne complète : saisie brute → parse → `resolveUserByUsername()` → UID (+ téléphone du profil). Statuts : `resolved` / `not_found` / `phone` / `not_username`. Tente aussi l'username « nu » (sans #) en dernier recours, jamais pour un numéro / UID.
+  - `resolveUserByUsername()` : accepte `#`/`@` préfixés, tirets Unicode, fallback exact-casse pour comptes anciens.
+- `routes/messages.v2.js` (`POST /send`) : résolution username **avant** `routeMessage()` :
+  - `#username` connu → `routeMessage({ targetUid })` → profil → téléphone réel → présence → **ONLINE Socket.IO / OFFLINE SMS** (le SMS part vers le numéro **réel du profil**, jamais le gateway ni le username brut).
+  - `#username` inconnu → **HTTP 404 `USER_NOT_FOUND`**, aucun message fantôme, aucun SMS, pas d'exception.
+  - `#+226…` → numéro explicite (préfixe retiré) → résolution téléphone existante.
+  - Logs `[USERNAME]` : raw input / parsed / resolving / resolved uid / resolved phone / online-offline routing.
+- `services/socketService.js` (`message:send`) : même support `#username` (ack `USER_NOT_FOUND` propre si inconnu, aucun message persisté).
+- `routes/sms.gateway.inbound.js` : `parseHashPrefix()` étendu (cas 3 : charset complet, `@`, tirets Unicode, username numérique court) + fallback username numérique uniquement si le numéro n'est aucun compte OmniSMS + trace `[USERNAME]`.
+
+**Règle non régressive** : un numéro qui fonctionnait avant fonctionne exactement comme avant (testé U5/U5b/I5/I5b).
+
+### 2. AUDIO → SMS — cause réelle et correction
+
+**Cause réelle** : `routeMessage()` (branche audio → externe) tentait la transcription **synchrone** ; pour un `data:` URI (cas produit, audio ≤ 1,5 MB stocké en base64 dans Firestore) aucun moteur ne pouvait se lancer immédiatement → log `Audio → SMS impossible : transcription vide ou échouée` → **fin du traitement**. Le worker `transcriptionWorker` sauvegardait ensuite la transcription mais **rien ne relançait le routage SMS**.
+
+**Correction** (réutilise `smsQueueWorker` → `smsGateway`/Infobip + retries BullMQ, pas de deuxième système SMS) :
+- `services/messageRouter.js` :
+  - `continueAudioSmsAfterTranscription({ messageId, transcription, collection })` : appelée **après** la sauvegarde de la transcription. Éligibilité stricte (`type=audio`, `channel=sms`, `receiverId` E.164, pas déjà envoyé). Envoie le **texte** via `enqueueSmsJob()` (format `[OmniSMS Vocal] {expéditeur} : {texte}`).
+  - **Idempotence** (retry du worker / double déclenchement) : réservation atomique Firestore `audioSmsStatus = 'queued'` (transaction) + `jobId sms-{messageId}` BullMQ + `externalId omnisms-{messageId}` INfiniReach. Un message = un SMS, point.
+  - Transcription vide → `audioSmsStatus: 'skipped_empty_transcription'`, aucun SMS vide.
+  - Échec transcription → `markAudioSmsTranscriptionFailed()` → `audioSmsStatus: 'transcription_failed'`, message conservé, statut propre.
+  - Anti-boucle : jamais de SMS vers la SIM passerelle (`INFINIREACH_FROM_NUMBER`).
+  - Destinataire résolu **sans téléphone** : aucun appel provider, message conservé (conversation OmniSMS).
+  - Log initial renommé : **« transcription en attente (asynchrone) »** — ne ressemble plus à une erreur finale ; seul le worker peut conclure à « réellement échouée ».
+  - **ID canonique** : plus l'ID temporaire `msg-…` n'est persisté ; l'ID du document Firestore est l'ID du payload Socket.IO, de la réponse API et de `GET /conversation` (`{ id: d.id, ...d.data() }`).
+- `workers/transcriptionWorker.js` : après l'étape « Saving transcription to Firestore » → `continueAudioSmsAfterTranscription()` ; sur chaque échec → statut d'erreur propre. Job reste `completed`/`failed` selon le cas, sans lever d'exception de la reprise.
+- `services/queueService.js` : `addSmsJob(data, opts)` transmet les options — `jobId: sms-{messageId}` fourni par `enqueueSmsJob` (dédup BullMQ) **n'est plus silencieusement ignoré**.
+
+### 3. NOTIFICATIONS — diagnostic et correction
+
+**Chemin vérifié** (serveur réel + client Socket.IO réel dans les tests) :
+`message:send`/`POST /send` → `routeMessage()` → Firestore `messages` → `emitToUser(resolvedUid, 'message:receive', msg)` → room `user:{uid}`.
+
+**Causes/points corrigés** :
+1. **ID incohérent** : le document Firestore était créé avec un champ `id` = ID temporaire, écrasant l'ID du document au retour `GET /conversation` → dédoublonnage frontend par ID cassé → corrections Session 11/12 inefficaces. **Corrigé** (ID canonique, §2).
+2. **Diagnostic d'émission** : `emitToUser()` loggue désormais `[NOTIFICATION] Événement {event} émis` avec `recipientUid`, `room`, **`socketsInRoom`** (0 = le destinataire n'a aucune session ouverte — c'est le signal clé pour le test réel) + résumé du payload (messageId, senderId, receiverId, conversationId, type, contentLength, createdAt — jamais le contenu ni de secret).
+3. Présence : `isUserOnline` (Redis `online_ttl:{uid}` + `online_users`) inchangée, double-check Socket.IO room conservé.
+4. **Offline** : comportement existant conservé (Firestore + SMS), aucune nouvelle brique push.
+
+**Payload `message:receive` (contrat inchangé, vérifié N4)** :
+`{ id, senderId, receiverId, conversationId, content, type, channel, audioUrl, duration, status, reactions, createdAt, updatedAt, tempId? }`.
+**Aucun champ `isMe`** n'existe dans le contrat — le frontend déduit `isMe` depuis `senderId` vs son UID.
+
+### 4. Fichiers modifiés (Session 13)
+
+| Fichier | Modification |
+|---|---|
+| `services/userResolver.js` | `parseRecipientReference`, `resolveRecipientUsername`, helpers (NFKC, tirets Unicode, phone-like) ; `resolveUserByUsername` tolérant |
+| `routes/messages.v2.js` | `/send` : résolution `#username` → 404 `USER_NOT_FOUND` / `routeMessage({targetUid})` ; logs `[USERNAME]` |
+| `services/socketService.js` | `message:send` : `#username` (ack propre) ; logs `[NOTIFICATION]` dans `emitToUser` + `message:send` (`socketsInRoom`) |
+| `services/messageRouter.js` | `continueAudioSmsAfterTranscription`, `markAudioSmsTranscriptionFailed`, `evaluateAudioSmsEligibility` ; ID canonique ; garde « pas de destination SMS » ; logs « en attente (asynchrone) » / `[NOTIFICATION]` |
+| `workers/transcriptionWorker.js` | Reprise Audio→SMS après sauvegarde ; statut d'erreur propre sur échec |
+| `services/queueService.js` | `addSmsJob(data, opts)` — `jobId` dédup transmis (était ignoré) |
+| `routes/sms.gateway.inbound.js` | `parseHashPrefix` étendu (charset complet, `@`, Unicode, numérique court) ; fallback username numérique ; exports tests ; logs `[USERNAME]`/`[NOTIFICATION]` |
+| `test/session13-username-audio-notif-tests.js` | **Nouveau** — 33 tests de VRAI comportement (serveur Express + Socket.IO réels, Firestore/gateway/Groq mockés) |
+
+### 5. Tests Session 13
+
+`node test/session13-username-audio-notif-tests.js` — **33/33 PASS** (stabilisé sur 3 exécutions).
+
+| Série | Tests |
+|---|---|
+| U (username) | U1, U2, U3, U4, U5, U5b, U6, U7a, U7b, U7c, U8 — résolution, online, offline, 404 propre, priorité téléphone, numérique, audio |
+| A (audio→SMS) | A1, A2, A3, A4, A5, A6, A7, A8 — reprise après transcription, provider existant, vide, échec, idempotence, online, UID non E.164 |
+| N (notifications) | N1, N2, N3, N4, N5, N6, N7 — présence, émission réelle, bon UID, payload, offline, pas de mauvais UID, persistance |
+| I (inbound #) | I1, I2, I3, I4, I5, I5b, I6 — inbound username, inconnu, offline, numérique, rétrocompat téléphone, conv existante, dédup |
+
+### 6. Non-régression
+
+| Suite | Résultat |
+|---|---|
+| `offline-monetization-tests.js` | 26/26 ✅ |
+| `offline-sms-tests.js` | 37/37 ✅ |
+| `p0-p4-unit-tests.js` | 36/36 ✅ |
+| `phase6-phase7-tests.js` | 51/51 ✅ |
+| `routing-matrix-tests.js` | 57/57 ✅ |
+| `routing-presence-tests.js` | 34/34 ✅ |
+| `session10-stabilization-tests.js` | 56/62 (6 échecs **pré-existants** : chemin `/home/user/webapp` non présent en CI — identique avant/après) |
+| `session11-inbound-routing-tests.js` | 19/19 ✅ |
+| `session11-notification-tests.js` | 18/25 (7 échecs **pré-existants** : fichiers Flutter `/home/user/frontend` absents de ce repo — identique avant/après) |
+| `session12-username-notif-payment-tests.js` | 54/61 (7 échecs **pré-existants** : idem — fichiers Flutter absents) |
+| `session6-tests.js` | 15/27 (12 échecs **pré-existants** : idem — fichiers Flutter absents) |
+| `sms-gateway-tests.js` | 48/48 ✅ |
+| `sms-inbound-tests.js` | 23/23 ✅ |
+| `session13-username-audio-notif-tests.js` | **33/33 ✅ (nouveau)** |
+
+Les 32 échecs « pré-existants » sont tous des lectures de fichiers Flutter situés dans un repo séparé (`/home/user/frontend`) qui n'existe pas dans cet environnement ; la liste exacte des échecs est **identique avant et après** la session (vérifiée test par test).
+
+### 7. Limitations / à faire en production
+
+- **Frontend non modifié** (hors périmètre). Le contrat Socket.IO est conservé ; le champ manquant éventuel côté client (`isMe`) s'en déduit depuis `senderId`.
+- Test réel recommandé après déploiement : envoyer `#username` depuis l'app, observer les logs `[USERNAME] … resolved uid=` puis `[NOTIFICATION] Événement message:receive émis … socketsInRoom:1` chez le destinataire.
+- `audioSmsStatus` est un **nouveau champ** Firestore (additif, aucune migration requise).
+- Le push notification en arrière-plan (app fermée) reste hors périmètre (aucun service payant autorisé) — l'existant (Firestore + SMS offline) est conservé.
+
+### 8. État final
+
+```text
+USERNAME       : FIXED (tests réels U1–U8 + I1–I6)
+AUDIO → SMS    : FIXED (tests réels A1–A8)
+NOTIFICATIONS  : FIXED — emission réelle prouvée (N1–N7) + ID canonique + diagnostic socketsInRoom
+PAYMENT        : NON TOUCHÉ
+FRONTEND       : NON TOUCHÉ
+```
