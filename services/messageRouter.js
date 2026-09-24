@@ -384,7 +384,12 @@ async function routeMessage(opts = {}) {
     let savedId = msgId;
     if (db) {
       try {
-        const ref = await db.collection('messages').add(msg);
+        // SESSION 13 (NOTIFICATIONS) : ne pas persister l'id temporaire `msg-…`.
+        // L'ID canonique est l'ID du document Firestore : c'est celui du payload
+        // Socket.IO, de la réponse POST /send et de GET /conversation
+        // ({ id: d.id, ...d.data() } — un champ `id` stocké l'écraserait).
+        const { id: _tempId, ...msgToStore } = msg;
+        const ref = await db.collection('messages').add(msgToStore);
         savedId = ref.id;
         msg.id  = savedId;
       } catch (dbErr) {
@@ -430,10 +435,21 @@ async function routeMessage(opts = {}) {
     }
 
     // Socket.IO — délivraison temps réel
+    logger.info('[NOTIFICATION] Message sauvegardé → destinataire en ligne → émission message:receive', {
+      senderUid,
+      recipientUid  : resolvedUid,
+      presence      : 'online',
+      messageId     : msg.id,
+      persisted     : savedId !== msgId,
+      conversationId: convId,
+      type,
+    });
     try {
       const emitToUser = require('./socketService').emitToUser;
       emitToUser(resolvedUid, 'message:receive', msg);
-    } catch (_) {}
+    } catch (emitErr) {
+      logger.warn('[NOTIFICATION] Émission Socket.IO impossible', { recipientUid: resolvedUid, error: emitErr.message });
+    }
 
     logger.info('[ROUTING] Message routed → OMNISMS', {
       senderUid,
@@ -466,6 +482,15 @@ async function routeMessage(opts = {}) {
   //
   // e164Target = numéro DESTINATAIRE en E.164
 
+  if (resolvedUid) {
+    logger.info('[NOTIFICATION] Destinataire OmniSMS hors ligne → aucune émission Socket.IO (Firestore + SMS, comportement existant)', {
+      senderUid,
+      recipientUid: resolvedUid,
+      presence    : 'offline',
+      type,
+    });
+  }
+
   // Si le destinataire a un compte OmniSMS mais est offline : utiliser son numéro réel
   let e164Target;
   if (resolvedUid && !recipientIsOnline && resolvedUserInfo && resolvedUserInfo.phone) {
@@ -489,10 +514,25 @@ async function routeMessage(opts = {}) {
   try { smsGateway = require('./smsGateway'); } catch (_) {}
   try { infobip    = require('./infobip');    } catch (_) {}
 
+  // SESSION 13 — destinataire résolu SANS numéro de téléphone (ex : compte
+  // créé via Google, username résolu dont le profil n'a pas de phone).
+  // On n'appelle JAMAIS le provider SMS avec une destination vide : le
+  // message reste en Firestore et sera livré en ligne.
+  if (!e164Target) {
+    logger.warn('[ROUTING] Destination SMS vide (destinataire sans numéro) — message en Firestore seulement, aucun SMS', {
+      senderUid,
+      resolvedUid: resolvedUid || null,
+      targetPhone: targetPhone ? targetPhone.replace(/\d{4}$/, '****') : null,
+      hint: 'Le profil Firestore du destinataire ne contient pas de numéro de téléphone.',
+    });
+  }
+
   const useGateway = smsGateway && smsGateway.isSmsGatewayProvider() && smsGateway.isConfigured();
   const useInfobip = infobip    && infobip.isConfigured();
 
-  if (useGateway) {
+  if (!e164Target) {
+    transport = 'none'; // ne jamais appeler un provider sans destination
+  } else if (useGateway) {
     transport = 'sms_gateway';
   } else if (useInfobip) {
     transport = 'infobip';
@@ -509,17 +549,29 @@ async function routeMessage(opts = {}) {
   }
 
   // Créer/récupérer la conversation externe
-  const extConv = await getOrCreateExternalConv(db, senderUid, e164Target, null);
-  const convId  = extConv?.conversationId || makeExternalConvId(senderUid, e164Target);
+  // SESSION 13 : sans numéro de destination, le message attend dans la
+  // conversation OmniSMS (IDs déterministes) du couple sender/destinataire —
+  // il sera lu quand l'utilisateur reconnectera (channel 'app').
+  let convId;
+  let msgChannel = 'sms';
+  let msgReceiverId = e164Target;
+  if (!e164Target && resolvedUid) {
+    convId        = makeConversationId(senderUid, resolvedUid);
+    msgChannel    = 'app';
+    msgReceiverId = resolvedUid;
+  } else {
+    const extConv = await getOrCreateExternalConv(db, senderUid, e164Target, null);
+    convId        = extConv?.conversationId || makeExternalConvId(senderUid, e164Target);
+  }
 
   const msg = {
     id            : msgId,
     senderId      : senderUid,
-    receiverId    : e164Target,
+    receiverId    : msgReceiverId,
     conversationId: convId,
     content       : content ? content.trim() : null,
     type,
-    channel       : 'sms',
+    channel       : msgChannel,
     audioUrl      : audioUrl || null,
     duration      : duration || null,
     status        : 'pending',
@@ -532,7 +584,9 @@ async function routeMessage(opts = {}) {
   let savedId = msgId;
   if (db) {
     try {
-      const ref = await db.collection('messages').add(msg);
+      // SESSION 13 : ID canonique = ID du document (voir branche OMNISMS)
+      const { id: _tempId, ...msgToStore } = msg;
+      const ref = await db.collection('messages').add(msgToStore);
       savedId = ref.id;
       msg.id  = savedId;
       // Mettre à jour lastMessage dans la conversation externe
@@ -676,6 +730,10 @@ async function routeMessage(opts = {}) {
     });
 
     let transcribedText = null;
+    // SESSION 13 : état de la tentative SYNCHRONE (diagnostic). Un échec ici
+    // n'est jamais définitif : la transcription asynchrone (transcriptionWorker)
+    // reprend l'envoi SMS via continueAudioSmsAfterTranscription().
+    let syncTranscription = 'not_attempted';
     try {
       const transcriptionService = require('./transcriptionService');
       // L'audioUrl peut être une URL https ou un chemin local
@@ -706,18 +764,25 @@ async function routeMessage(opts = {}) {
       }
 
       if (audioPath) {
+        syncTranscription = 'attempted';
         const result = await transcriptionService.transcribe({ audioPath, language: 'fr' });
         if (result && result.text && result.text.trim()) {
           transcribedText = result.text.trim();
+          syncTranscription = 'done';
           logger.info('[ROUTING] Transcription réussie', {
             senderUid, chars: transcribedText.length, method: result.method,
           });
+        } else {
+          syncTranscription = 'empty';
         }
       }
     } catch (transcribeErr) {
+      syncTranscription = 'failed';
       logger.warn('[ROUTING] Transcription échouée — message audio non délivré par SMS', {
         error: transcribeErr.message,
         senderUid,
+        // SESSION 13 : échec de la tentative synchrone uniquement
+        suite: 'transcription asynchrone (transcriptionWorker) → reprise SMS automatique',
       });
     }
 
@@ -770,8 +835,17 @@ async function routeMessage(opts = {}) {
         });
       }
     } else if (!transcribedText) {
-      logger.warn('[ROUTING] Audio → SMS impossible : transcription vide ou échouée, message en Firestore seulement', {
-        senderUid, convId,
+      // SESSION 13 — ce n'est PAS un échec définitif : POST /api/messages/send
+      // lance la transcription asynchrone ; dès que la transcription est
+      // sauvegardée, transcriptionWorker appelle continueAudioSmsAfterTranscription()
+      // qui envoie le TEXTE via la file SMS existante. Seul le worker peut
+      // conclure à un échec réel (log « [AUDIO_SMS] Transcription réellement échouée »).
+      logger.info('[ROUTING] Audio → SMS : transcription en attente (asynchrone) — l\'envoi SMS reprendra automatiquement après la transcription', {
+        senderUid,
+        convId,
+        messageId        : savedId,
+        syncTranscription,  // not_attempted (data URI) | attempted | empty | failed
+        audioSource      : (audioUrl || '').startsWith('data:') ? 'data-uri' : 'url',
       });
     }
   } else if (type !== 'text') {
@@ -791,6 +865,314 @@ async function routeMessage(opts = {}) {
   };
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * SESSION 13 — Reprise Audio → SMS après la transcription asynchrone
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * Problème corrigé : routeMessage() route un vocal vers SMS (destinataire
+ * externe ou OmniSMS hors ligne) AVANT que la transcription asynchrone
+ * (transcriptionWorker, Groq) soit disponible. Le worker sauvegardait ensuite
+ * la transcription… et le routage SMS n'était jamais repris.
+ *
+ * continueAudioSmsAfterTranscription() est appelée par le worker APRÈS la
+ * sauvegarde de la transcription. Elle envoie le TEXTE transcrit via la file
+ * SMS existante (smsQueueWorker → INfiniReach / Infobip, retries BullMQ).
+ * Le fichier audio n'est JAMAIS envoyé par SMS.
+ *
+ * Idempotence (retries du worker, double déclenchement) :
+ *   1. réservation atomique Firestore (transaction) : audioSmsStatus = 'queued'
+ *      n'est posé qu'une seule fois par message ;
+ *   2. jobId BullMQ `sms-{messageId}` (enqueueSmsJob) ;
+ *   3. externalId INfiniReach `omnisms-{messageId}` (smsGateway.sendSMS).
+ *
+ * Champ Firestore ajouté sur messages/{id} : audioSmsStatus
+ *   queued | sent | failed | transcription_failed |
+ *   skipped_empty_transcription | skipped_no_transport | skipped_gateway_number
+ */
+
+const E164_RE                  = /^\+[1-9]\d{6,14}$/;
+const AUDIO_SMS_SENT_STATUSES  = ['sent', 'delivered', 'read', 'seen'];
+const AUDIO_SMS_LOCKED_MARKERS = ['queued', 'sent'];
+
+function getContinuationDb(dbParam) {
+  if (dbParam) return dbParam;
+  try {
+    const d = require('../config/firebase');
+    return d && !d._stub ? d : null;
+  } catch (_) { return null; }
+}
+
+function maskPhoneS13(p) {
+  return p ? String(p).replace(/\d{4}$/, '****') : null;
+}
+
+/**
+ * Un message Firestore est-il un vocal routé vers SMS, pas encore envoyé ?
+ * @returns {{ eligible: boolean, reason?: string, to?: string }}
+ */
+function evaluateAudioSmsEligibility(msg) {
+  if (!msg)                           return { eligible: false, reason: 'message_not_found' };
+  if (msg.type !== 'audio')           return { eligible: false, reason: 'not_audio' };
+  // channel 'app' = destinataire OmniSMS EN LIGNE, déjà livré par Socket.IO (A7)
+  if (msg.channel !== 'sms')          return { eligible: false, reason: 'not_sms_route' };
+  if (msg.direction === 'inbound')    return { eligible: false, reason: 'inbound_message' };
+  const to = typeof msg.receiverId === 'string' ? msg.receiverId.trim() : '';
+  if (!E164_RE.test(to))              return { eligible: false, reason: 'no_valid_recipient_phone' };
+  if (AUDIO_SMS_SENT_STATUSES.includes(msg.status) || msg.smsMessageId) {
+    return { eligible: false, reason: 'already_sent' };
+  }
+  if (AUDIO_SMS_LOCKED_MARKERS.includes(msg.audioSmsStatus)) {
+    return { eligible: false, reason: 'already_queued' };
+  }
+  return { eligible: true, to };
+}
+
+/**
+ * Réservation atomique : un seul appelant peut passer audioSmsStatus à 'queued'.
+ */
+async function claimAudioSms(db, ref) {
+  const now    = new Date().toISOString();
+  const fields = { audioSmsStatus: 'queued', audioSmsQueuedAt: now, updatedAt: now };
+
+  if (typeof db.runTransaction === 'function') {
+    return db.runTransaction(async (tx) => {
+      const snap  = await tx.get(ref);
+      const check = evaluateAudioSmsEligibility(snap && snap.exists ? snap.data() : null);
+      if (!check.eligible) return { claimed: false, reason: check.reason };
+      tx.update(ref, fields);
+      return { claimed: true, to: check.to };
+    });
+  }
+
+  // Repli (Firestore sans transactions — ex. stubs) : lecture puis écriture
+  const snap  = await ref.get();
+  const check = evaluateAudioSmsEligibility(snap && snap.exists ? snap.data() : null);
+  if (!check.eligible) return { claimed: false, reason: check.reason };
+  await ref.update(fields);
+  return { claimed: true, to: check.to };
+}
+
+/** Même format d'expéditeur que la branche audio synchrone de routeMessage(). */
+async function buildAudioSmsSenderDisplay(senderUid) {
+  let senderName  = null;
+  let senderPhone = null;
+  if (senderUid) {
+    try {
+      const { resolveUserByUid } = require('./userResolver');
+      const u = await resolveUserByUid(senderUid);
+      if (u && u.found) {
+        senderName  = u.name || u.username || null;
+        senderPhone = u.phone || null;
+      }
+    } catch (_) { /* userResolver indisponible → affichage générique */ }
+  }
+  return senderName
+    ? `${senderName}${senderPhone ? ` (${senderPhone})` : ''}`
+    : (senderPhone || 'Un utilisateur OmniSMS');
+}
+
+/**
+ * Reprend le routage SMS d'un message vocal une fois sa transcription sauvegardée.
+ * Ne lève JAMAIS d'exception (le job de transcription reste « completed »).
+ *
+ * @param {object} opts
+ * @param {string}  opts.messageId            ID du document messages/{id}
+ * @param {string}  opts.transcription        texte transcrit (Groq / Whisper)
+ * @param {string} [opts.collection='messages'] collection mise à jour par le worker
+ * @param {object} [opts.db]                  instance Firestore (tests)
+ * @param {string} [opts.jobId]               ID du job de transcription (logs)
+ * @returns {Promise<{ action: 'queued'|'sent'|'skipped'|'failed', reason?: string, jobId?: string }>}
+ */
+async function continueAudioSmsAfterTranscription(opts = {}) {
+  const {
+    messageId,
+    transcription,
+    collection = 'messages',
+    db: dbParam = null,
+    jobId = null,
+  } = opts;
+
+  try {
+    if (!messageId) return { action: 'skipped', reason: 'no_message_id' };
+    if (collection !== 'messages') {
+      // audio_messages (POST /api/audio/transcribe/:id) : transcription seule, aucun routage
+      return { action: 'skipped', reason: 'collection_not_routed' };
+    }
+
+    const db = getContinuationDb(dbParam);
+    if (!db) {
+      logger.warn('[AUDIO_SMS] Firestore indisponible — reprise Audio → SMS impossible', { messageId });
+      return { action: 'skipped', reason: 'db_unavailable' };
+    }
+
+    const ref   = db.collection('messages').doc(messageId);
+    const snap  = await ref.get();
+    const msg   = snap && snap.exists ? snap.data() : null;
+    const check = evaluateAudioSmsEligibility(msg);
+    if (!check.eligible) {
+      logger.info('[AUDIO_SMS] Aucune reprise SMS nécessaire', { messageId, reason: check.reason, jobId });
+      return { action: 'skipped', reason: check.reason };
+    }
+
+    const text = typeof transcription === 'string' ? transcription.trim() : '';
+    const now  = new Date().toISOString();
+
+    // ── Transcription vide : aucun SMS vide, message conservé ──────────
+    if (!text) {
+      await ref.update({
+        audioSmsStatus: 'skipped_empty_transcription',
+        audioSmsError : 'Transcription vide — aucun SMS envoyé.',
+        updatedAt     : now,
+      }).catch(() => {});
+      logger.warn('[AUDIO_SMS] Transcription vide → aucun SMS envoyé (message conservé)', {
+        messageId, to: maskPhoneS13(check.to), jobId,
+      });
+      return { action: 'skipped', reason: 'empty_transcription' };
+    }
+
+    // ── Anti-boucle : jamais de SMS vers la SIM passerelle elle-même ────
+    const gw     = (process.env.INFINIREACH_FROM_NUMBER || '').trim();
+    const gwNorm = gw ? (normalizePhone(gw) || gw) : '';
+    if (gwNorm && check.to === gwNorm) {
+      await ref.update({ audioSmsStatus: 'skipped_gateway_number', updatedAt: now }).catch(() => {});
+      logger.warn('[AUDIO_SMS] Destinataire = numéro passerelle → SMS annulé (anti-boucle)', {
+        messageId, to: maskPhoneS13(check.to),
+      });
+      return { action: 'skipped', reason: 'gateway_number' };
+    }
+
+    // ── Réservation atomique (idempotence) ─────────────────────────────
+    const claim = await claimAudioSms(db, ref);
+    if (!claim.claimed) {
+      logger.info('[AUDIO_SMS] Déjà pris en charge — aucun doublon', { messageId, reason: claim.reason, jobId });
+      return { action: 'skipped', reason: claim.reason || 'already_claimed' };
+    }
+
+    const senderDisplay = await buildAudioSmsSenderDisplay(msg.senderId);
+    const smsText       = `[OmniSMS Vocal] ${senderDisplay} : ${text}`;
+
+    logger.info('[AUDIO_SMS] Transcription disponible → envoi du texte via la file SMS existante', {
+      messageId,
+      to            : maskPhoneS13(claim.to),
+      transcriptLen : text.length,
+      conversationId: msg.conversationId || null,
+      jobId,
+    });
+
+    const { enqueueSmsJob } = require('./smsQueueWorker');
+    let queued;
+    try {
+      queued = await enqueueSmsJob({
+        to            : claim.to,
+        text          : smsText,
+        messageId,                              // → jobId sms-{messageId} + externalId omnisms-{messageId}
+        conversationId: msg.conversationId || null,
+        ownerUid      : msg.senderId || null,
+      });
+    } catch (sendErr) {
+      // Mode inline (sans Redis) : l'envoi a été tenté immédiatement et a échoué.
+      await ref.update({
+        audioSmsStatus: 'failed',
+        audioSmsError : String(sendErr.message || 'Envoi SMS échoué').slice(0, 300),
+        updatedAt     : new Date().toISOString(),
+      }).catch(() => {});
+      logger.error('[AUDIO_SMS] Envoi SMS du texte transcrit échoué', {
+        messageId, to: maskPhoneS13(claim.to), error: sendErr.message,
+      });
+      return { action: 'failed', reason: 'sms_send_failed', error: sendErr.message };
+    }
+
+    if (!queued || (!queued.jobId && !queued.queued)) {
+      await ref.update({
+        audioSmsStatus: 'failed',
+        audioSmsError : 'File SMS indisponible — job non créé.',
+        updatedAt     : new Date().toISOString(),
+      }).catch(() => {});
+      logger.error('[AUDIO_SMS] File SMS indisponible — SMS non envoyé', { messageId });
+      return { action: 'failed', reason: 'queue_unavailable' };
+    }
+
+    if (queued.result && queued.result.skipped) {
+      await ref.update({ audioSmsStatus: 'skipped_no_transport', updatedAt: new Date().toISOString() }).catch(() => {});
+      logger.warn('[AUDIO_SMS] Aucun transport SMS configuré — SMS non envoyé (message conservé)', { messageId });
+      return { action: 'skipped', reason: 'no_transport_configured' };
+    }
+
+    if (queued.result && queued.result.success) {
+      await ref.update({
+        audioSmsStatus: 'sent',
+        audioSmsSentAt: new Date().toISOString(),
+        updatedAt     : new Date().toISOString(),
+      }).catch(() => {});
+      logger.info('[AUDIO_SMS] SMS du texte transcrit envoyé', {
+        messageId,
+        to          : maskPhoneS13(claim.to),
+        provider    : queued.result.provider || null,
+        smsMessageId: queued.result.smsMessageId || null,
+      });
+      return { action: 'sent', jobId: queued.jobId, smsMessageId: queued.result.smsMessageId || null };
+    }
+
+    logger.info('[AUDIO_SMS] SMS mis en file (BullMQ) — envoi et retries par smsQueueWorker', {
+      messageId, smsJobId: queued.jobId, to: maskPhoneS13(claim.to),
+    });
+    return { action: 'queued', jobId: queued.jobId };
+
+  } catch (err) {
+    logger.error('[AUDIO_SMS] Reprise Audio → SMS impossible', { messageId, error: err.message, jobId });
+    return { action: 'failed', reason: 'exception', error: err.message };
+  }
+}
+
+/**
+ * Enregistre un statut d'erreur propre quand la transcription d'un vocal routé
+ * vers SMS échoue. Aucun SMS n'est envoyé, le message est conservé.
+ * Le marqueur 'transcription_failed' n'est PAS bloquant : si une nouvelle
+ * tentative du worker réussit, l'envoi SMS reprend normalement.
+ * Ne lève jamais d'exception.
+ */
+async function markAudioSmsTranscriptionFailed(opts = {}) {
+  const {
+    messageId,
+    collection   = 'messages',
+    error        = null,
+    finalAttempt = true,
+    db: dbParam  = null,
+    jobId        = null,
+  } = opts;
+
+  try {
+    if (!messageId || collection !== 'messages') return { action: 'skipped', reason: 'collection_not_routed' };
+    const db = getContinuationDb(dbParam);
+    if (!db) return { action: 'skipped', reason: 'db_unavailable' };
+
+    const ref   = db.collection('messages').doc(messageId);
+    const snap  = await ref.get();
+    const check = evaluateAudioSmsEligibility(snap && snap.exists ? snap.data() : null);
+    if (!check.eligible) return { action: 'skipped', reason: check.reason };
+
+    await ref.update({
+      audioSmsStatus: 'transcription_failed',
+      audioSmsError : String(error || 'Transcription échouée').slice(0, 300),
+      updatedAt     : new Date().toISOString(),
+    });
+
+    if (finalAttempt) {
+      logger.warn('[AUDIO_SMS] Transcription réellement échouée → aucun SMS envoyé (message conservé, statut d\'erreur enregistré)', {
+        messageId, to: maskPhoneS13(check.to), error, jobId,
+      });
+    } else {
+      logger.warn('[AUDIO_SMS] Transcription échouée (tentative intermédiaire) — nouvelle tentative prévue, aucun SMS pour l\'instant', {
+        messageId, error, jobId,
+      });
+    }
+    return { action: 'marked', reason: 'transcription_failed' };
+  } catch (err) {
+    logger.warn('[AUDIO_SMS] Enregistrement du statut d\'échec impossible', { messageId, error: err.message });
+    return { action: 'failed', reason: 'exception', error: err.message };
+  }
+}
+
 module.exports = {
   routeMessage,
   makeConversationId,
@@ -798,4 +1180,8 @@ module.exports = {
   getOrCreateExternalConv,
   findExternalConvByPhone,
   updateExternalConvLastMessage,
+  // SESSION 13 — reprise Audio → SMS après transcription asynchrone
+  continueAudioSmsAfterTranscription,
+  markAudioSmsTranscriptionFailed,
+  evaluateAudioSmsEligibility,
 };

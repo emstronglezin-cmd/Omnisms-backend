@@ -23,6 +23,38 @@ const { logger }  = require('../middleware/logger');
 const redis       = require('./redis');
 const { normalizePhone } = require('./phoneNormalizer');
 const { resolveUserByPhone } = require('./userResolver');
+// SESSION 13 — résolution #username (même service que POST /api/messages/send)
+const { resolveRecipientUsername } = require('./userResolver');
+
+// SESSION 13 — événements « nouveau message » tracés avec le tag [NOTIFICATION]
+const NOTIFICATION_EVENTS = new Set(['message:receive', 'new_message']);
+
+/** Nombre de sockets connectés dans la room user:{uid} (instance locale). */
+function countSocketsInUserRoom(uid) {
+  try {
+    const room = _io && _io.sockets && _io.sockets.adapter && _io.sockets.adapter.rooms
+      ? _io.sockets.adapter.rooms.get(`user:${uid}`)
+      : null;
+    return room ? room.size : 0;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Résumé du payload pour les logs — JAMAIS le contenu du message. */
+function summarizeMessagePayload(data) {
+  const d = data || {};
+  return {
+    messageId     : d.id || d.messageId || null,
+    senderId      : d.senderId || null,
+    receiverId    : d.receiverId || null,
+    conversationId: d.conversationId || null,
+    type          : d.type || null,
+    channel       : d.channel || null,
+    contentLength : typeof d.content === 'string' ? d.content.length : 0,
+    createdAt     : d.createdAt || d.timestamp || null,
+  };
+}
 
 const ONLINE_TTL = 5 * 60; // 5 minutes (renouvelé par heartbeat)
 
@@ -232,14 +264,46 @@ function initSocketIO(httpServer) {
         // ── Résolution OmniSMS via userResolver (multi-variantes, source de vérité)
         //    Garantit un conversationId basé sur UIDs réels, jamais sur numéros.
         let effectiveReceiverId = receiverId;
-        const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
+        let phoneCandidate      = receiverId;
+        let usernameResolved    = false;
+
+        // SESSION 13 — "#username" / "@username" explicite → UID réel.
+        // Username inconnu → erreur propre (ack), aucun message fantôme.
+        if (typeof resolveRecipientUsername === 'function' && typeof receiverId === 'string' && /^\s*[#@＃＠]/.test(receiverId)) {
+          const lookup = await resolveRecipientUsername(receiverId, {
+            allowBare: false, source: 'Socket.IO message:send', senderUid: uid,
+          });
+          if (lookup.status === 'not_found') {
+            if (typeof ack === 'function') {
+              ack({
+                error   : `Utilisateur introuvable : aucun compte OmniSMS pour « #${lookup.username || ''} ».`,
+                code    : 'USER_NOT_FOUND',
+                username: lookup.username || null,
+                tempId  : tempId || null,
+              });
+            }
+            return;
+          }
+          if (lookup.status === 'resolved') {
+            effectiveReceiverId = lookup.uid;
+            usernameResolved    = true;
+          }
+          if (lookup.status === 'phone') {
+            // "#+226…" → numéro explicite : même traitement qu'un numéro saisi sans #
+            phoneCandidate      = lookup.phoneValue;
+            effectiveReceiverId = lookup.phoneValue;
+          }
+        }
+
+        const looksLikePhone = !usernameResolved
+          && /^\+?[0-9\s\-()+]{7,20}$/.test(phoneCandidate) && !phoneCandidate.includes('-');
         if (looksLikePhone) {
           try {
-            const resolved = await resolveUserByPhone(receiverId, { includeDeleted: false });
+            const resolved = await resolveUserByPhone(phoneCandidate, { includeDeleted: false });
             if (resolved.found) {
               effectiveReceiverId = resolved.uid;
               logger.info('[Socket] Phone resolved → OmniSMS UID', {
-                phone: receiverId.replace(/\d{4}$/, '****'),
+                phone: phoneCandidate.replace(/\d{4}$/, '****'),
                 resolvedUid: resolved.uid,
               });
             }
@@ -273,6 +337,13 @@ function initSocketIO(httpServer) {
 
         // Envoyer au destinataire via son UID OmniSMS résolu (room user:{uid})
         _io.to(`user:${effectiveReceiverId}`).emit('message:receive', msg);
+        logger.info('[NOTIFICATION] Socket.IO message:send → message:receive émis', {
+          event        : 'message:receive',
+          recipientUid : effectiveReceiverId,
+          room         : `user:${effectiveReceiverId}`,
+          socketsInRoom: countSocketsInUserRoom(effectiveReceiverId),
+          ...summarizeMessagePayload(msg),
+        });
 
         // Confirmer à l'expéditeur
         if (typeof ack === 'function') {
@@ -432,8 +503,24 @@ function getIO() {
  * Peut être appelé depuis n'importe quel service.
  */
 function emitToUser(uid, event, data) {
-  if (!_io) return;
+  if (!_io) {
+    if (NOTIFICATION_EVENTS.has(event)) {
+      logger.warn('[NOTIFICATION] Socket.IO non initialisé — événement non émis', { event, recipientUid: uid });
+    }
+    return;
+  }
   _io.to(`user:${uid}`).emit(event, data);
+  // SESSION 13 — trace de l'émission réelle : room ciblée + sockets connectés.
+  // socketsInRoom = 0 → le destinataire n'a aucune session Socket.IO ouverte.
+  if (NOTIFICATION_EVENTS.has(event)) {
+    logger.info(`[NOTIFICATION] Événement ${event} émis`, {
+      event,
+      recipientUid : uid,
+      room         : `user:${uid}`,
+      socketsInRoom: countSocketsInUserRoom(uid),
+      ...summarizeMessagePayload(data),
+    });
+  }
 }
 
 /**

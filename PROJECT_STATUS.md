@@ -790,3 +790,65 @@ SAASPAY_API_KEY    = pk_live_xxx
 | `session12-username-notif-payment-tests.js` | 80 | ✅ 80/80 |
 | Toutes suites précédentes | 332 | ✅ 332/332 |
 | **TOTAL** | **412** | **✅ 412/412** |
+
+---
+
+## § Session 13 (2026-09-24) — #username réel + Audio→SMS après transcription + notifications
+
+### 1. USERNAME — FIXED
+
+**Problème** : `#petit-test` → utilisateur non trouvé en production (le fix Session 12 ne couvrait pas le chemin `POST /api/messages/send` ni la casse/tirets Unicode/`@`/point des usernames).
+
+**Cause réelle** : aucune branche username dans `/send` (receiverId traité comme téléphone ou UID) + `parseHashPrefix` inbound trop restreint + `resolveUserByUsername` strictement lowercase. Champ Firestore : `users.username` (vérifié dans `routes/auth.js`, `routes/me.js`).
+
+**Correction** :
+- `services/userResolver.js` : `parseRecipientReference()` + `resolveRecipientUsername()` (parse → username → UID → téléphone du profil). Numéro toujours prioritaire. Tolerances : NFKC (＃/@), tirets Unicode, `@`, préfixe `#` accepté par le résolveur, fallback exact-casse.
+- `routes/messages.v2.js` : `/send` résout `#username` avant routage → `routeMessage({targetUid})` → online Socket.IO / offline SMS au **numéro réel du profil**. Inconnu → **404 `USER_NOT_FOUND`** (pas de message fantôme, pas de SMS).
+- `services/socketService.js` : `message:send` supporte `#username` (ack propre si inconnu).
+- `routes/sms.gateway.inbound.js` : `parseHashPrefix` étendu + fallback username numérique (seul si le numéro n'est aucun compte).
+
+**Preuve** : tests U1–U8 + I1–I6 (`test/session13-username-audio-notif-tests.js`).
+
+### 2. AUDIO → SMS — FIXED
+
+**Problème** : la transcription Groq réussissait mais le SMS n'était jamais envoyé (le routage SMS déclenché avant la transcription n'était jamais repris).
+
+**Correction** :
+- `services/messageRouter.js` : `continueAudioSmsAfterTranscription()` appelée par le worker **après** sauvegarde de la transcription → texte envoyé via la file SMS existante (`enqueueSmsJob` → INfiniReach/Infobip + retries). Jamais le fichier audio.
+- **Idempotence** : transaction Firestore `audioSmsStatus='queued'` + `jobId sms-{messageId}` + `externalId omnisms-{messageId}`. Retry du worker → 0 SMS supplémentaire.
+- Transcription vide → aucun SMS (`skipped_empty_transcription`). Échec → `transcription_failed` + message conservé. Log initial = « transcription en attente (asynchrone) » (plus d'« impossible » prématuré).
+- `services/queueService.js` : `addSmsJob` transmet `jobId` (était ignoré → pas de dédup BullMQ).
+- **ID canonique** : l'ID du document Firestore est désormais l'ID partout (payload Socket.IO, réponse API, historique) — corrige le dédoublonnage côté client.
+
+**Preuve** : tests A1–A8 (reprise réelle, provider capturé, idempotence, vide, échec).
+
+### 3. NOTIFICATIONS — FIXED (émission réelle prouvée + diagnostic)
+
+**Chemin réel testé** (serveur Express + client Socket.IO réels) :
+`POST /send` → Firestore `messages` → `emitToUser(uid, 'message:receive', msg)` → room `user:{uid}`.
+
+**Corrections** :
+1. ID de message canonique (cause du non-affichage/dédoublonnage) — voir §2.
+2. Logs `[NOTIFICATION]` à chaque émission : `event`, `recipientUid`, `room`, **`socketsInRoom`** (0 = aucune session du destinataire), résumé payload sans secret.
+3. Offline : comportement existant (Firestore + SMS) conservé — aucun nouveau service.
+
+**Payload (contrat inchangé)** : `{ id, senderId, receiverId, conversationId, content, type, channel, audioUrl, duration, status, reactions, createdAt, updatedAt }`. Pas de champ `isMe` (déduit côté client depuis `senderId`).
+
+**Preuve** : tests N1–N7 (présence, émission réelle reçue par un vrai client, bon UID, payload, offline, aucun mauvais UID, persistance).
+
+### 4. Tests Session 13
+
+| Suite | Tests | Résultat |
+|---|---|---|
+| `session13-username-audio-notif-tests.js` (nouveau) | 33 | ✅ 33/33 |
+| Toutes suites backend existantes | 385 (hors 32 échecs pré-existants liés aux fichiers Flutter absents de ce repo) | ✅ inchangé avant/après |
+
+### 5. État
+
+```text
+USERNAME       : FIXED
+AUDIO → SMS    : FIXED
+NOTIFICATIONS  : FIXED
+PAYMENT        : NON TOUCHÉ
+FRONTEND       : NON TOUCHÉ
+```

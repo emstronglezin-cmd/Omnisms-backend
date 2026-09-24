@@ -70,6 +70,15 @@ const router  = express.Router();
 const { logger }              = require('../middleware/logger');
 const { normalizePhone }      = require('../services/phoneNormalizer');
 const { resolveUserByPhone, resolveUserByUid, resolveUserByUsername, normalizeUsername } = require('../services/userResolver');
+// SESSION 13 — helpers #username partagés (mêmes règles que POST /api/messages/send).
+// Repli local si un module userResolver partiel est injecté (ex. mocks de tests).
+const _userResolverS13 = require('../services/userResolver');
+const cleanIdentifierInput = typeof _userResolverS13.cleanIdentifierInput === 'function'
+  ? _userResolverS13.cleanIdentifierInput
+  : (s) => (s === null || s === undefined ? '' : String(s).trim());
+const isPhoneLikeIdentifier = typeof _userResolverS13.isPhoneLikeIdentifier === 'function'
+  ? _userResolverS13.isPhoneLikeIdentifier
+  : (s) => /^\+?[\d\s\-().]{6,24}$/.test(String(s || '').trim()) && String(s || '').replace(/\D/g, '').length >= 6;
 const {
   findExternalConvByPhone,
   getOrCreateExternalConv,
@@ -167,7 +176,9 @@ async function isAlreadyProcessed(eventId) {
  */
 function parseHashPrefix(text) {
   if (!text || typeof text !== 'string') return null;
-  const trimmed = text.trim();
+  // SESSION 13 : normaliser UNIQUEMENT le premier mot (＃ → #, tirets Unicode des
+  // claviers mobiles → '-', caractères invisibles). Le corps du message est intact.
+  const trimmed = normalizeHashToken(text.trim());
 
   // ── Cas 1 : numéro de téléphone (#NUMERO message ou #+NUMERO message)
   const phoneMatch = trimmed.match(/^#?\s*(\+?[\d]{6,15})\s+([\s\S]+)$/);
@@ -176,7 +187,14 @@ function parseHashPrefix(text) {
     const cleanText = phoneMatch[2].trim();
     const e164      = normalizePhone(rawPhone);
     if (!e164 || !cleanText) return null;
-    return { targetPhone: e164, cleanText };
+    const parsed = { targetPhone: e164, cleanText };
+    // SESSION 13 (U7) : "#123456 msg" peut aussi désigner un username purement
+    // numérique. Le téléphone reste PRIORITAIRE : fallbackUsername n'est utilisé
+    // que si aucun compte OmniSMS ne correspond au numéro.
+    if (trimmed.startsWith('#') && /^\d+$/.test(rawPhone)) {
+      parsed.fallbackUsername = normalizeUsername(rawPhone);
+    }
+    return parsed;
   }
 
   // ── Cas 2 : username (#username message)
@@ -186,14 +204,39 @@ function parseHashPrefix(text) {
   if (usernameMatch) {
     const rawUsername = usernameMatch[1];
     const cleanText   = usernameMatch[2].trim();
-    // Exclure les chaînes purement numériques (déjà gérées par le cas 1 ou non pertinentes)
-    if (/^\d+$/.test(rawUsername)) return null;
+    // Chaînes purement numériques : ≥ 6 chiffres = numéro (cas 1) ; 2–5 chiffres
+    // → examinées par le cas 3 (username numérique court, jamais un numéro).
+    if (!/^\d+$/.test(rawUsername)) {
+      const normalized = normalizeUsername(rawUsername);
+      if (!normalized || !cleanText) return null;
+      return { targetUsername: normalized, cleanText };
+    }
+  }
+
+  // ── Cas 3 (SESSION 13) : username au charset complet de l'inscription
+  // (routes/auth.js : [a-zA-Z0-9_.-], 2–50) — ex : "#jean.dupont Salut",
+  // "#@petit-test Bonjour", "#_moi Coucou", "#12345 Salut".
+  const extendedMatch = trimmed.match(/^#\s*@?\s*([a-zA-Z0-9_.-]{2,50})\s+([\s\S]+)$/);
+  if (extendedMatch) {
+    const rawUsername = extendedMatch[1];
+    const cleanText   = extendedMatch[2].trim();
+    if (isPhoneLikeIdentifier(rawUsername)) return null; // un numéro n'est jamais un username
     const normalized = normalizeUsername(rawUsername);
     if (!normalized || !cleanText) return null;
     return { targetUsername: normalized, cleanText };
   }
 
   return null;
+}
+
+/**
+ * SESSION 13 — Normalise le premier mot d'un SMS (le préfixe #cible) sans
+ * toucher au reste du texte.
+ */
+function normalizeHashToken(text) {
+  const m = text.match(/^(\S+)([\s\S]*)$/);
+  if (!m) return text;
+  return cleanIdentifierInput(m[1]) + m[2];
 }
 
 /* ── Mise à jour statut livraison ───────────────────────────── */
@@ -386,9 +429,19 @@ async function processSmsReceived(webhookBody) {
   let convId    = null;
   let finalText = String(textRaw);
   let isNewConv = false;
+  let resolvedViaUsername = null; // SESSION 13 — username ayant servi à résoudre ownerUid (logs)
 
   // Cas A : Protocole #
   const hashParsed = parseHashPrefix(finalText);
+  if (/^\s*(#|＃)/.test(finalText)) {
+    // SESSION 13 — trace [USERNAME] : premier mot seulement (jamais le corps du SMS)
+    const firstToken = finalText.trim().split(/\s+/)[0] || '';
+    logger.info('[USERNAME] raw input received', {
+      source   : 'SMS entrant INfiniReach',
+      rawTarget: /\d{4}/.test(firstToken) ? firstToken.replace(/\d{4}$/, '****') : firstToken.slice(0, 60),
+      parsed   : hashParsed ? (hashParsed.targetUsername ? 'username' : 'phone') : 'non reconnu',
+    });
+  }
   if (hashParsed) {
     if (hashParsed.targetPhone) {
       // ── Protocole #NUMERO ────────────────────────────────────
@@ -408,6 +461,20 @@ async function processSmsReceived(webhookBody) {
         logger.warn('[INfiniReach] webhook:inbound # protocol (phone) : numéro cible non OmniSMS', {
           targetPhone: hashParsed.targetPhone.replace(/\d{4}$/, '****'),
         });
+        // SESSION 13 (U7) : "#123456 msg" — username purement numérique, tenté
+        // UNIQUEMENT parce qu'aucun compte OmniSMS ne possède ce numéro.
+        if (hashParsed.fallbackUsername) {
+          const byUsername = await resolveUserByUsername(hashParsed.fallbackUsername);
+          if (byUsername.found) {
+            ownerUid       = byUsername.uid;
+            finalText      = hashParsed.cleanText;
+            isNewConv      = true;
+            resolvedViaUsername = hashParsed.fallbackUsername;
+            logger.info(`[USERNAME] resolved uid=${ownerUid} (username numérique, numéro non OmniSMS)`, {
+              source: 'SMS entrant INfiniReach', username: hashParsed.fallbackUsername,
+            });
+          }
+        }
       }
 
     } else if (hashParsed.targetUsername) {
@@ -415,19 +482,31 @@ async function processSmsReceived(webhookBody) {
       logger.info('[INfiniReach] webhook:inbound Protocole #username détecté', {
         targetUsername: hashParsed.targetUsername,
       });
+      logger.info(`[USERNAME] parsed username=${hashParsed.targetUsername}`, {
+        source: 'SMS entrant INfiniReach', from: fromE164.replace(/\d{4}$/, '****'),
+      });
+      logger.info(`[USERNAME] resolving username=${hashParsed.targetUsername}`, { source: 'SMS entrant INfiniReach' });
 
       const targetUser = await resolveUserByUsername(hashParsed.targetUsername);
       if (targetUser.found) {
         ownerUid  = targetUser.uid;
         finalText = hashParsed.cleanText;
         isNewConv = true;
+        resolvedViaUsername = hashParsed.targetUsername;
         logger.info('[INfiniReach] webhook:inbound # protocol (username) → OmniSMS user trouvé', {
           targetUsername: hashParsed.targetUsername,
           targetUid     : ownerUid,
         });
+        logger.info(`[USERNAME] resolved uid=${ownerUid}`, {
+          source: 'SMS entrant INfiniReach', username: hashParsed.targetUsername,
+        });
       } else {
         logger.warn('[INfiniReach] webhook:inbound # protocol (username) : username non trouvé', {
           targetUsername: hashParsed.targetUsername,
+        });
+        logger.warn(`[USERNAME] username not found=${hashParsed.targetUsername}`, {
+          source: 'SMS entrant INfiniReach',
+          hint  : 'Aucun compte users.username correspondant — routage via conversation existante / SIM (inchangé)',
         });
       }
     }
@@ -494,6 +573,11 @@ async function processSmsReceived(webhookBody) {
           gatewayNumberMasked  : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
           phoneDistinct        : recipientPhone !== (normalizePhone(recipientE164) || recipientE164),
         });
+        if (resolvedViaUsername) {
+          logger.info(`[USERNAME] resolved phone=${recipientPhone.replace(/\d{4}$/, '****')}`, {
+            source: 'SMS entrant INfiniReach', username: resolvedViaUsername, resolvedUid: ownerUid,
+          });
+        }
       } else {
         logger.warn('[INfiniReach] webhook:inbound Profil propriétaire sans numéro valide', {
           ownerUid,
@@ -664,8 +748,24 @@ async function processSmsReceived(webhookBody) {
       ownerIsOnline = false;
     }
 
+    if (resolvedViaUsername) {
+      logger.info(`[USERNAME] online/offline routing=${ownerIsOnline ? 'ONLINE → OmniSMS (Socket.IO)' : 'OFFLINE → SMS vers le numéro réel du profil'}`, {
+        source        : 'SMS entrant INfiniReach',
+        username      : resolvedViaUsername,
+        resolvedUid   : ownerUid,
+        fallbackTo    : ownerIsOnline ? null : (recipientPhone ? recipientPhone.replace(/\d{4}$/, '****') : '(non résolu)'),
+      });
+    }
+
     if (ownerIsOnline) {
       // ── ONLINE → livraison OmniSMS temps réel ──────────────────
+      logger.info('[NOTIFICATION] SMS entrant → destinataire en ligne → émission Socket.IO', {
+        recipientUid  : ownerUid,
+        events        : ['message:receive', 'new_message'],
+        messageId     : socketPayload.id,
+        conversationId: convId,
+        persisted     : !!savedMsgId,
+      });
       emitFn(ownerUid, 'message:receive', socketPayload);
       emitFn(ownerUid, 'new_message',     socketPayload); // rétrocompat
 
@@ -910,3 +1010,7 @@ router.get('/sms-gateway/status', (_req, res) => {
 });
 
 module.exports = router;
+// SESSION 13 — exports additionnels (tests réels du parseur #username et du
+// traitement entrant). N'altère pas le router Express monté par server.js.
+module.exports.parseHashPrefix    = parseHashPrefix;
+module.exports.processSmsReceived = processSmsReceived;

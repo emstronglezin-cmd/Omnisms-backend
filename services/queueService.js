@@ -265,11 +265,17 @@ async function addTranscriptionJob(data) {
 
 /**
  * Ajouter un job SMS async.
+ *
+ * SESSION 13 : les options passées par l'appelant sont désormais transmises.
+ * enqueueSmsJob() fournit `jobId: sms-{messageId}` (déduplication BullMQ :
+ * un même message ne crée qu'un seul job) — cette option était ignorée.
+ * Valeurs par défaut inchangées (attempts 3, backoff exponentiel 3 s).
  */
-async function addSmsJob(data) {
+async function addSmsJob(data, opts = {}) {
   return addJob('sms', data, {
     attempts: 3,
     backoff : { type: 'exponential', delay: 3000 },
+    ...(opts || {}),
   });
 }
 

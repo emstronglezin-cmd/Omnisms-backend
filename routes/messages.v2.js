@@ -27,6 +27,10 @@ try { ({ routeMessage } = require('../services/messageRouter')); } catch (_) {}
 let addTranscriptionJob = null;
 try { ({ addTranscriptionJob } = require('../services/queueService')); } catch (_) {}
 
+// SESSION 13 — résolution #username (même service que le reste du backend)
+let resolveRecipientUsername = null;
+try { ({ resolveRecipientUsername } = require('../services/userResolver')); } catch (_) {}
+
 const auth = firebaseAuth;
 
 function validate(req, res) {
@@ -422,14 +426,51 @@ router.post(
       // existant pour les types non-texte.
       // ---------------------------------------------------------------
 
+      // ── SESSION 13 — Destinataire #username / @username ───────────────
+      // Chaîne : saisie brute → parseRecipientReference() → resolveUserByUsername()
+      //          → UID → routeMessage() (profil → téléphone réel → présence →
+      //          ONLINE Socket.IO / OFFLINE SMS vers le numéro RÉEL du profil).
+      // Username inconnu → 404 USER_NOT_FOUND : aucun message fantôme, aucun SMS.
+      // Les numéros (+226…, 226…) ne sont jamais pris pour des usernames : la
+      // logique téléphone existante ci-dessous reste inchangée.
+      let usernameLookup = { status: 'not_username' };
+      if (resolveRecipientUsername) {
+        try {
+          usernameLookup = await resolveRecipientUsername(receiverId, {
+            phone, source: 'POST /api/messages/send', senderUid: uid,
+          });
+        } catch (unameErr) {
+          logger.warn('[USERNAME] résolution impossible — logique existante conservée', { error: unameErr.message });
+          usernameLookup = { status: 'not_username' };
+        }
+      }
+
+      if (usernameLookup.status === 'not_found') {
+        return res.status(404).json({
+          error   : `Utilisateur introuvable : aucun compte OmniSMS pour « #${usernameLookup.username || ''} ».`,
+          code    : 'USER_NOT_FOUND',
+          username: usernameLookup.username || null,
+        });
+      }
+
+      const usernameTarget  = usernameLookup.status === 'resolved' ? usernameLookup : null;
+      // "#+22670123456" → numéro explicite (préfixe retiré), routé comme un numéro.
+      const explicitPhone   = usernameLookup.status === 'phone' ? usernameLookup.phoneValue : null;
+      const routingReceiver = explicitPhone || receiverId;
+      // Un champ `phone` contenant des lettres / # / @ n'est pas un numéro :
+      // ne jamais envoyer de SMS vers un username brut.
+      const safePhone       = phone && !/[a-zA-Z#@]/.test(String(phone)) ? phone : null;
+
       // Déterminer si le receiverId est un téléphone ou un UID Firestore
       // UID Firestore : chaîne alphanumérique sans '+' ni espaces, peut contenir des '-'
       // Téléphone     : que des chiffres, +, espaces, tirets, parenthèses — sans '-' à l'intérieur d'un UID
-      const looksLikePhone = /^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-');
+      const looksLikePhone = !usernameTarget && (
+        !!explicitPhone || (/^\+?[0-9\s\-()+]{7,20}$/.test(receiverId) && !receiverId.includes('-'))
+      );
 
       let routeResult = null;
-      let effectiveReceiverId = receiverId;
-      let cId = convId(uid, receiverId);
+      let effectiveReceiverId = usernameTarget ? usernameTarget.uid : routingReceiver;
+      let cId = convId(uid, effectiveReceiverId);
 
       if (routeMessage && db) {
         try {
@@ -451,8 +492,10 @@ router.post(
             senderUid  : uid,
             // Si receiverId est un UID (pas un téléphone) : passer comme targetUid
             // Si receiverId est un téléphone : passer comme targetPhone
-            targetPhone: looksLikePhone ? (phone || receiverId) : (phone || null),
-            targetUid  : looksLikePhone ? null : receiverId,
+            // SESSION 13 : username résolu → targetUid = UID réel ; le téléphone
+            // est relu depuis le profil par routeMessage (jamais le username brut).
+            targetPhone: usernameTarget ? null : (looksLikePhone ? (safePhone || routingReceiver) : (safePhone || null)),
+            targetUid  : usernameTarget ? usernameTarget.uid : (looksLikePhone ? null : receiverId),
             content    : content || (type === 'audio' ? '🎤 Message vocal' : type === 'image' ? '📷 Image' : ''),
             type,
             audioUrl   : audioUrl || null,
@@ -462,9 +505,25 @@ router.post(
             db,
           });
 
+          if (usernameTarget && routeResult) {
+            const externalPhone = routeResult.externalPhone || null;
+            logger.info(`[USERNAME] online/offline routing=${routeResult.route === 'OMNISMS' ? 'ONLINE → OmniSMS (Socket.IO)' : routeResult.route === 'SMS_EXTERNE' ? 'OFFLINE → SMS' : routeResult.route}`, {
+              username        : usernameTarget.username,
+              resolvedUid     : usernameTarget.uid,
+              route           : routeResult.route,
+              smsTarget       : externalPhone ? externalPhone.replace(/\d{4}$/, '****') : null,
+              // Preuve : le SMS part vers le numéro du profil résolu (jamais gateway / username brut)
+              smsTargetIsProfilePhone: externalPhone
+                ? (normalizePhone(externalPhone) || externalPhone) === (normalizePhone(usernameTarget.phone) || usernameTarget.phone)
+                : null,
+              conversationId  : routeResult.conversationId,
+              messageId       : routeResult.messageId,
+            });
+          }
+
           if (routeResult && routeResult.route !== 'ERROR') {
             cId                 = routeResult.conversationId;
-            effectiveReceiverId = routeResult.resolvedUid || receiverId;
+            effectiveReceiverId = routeResult.resolvedUid || (usernameTarget ? usernameTarget.uid : routingReceiver);
           } else if (routeResult && routeResult.route === 'ERROR') {
             logger.warn('[Messages] routeMessage returned ERROR, falling back to direct save', {
               error: routeResult.message, receiverId,

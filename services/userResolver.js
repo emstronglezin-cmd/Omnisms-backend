@@ -50,6 +50,107 @@ function normalizeUsername(username) {
   return username.toLowerCase().trim();
 }
 
+/* ── SESSION 13 — Détection des références #username / @username ──────────
+ *
+ * Règles (identiques à l'inscription routes/auth.js et PUT /me/profile) :
+ *   - username : [a-zA-Z0-9_.-], 2 à 50 caractères, stocké en minuscules
+ *     dans le champ Firestore `users.username`.
+ *   - Un numéro de téléphone (+226…, 226…, 70…) n'est JAMAIS un username :
+ *     la résolution téléphone reste prioritaire et inchangée.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+// Tirets Unicode (‐ ‑ ‒ – — ― − ﹘ ﹣ －) insérés par certains claviers mobiles.
+const UNICODE_DASHES_RE = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g;
+// Caractères invisibles (zero-width space/joiner, BOM) parfois collés au texte.
+const ZERO_WIDTH_RE     = /[\u200B-\u200D\u2060\uFEFF]/g;
+// Charset username officiel (auth.js : /^[a-zA-Z0-9_.-]+$/, longueur 2–50).
+const USERNAME_REF_RE   = /^[a-zA-Z0-9_.-]{2,50}$/;
+// Forme "numéro de téléphone" : chiffres + séparateurs usuels, sans lettre.
+const PHONE_LIKE_RE     = /^\+?[\d\s\-().]{6,24}$/;
+
+/**
+ * Nettoie une saisie d'identifiant (sans modifier sa casse) :
+ * normalisation NFKC (＃ → #, ＠ → @), tirets Unicode → '-', suppression des
+ * caractères invisibles, trim.
+ */
+function cleanIdentifierInput(raw) {
+  if (raw === null || raw === undefined) return '';
+  let s = String(raw);
+  try { s = s.normalize('NFKC'); } catch (_) { /* environnement sans ICU */ }
+  return s.replace(ZERO_WIDTH_RE, '').replace(UNICODE_DASHES_RE, '-').trim();
+}
+
+/**
+ * true si la valeur a la forme d'un numéro de téléphone
+ * (au moins 6 chiffres, aucune lettre). Ex : +22670123456, 22670123456, 70 12 34 56.
+ */
+function isPhoneLikeIdentifier(value) {
+  if (value === null || value === undefined) return false;
+  const s = String(value).trim();
+  return PHONE_LIKE_RE.test(s) && s.replace(/\D/g, '').length >= 6;
+}
+
+/**
+ * Analyse un identifiant destinataire portant un préfixe explicite # ou @.
+ *
+ *   '#petit-test' | '@petit-test' | '#@petit-test'
+ *       → { kind: 'username', prefix, username: 'petit-test' }
+ *   '#+22670123456' | '#22670123456'
+ *       → { kind: 'phone', prefix, value: '+22670123456' | '22670123456',
+ *           numericUsername: null | '22670123456' }   (chiffres purs uniquement)
+ *   '#' | '#a' | '#hello world'
+ *       → { kind: 'invalid', prefix, value }
+ *   sans préfixe (#/@) ou vide → null (la logique existante s'applique)
+ *
+ * @param {string} raw
+ * @returns {null|{kind: 'username'|'phone'|'invalid', prefix: string, username?: string, value?: string, numericUsername?: string|null}}
+ */
+function parseRecipientReference(raw) {
+  let s = cleanIdentifierInput(raw);
+  if (!s) return null;
+
+  let prefix = null;
+  if (s[0] === '#') {
+    prefix = '#';
+    s = s.slice(1).trim();
+    if (s[0] === '@') s = s.slice(1).trim(); // "#@petit-test"
+  } else if (s[0] === '@') {
+    prefix = '@';
+    s = s.slice(1).trim();
+  }
+
+  if (!prefix) return null;
+  if (!s) return { kind: 'invalid', prefix, value: '' };
+
+  // Un numéro reste un numéro (priorité téléphone, U5).
+  if (isPhoneLikeIdentifier(s)) {
+    const digitsOnly = /^\d+$/.test(s);
+    return {
+      kind           : 'phone',
+      prefix,
+      value          : s,
+      // Username purement numérique possible (U7) — utilisé UNIQUEMENT si le
+      // numéro ne correspond à aucun compte OmniSMS.
+      numericUsername: digitsOnly && USERNAME_REF_RE.test(s) ? s : null,
+    };
+  }
+
+  if (USERNAME_REF_RE.test(s)) {
+    return { kind: 'username', prefix, username: normalizeUsername(s) };
+  }
+
+  return { kind: 'invalid', prefix, value: s };
+}
+
+/**
+ * Raccourci : retourne le username normalisé d'une référence #username /
+ * @username, ou null (numéro, saisie invalide ou sans préfixe).
+ */
+function parseUsernameReference(raw) {
+  const ref = parseRecipientReference(raw);
+  return ref && ref.kind === 'username' ? ref.username : null;
+}
+
 /**
  * Retourne toutes les variantes d'un numéro à tester dans Firestore.
  * Ex: "+22670000000" → ["+22670000000", "0022670000000", "70000000"] 
@@ -201,20 +302,34 @@ async function resolveUserByEmail(email, opts = {}) {
  * Résout un utilisateur OmniSMS à partir d'un username.
  */
 async function resolveUserByUsername(username, opts = {}) {
-  if (!username) return { found: false };
+  if (!username || typeof username !== 'string') return { found: false };
 
   const { includeDeleted = false } = opts;
   const db = getDb();
   if (!db) return { found: false };
 
-  const normalized = normalizeUsername(username);
+  // SESSION 13 : accepter "#petit-test" / "@petit-test" et les tirets Unicode
+  // des claviers mobiles. Un username stocké ne peut jamais commencer par # ou @
+  // (charset de l'inscription), ce nettoyage ne peut donc pas créer d'ambiguïté.
+  const cleaned    = cleanIdentifierInput(username).replace(/^#\s*/, '').replace(/^@\s*/, '');
+  const normalized = normalizeUsername(cleaned);
   if (!normalized) return { found: false };
 
   try {
-    const snap = await db.collection('users')
+    let snap = await db.collection('users')
       .where('username', '==', normalized)
       .limit(1)
       .get();
+
+    // SESSION 13 : compatibilité comptes anciens dont le username aurait été
+    // enregistré avec sa casse d'origine (avant la normalisation lowercase).
+    // Correspondance EXACTE sur la saisie de l'utilisateur uniquement.
+    if (snap.empty && cleaned && cleaned !== normalized) {
+      snap = await db.collection('users')
+        .where('username', '==', cleaned)
+        .limit(1)
+        .get();
+    }
 
     if (snap.empty) return { found: false };
 
@@ -274,6 +389,124 @@ async function resolveUserByUid(uid, opts = {}) {
     logger.warn('[UserResolver] resolveUserByUid error', { error: err.message });
     return { found: false };
   }
+}
+
+/* ── SESSION 13 — Destinataire saisi par username (#username) ─────────────── */
+
+// UID Firestore auto-généré (users.add() → 20 caractères) ou UID Firebase Auth (28).
+const GENERATED_UID_RE = /^[A-Za-z0-9]{20}$|^[A-Za-z0-9]{28}$/;
+
+function maskPhoneForLog(phone) {
+  return phone ? String(phone).replace(/\d{4}$/, '****') : null;
+}
+
+/**
+ * Résout un destinataire saisi dans l'application lorsqu'il désigne un username.
+ * Utilisé par POST /api/messages/send et Socket.IO `message:send` AVANT le
+ * routage (messageRouter), afin que la chaîne soit :
+ *   saisie brute → parse → username → UID → (routeMessage : profil → téléphone
+ *   réel → présence → ONLINE Socket.IO / OFFLINE SMS).
+ *
+ * Statuts retournés :
+ *   'resolved'     → { uid, username, phone, user }        username trouvé
+ *   'not_found'    → { username }                          #username inconnu ou invalide
+ *   'phone'        → { phoneValue }                        "#+226…" : numéro explicite
+ *   'not_username' → logique existante inchangée (numéro, UID, saisie inconnue sans préfixe)
+ *
+ * @param {string} receiverId
+ * @param {object} [opts]
+ * @param {string}  [opts.phone]            champ `phone` éventuellement fourni par le client
+ * @param {boolean} [opts.allowBare=true]   tenter un username SANS préfixe (jamais pour un
+ *                                          numéro, un UID généré ou un UID existant)
+ * @param {string}  [opts.source]           libellé pour les logs
+ * @param {string}  [opts.senderUid]
+ */
+async function resolveRecipientUsername(receiverId, opts = {}) {
+  const { phone = null, allowBare = true, source = 'app', senderUid = null } = opts;
+  const ref = parseRecipientReference(receiverId);
+
+  /* ── 1. Préfixe explicite # / @ ──────────────────────────────── */
+  if (ref) {
+    logger.info('[USERNAME] raw input received', {
+      source,
+      senderUid,
+      rawInput: ref.kind === 'phone' ? maskPhoneForLog(cleanIdentifierInput(receiverId)) : cleanIdentifierInput(receiverId),
+      kind    : ref.kind,
+    });
+
+    if (ref.kind === 'phone') {
+      // "#+22670123456" → numéro explicite : la résolution téléphone existante
+      // s'applique (priorité absolue au téléphone).
+      if (ref.numericUsername) {
+        const byPhone = await resolveUserByPhone(ref.value);
+        if (!byPhone.found) {
+          // U7 : username purement numérique, uniquement si le numéro n'est pas OmniSMS.
+          const byUsername = await resolveUserByUsername(ref.numericUsername);
+          if (byUsername.found) {
+            logger.info('[USERNAME] resolved uid (username numérique, aucun compte avec ce numéro)', {
+              source, username: ref.numericUsername, resolvedUid: byUsername.uid,
+              resolvedPhone: maskPhoneForLog(byUsername.phone),
+            });
+            return {
+              status  : 'resolved',
+              username: ref.numericUsername,
+              uid     : byUsername.uid,
+              phone   : byUsername.phone || null,
+              user    : byUsername,
+              prefix  : ref.prefix,
+            };
+          }
+        }
+      }
+      logger.info('[USERNAME] input is a phone number → résolution téléphone existante', {
+        source, phone: maskPhoneForLog(ref.value),
+      });
+      return { status: 'phone', phoneValue: ref.value, prefix: ref.prefix };
+    }
+
+    if (ref.kind === 'invalid') {
+      logger.warn('[USERNAME] username invalide → aucun envoi', {
+        source, senderUid, rawInput: cleanIdentifierInput(receiverId).slice(0, 60),
+      });
+      return { status: 'not_found', username: ref.value || '', invalid: true, prefix: ref.prefix };
+    }
+
+    logger.info(`[USERNAME] parsed username=${ref.username}`, { source, senderUid });
+    logger.info(`[USERNAME] resolving username=${ref.username}`, { source });
+    const r = await resolveUserByUsername(ref.username);
+    if (!r.found) {
+      logger.warn(`[USERNAME] username not found=${ref.username} → aucun message, aucun SMS`, { source, senderUid });
+      return { status: 'not_found', username: ref.username, prefix: ref.prefix };
+    }
+    logger.info(`[USERNAME] resolved uid=${r.uid}`, { source, username: ref.username });
+    logger.info(`[USERNAME] resolved phone=${maskPhoneForLog(r.phone) || '(aucun numéro dans le profil)'}`, {
+      source, username: ref.username, resolvedUid: r.uid,
+    });
+    return { status: 'resolved', username: ref.username, uid: r.uid, phone: r.phone || null, user: r, prefix: ref.prefix };
+  }
+
+  /* ── 2. Sans préfixe : username « nu » (ex. le client a retiré le #) ── */
+  if (!allowBare || receiverId === null || receiverId === undefined) return { status: 'not_username' };
+  const bare = cleanIdentifierInput(receiverId);
+  if (!bare || !USERNAME_REF_RE.test(bare))  return { status: 'not_username' };
+  if (isPhoneLikeIdentifier(bare))            return { status: 'not_username' }; // numéro → inchangé
+  if (GENERATED_UID_RE.test(bare))            return { status: 'not_username' }; // UID → inchangé (0 lecture)
+  if (phone && isPhoneLikeIdentifier(cleanIdentifierInput(phone))) {
+    return { status: 'not_username' };  // compat : numéro fourni explicitement par le client
+  }
+
+  const byUid = await resolveUserByUid(bare);
+  if (byUid.found) return { status: 'not_username' };                         // UID existant → inchangé
+
+  const r = await resolveUserByUsername(bare);
+  if (!r.found) return { status: 'not_username' };                            // comportement existant conservé
+
+  logger.info(`[USERNAME] raw input received (sans préfixe) → parsed username=${normalizeUsername(bare)}`, { source, senderUid });
+  logger.info(`[USERNAME] resolved uid=${r.uid}`, { source, username: normalizeUsername(bare) });
+  logger.info(`[USERNAME] resolved phone=${maskPhoneForLog(r.phone) || '(aucun numéro dans le profil)'}`, {
+    source, resolvedUid: r.uid,
+  });
+  return { status: 'resolved', username: normalizeUsername(bare), uid: r.uid, phone: r.phone || null, user: r, prefix: null };
 }
 
 /* ── Vérifications unicité (pour inscription/mise à jour) ────── */
@@ -365,6 +598,12 @@ module.exports = {
   normalizeEmail,
   normalizeUsername,
   phoneVariants,
+  // Session 13 — références #username / @username
+  cleanIdentifierInput,
+  isPhoneLikeIdentifier,
+  parseRecipientReference,
+  parseUsernameReference,
+  resolveRecipientUsername,
   // Vérifications unicité
   checkPhoneExists,
   checkEmailExists,
