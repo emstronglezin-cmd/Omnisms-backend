@@ -31,6 +31,15 @@
 const axios  = require('axios');
 const crypto = require('crypto');
 const { logger } = require('../middleware/logger');
+const { normalizePaymentEnv, getPaymentEnvStatus, maskSecret } = require('../config/paymentEnv');
+
+/* ── Configuration ───────────────────────────────────────────────
+   Les anciennes variables (legacy) éventuellement encore présentes
+   dans l'environnement Render sont recopiées vers les variables
+   SAASPAY_* lues ci-dessous (voir config/paymentEnv.js).
+   Aucune valeur secrète n'est journalisée.
+──────────────────────────────────────────────────────────────── */
+normalizePaymentEnv({ logger });
 
 /* ── Constantes ──────────────────────────────────────────────── */
 const SAASPAY_BASE_URL  = (process.env.SAASPAY_BASE_URL || 'https://saaspay.me').replace(/\/$/, '');
@@ -73,6 +82,51 @@ function buildHeaders() {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Masque toute valeur sensible dans un objet destiné aux logs
+ * (clé, secret, token, signature, authorization…).
+ * Utilisé pour ne JAMAIS écrire une clé API complète dans les logs.
+ */
+function maskSensitiveFields(input, depth = 0) {
+  if (depth > 4 || input === null || input === undefined) return input;
+  if (Array.isArray(input)) return input.map(v => maskSensitiveFields(v, depth + 1));
+  if (typeof input !== 'object') return input;
+
+  const out = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (/key|secret|token|signature|authorization|password/i.test(key)) {
+      out[key] = typeof value === 'string' ? maskSecret(value) : '[REDACTED]';
+    } else {
+      out[key] = maskSensitiveFields(value, depth + 1);
+    }
+  }
+  return out;
+}
+
+/**
+ * Résumé de configuration sûr (aucun secret) pour les diagnostics.
+ * @returns {object}
+ */
+function getConfigStatus() {
+  const status = getPaymentEnvStatus();
+  return {
+    provider      : status.provider,
+    configured    : status.configured,
+    baseUrl       : status.baseUrl,
+    secretKey     : status.required.SAASPAY_SECRET_KEY,
+    apiKey        : status.required.SAASPAY_API_KEY,
+    webhookSecret : status.optional.SAASPAY_WEBHOOK_SECRET,
+    backendUrl    : status.optional.BACKEND_URL,
+    frontendUrl   : status.optional.FRONTEND_URL,
+    missingRequired: status.missingRequired,
+    legacyPresent : status.legacyPresent,
+    legacyApplied : status.legacyApplied,
+    premiumAmount : PREMIUM_AMOUNT,
+    premiumCurrency: PREMIUM_CURRENCY,
+    webhookUrl    : `${(process.env.BACKEND_URL || 'https://omnisms-backend.onrender.com').replace(/\/$/, '')}${status.webhookPath}`,
+  };
 }
 
 async function withRetry(fn, retries = MAX_RETRIES) {
@@ -182,9 +236,9 @@ async function createCheckout({
   } catch (err) {
     const status  = err.response?.status;
     const detail  = err.response?.data;
-    logger.error('[SaaSPay] Erreur POST /api/v1/checkout', {
+    logger.error('[PAYMENT_ERROR] SaaSPay — échec POST /api/v1/checkout', {
       status,
-      detail : JSON.stringify(detail).substring(0, 500),
+      detail : JSON.stringify(maskSensitiveFields(detail)).substring(0, 500),
       message: err.message,
     });
     throw new Error(
@@ -196,8 +250,12 @@ async function createCheckout({
   // Extraire les données — format officiel : { data: { id, payment_url, ... } }
   const data = extractData(response.data);
 
-  logger.info('[SaaSPay] Réponse POST /api/v1/checkout', {
-    raw: JSON.stringify(response.data).substring(0, 500),
+  logger.info('[PAYMENT] SaaSPay — réponse création checkout', {
+    checkoutId : data?.id || data?.checkout_id || null,
+    status     : data?.status || null,
+    amount     : data?.amount || null,
+    currency   : data?.currency || null,
+    hasPaymentUrl: !!(data?.payment_url || data?.url || data?.checkout_url),
   });
 
   // Vérifier les champs obligatoires
@@ -285,13 +343,20 @@ async function getCheckoutStatus(checkoutId) {
 
 /* ═══════════════════════════════════════════════════════════════
    Webhook — Vérification signature HMAC
-   Header : X-SaaSPay-Signature
-   Calcul  : HMAC-SHA256(rawBody, pk_live_xxx) en hex
+   Header : X-SaaSPay-Signature (ou X-LeekPay-Signature — legacy)
+   Calcul  : HMAC-SHA256(rawBody, secret) en hex
+
+   ⚠️ SÉCURITÉ : la vérification est FAIL-CLOSED.
+   En l'absence de clé de signature ou d'en-tête de signature, la
+   fonction retourne false. Le controller compense en exigeant alors
+   une confirmation du statut auprès de l'API SaaSPay (server-side)
+   avant toute activation Premium : aucun webhook ne peut donc être
+   falsifié pour activer Premium sans confirmation du fournisseur.
 ══════════════════════════════════════════════════════════════════ */
 /**
  * @param {string} rawBody   - Corps brut UTF-8
  * @param {string} signature - Valeur header X-SaaSPay-Signature
- * @returns {boolean}
+ * @returns {boolean} true uniquement si la signature est présente ET valide
  */
 function verifyWebhookSignature(rawBody, signature) {
   const signingKey = (
@@ -301,13 +366,17 @@ function verifyWebhookSignature(rawBody, signature) {
   ).trim();
 
   if (!signingKey) {
-    logger.warn('[SaaSPay] Clé signature webhook absente — mode dégradé (accepté sans vérification).');
-    return true;
+    logger.warn('[PAYMENT_VERIFY] Clé de signature webhook absente (SAASPAY_WEBHOOK_SECRET / SAASPAY_API_KEY) ' +
+      '— signature non vérifiable : confirmation du statut auprès du fournisseur obligatoire.', {
+      signaturePresent: !!signature,
+    });
+    return false;
   }
 
   if (!signature) {
-    logger.warn('[SaaSPay] Header X-SaaSPay-Signature absent — webhook accepté en mode dégradé.');
-    return true;  // Accepter si aucune signature (pas encore configurée côté LeekPay)
+    logger.warn('[PAYMENT_VERIFY] Header de signature absent — signature non vérifiable : ' +
+      'confirmation du statut auprès du fournisseur obligatoire.');
+    return false;
   }
 
   try {
@@ -320,26 +389,24 @@ function verifyWebhookSignature(rawBody, signature) {
     const sigBuf = Buffer.from(signature,  'hex');
     const expBuf = Buffer.from(expected,   'hex');
 
-    if (sigBuf.length !== expBuf.length) {
-      logger.error('[SaaSPay] Signature longueur invalide', {
-        received: signature.substring(0, 16) + '…',
-        expected: expected.substring(0, 16) + '…',
+    if (sigBuf.length !== expBuf.length || sigBuf.length === 0) {
+      logger.error('[PAYMENT_VERIFY] Signature webhook invalide (longueur)', {
+        receivedLength: signature.length,
       });
       return false;
     }
 
     const isValid = crypto.timingSafeEqual(sigBuf, expBuf);
     if (!isValid) {
-      logger.error('[SaaSPay] Signature webhook invalide', {
-        received: signature.substring(0, 16) + '…',
-        expected: expected.substring(0, 16) + '…',
+      logger.error('[PAYMENT_VERIFY] Signature webhook invalide', {
+        receivedLength: signature.length,
       });
     }
     return isValid;
 
   } catch (err) {
-    logger.error('[SaaSPay] Erreur vérification signature', { error: err.message });
-    return true;  // mode dégradé — accepter plutôt que bloquer
+    logger.error('[PAYMENT_VERIFY] Erreur vérification signature', { error: err.message });
+    return false;
   }
 }
 
@@ -350,6 +417,8 @@ module.exports = {
   verifyWebhookSignature,
   isConfigured,
   validateAmount,
+  getConfigStatus,
+  maskSensitiveFields,
   PREMIUM_AMOUNT,
   PREMIUM_CURRENCY,
   ALLOWED_CURRENCIES,

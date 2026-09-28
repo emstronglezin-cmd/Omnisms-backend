@@ -11,7 +11,9 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "build": "echo 'No build step required'",
-    "audit:check": "npm audit --audit-level=high --omit=dev"
+    "audit:check": "npm audit --audit-level=high --omit=dev",
+    "test": "node test/admin-payment-tests.js",
+    "test:admin-payment": "node test/admin-payment-tests.js"
   },
   "overrides": {
     "whatwg-url": "11.0.0"

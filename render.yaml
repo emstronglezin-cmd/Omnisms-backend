@@ -74,28 +74,30 @@ services:
       # Créez votre compte : https://www.leekpay.me/register
       # Dashboard → Clés API → Nouvelle clé API
 
-      # Clé publique (pk_live_xxx) — aussi utilisée pour signature webhook
-      - key: LEEKPAY_API_KEY
+      # ⚠️ NOMS EXACTS attendus par le code (services/saaspay.js)
+
+      # Clé secrète (sk_live_xxx) — Bearer token API (jamais exposée côté client)
+      - key: SAASPAY_SECRET_KEY
         sync: false
 
-      # Clé secrète (sk_live_xxx) — JAMAIS exposée côté client
-      - key: LEEKPAY_SECRET_KEY
+      # Clé publique (pk_live_xxx) — signature des webhooks
+      - key: SAASPAY_API_KEY
         sync: false
 
-      # URL base API LeekPay (ne pas modifier sauf sandbox)
-      - key: LEEKPAY_BASE_URL
-        value: https://leekpay.fr
+      # URL base API SaaSPay (défaut https://saaspay.me)
+      - key: SAASPAY_BASE_URL
+        value: https://saaspay.me
 
-      # Secret webhook optionnel (si vide, LEEKPAY_API_KEY est utilisée)
-      - key: LEEKPAY_WEBHOOK_SECRET
+      # Secret webhook optionnel (si vide, SAASPAY_API_KEY est utilisée pour la signature)
+      - key: SAASPAY_WEBHOOK_SECRET
         sync: false
 
       # Montant abonnement Premium (défaut 2000)
-      - key: LEEKPAY_PREMIUM_AMOUNT
+      - key: SAASPAY_PREMIUM_AMOUNT
         value: "2000"
 
       # Devise (XOF | EUR | USD)
-      - key: LEEKPAY_PREMIUM_CURRENCY
+      - key: SAASPAY_PREMIUM_CURRENCY
         value: XOF
 
       # ── Redis (BullMQ + Async Jobs) ──────────────────────────

@@ -40,6 +40,15 @@ const app    = express();
 const server = http.createServer(app);
 const PORT   = parseInt(process.env.PORT, 10) || 5000;
 
+/* ── Configuration paiement ──────────────────────────────────
+   Le code de paiement lit EXCLUSIVEMENT les variables SAASPAY_*.
+   config/paymentEnv.js recopie les anciennes variables LEEKPAY_*
+   encore présentes dans l'environnement Render vers les variables
+   attendues (aucun secret n'est journalisé).
+──────────────────────────────────────────────────────────── */
+const paymentEnv = require('./config/paymentEnv');
+const paymentConfigLegacy = paymentEnv.normalizePaymentEnv({ logger: require('./middleware/logger').logger });
+
 app.set('trust proxy', 1);
 
 /* ── Middleware global ───────────────────────────────────── */
@@ -82,11 +91,23 @@ app.use(
 );
 
 /* ── Checks de configuration ─────────────────────────────── */
+/**
+ * Le service de paiement (services/saaspay.js) exige SAASPAY_SECRET_KEY
+ * + SAASPAY_API_KEY. Les anciennes variables LEEKPAY_* éventuellement
+ * présentes sont recopiées au démarrage par config/paymentEnv.js.
+ * @returns {boolean} true uniquement si le service peut réellement appeler l'API
+ */
 function checkLeekPay() {
-  // Vérifier SaaSPay (nouveau) OU LeekPay (legacy backward compat)
-  const saaspayOk = !!(process.env.SAASPAY_API_KEY && process.env.SAASPAY_SECRET_KEY);
-  const leekpayOk = !!(process.env.LEEKPAY_API_KEY && process.env.LEEKPAY_SECRET_KEY);
-  return saaspayOk || leekpayOk;
+  return paymentEnv.getPaymentEnvStatus().configured;
+}
+
+/** Détail de configuration paiement, sans aucun secret */
+function getPaymentConfigStatus() {
+  try {
+    return require('./services/saaspay').getConfigStatus();
+  } catch (e) {
+    return { configured: checkLeekPay(), error: e.message };
+  }
 }
 function checkInfobip() {
   return !!(process.env.INFOBIP_API_KEY && process.env.INFOBIP_BASE_URL);
@@ -107,6 +128,27 @@ function checkTranscription() {
 }
 
 /* ── Health & status ─────────────────────────────────────── */
+/* ── Alerte configuration paiement (démarrage) ─────────────── */
+if (!paymentConfigLegacy.missing.length) {
+  const st = getPaymentConfigStatus();
+  logger.info('[PAYMENT_CONFIG] SaaSPay configuré', {
+    baseUrl        : st.baseUrl,
+    secretKey      : st.secretKey,
+    apiKey         : st.apiKey,
+    webhookSecret  : st.webhookSecret,
+    webhookUrl     : st.webhookUrl,
+    premiumAmount  : st.premiumAmount,
+    premiumCurrency: st.premiumCurrency,
+    legacyApplied  : st.legacyApplied,
+  });
+} else {
+  logger.error('[PAYMENT_CONFIG] Configuration SaaSPay INCOMPLÈTE — le paiement répondra 503', {
+    missingRequired: paymentConfigLegacy.missing,
+    expected       : 'SAASPAY_SECRET_KEY + SAASPAY_API_KEY (Render → Settings → Environment)',
+    legacyPresent  : paymentConfigLegacy.applied,
+  });
+}
+
 app.get('/', (_req, res) => {
   const lpOk      = checkLeekPay();
   const infobipOk = checkInfobip();
@@ -160,7 +202,8 @@ app.get('/health', (_req, res) => {
     checks  : {
       firebase      : firebaseOk      ? 'ok' : 'MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON',
       jwt           : jwtOk           ? 'ok' : 'MISSING — set JWT_SECRET',
-      payments      : lpOk            ? 'ACTIVE' : 'INACTIVE — set SAASPAY_API_KEY + SAASPAY_SECRET_KEY',
+      payments      : lpOk            ? 'ACTIVE'
+                                        : `INACTIVE — variables manquantes : ${paymentEnv.getPaymentEnvStatus().missingRequired.join(', ') || 'SAASPAY_API_KEY + SAASPAY_SECRET_KEY'}`,
       infobip       : infobipOk       ? 'ACTIVE' : 'INACTIVE — set INFOBIP_API_KEY + INFOBIP_BASE_URL',
       redis         : redisOk         ? 'CONFIGURED' : 'MISSING — using memory fallback (set REDIS_URL)',
       socketio      : 'ACTIVE',
@@ -278,6 +321,7 @@ app.get('/api/user/status', (req, res) => getUserPremiumStatus(req, res));
 
 /* ── Admin & feature routes ──────────────────────────────── */
 app.use('/admin',         adminRoutes);
+app.use('/api/admin',     adminRoutes);   // alias API (mêmes protections x-admin-key)
 app.use('/groups',        groupRoutes);
 app.use('/users',         userRoutes);
 app.use('/me',            meRoutes);
@@ -527,7 +571,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('🌍 ENV        : ' + (process.env.NODE_ENV || 'development'));
   console.log('🔥 Firebase   : ' + (firebaseOk ? '✅ configured' : '❌ MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON'));
   console.log('🔑 JWT        : ' + (jwtOk ? '✅ configured' : '❌ MISSING — set JWT_SECRET'));
-  console.log('💳 SaaSPay    : ' + (lpOk  ? '✅ ACTIVE' : '⚠️  INACTIVE — set SAASPAY_API_KEY + SAASPAY_SECRET_KEY'));
+  console.log('💳 SaaSPay    : ' + (lpOk
+    ? `✅ ACTIVE — ${getPaymentConfigStatus().baseUrl} (webhook ${getPaymentConfigStatus().webhookUrl})`
+    : `⚠️  INACTIVE — variables manquantes : ${paymentEnv.getPaymentEnvStatus().missingRequired.join(', ') || 'SAASPAY_API_KEY + SAASPAY_SECRET_KEY'}`));
   console.log('📡 Infobip    : ' + (infobipOk
     ? `✅ ACTIVE — key:${infobipKeyPrefix}... url:${infobipNormUrl} hasHttps:${!!infobipHasHttps}`
     : '❌ INACTIVE — set INFOBIP_API_KEY and INFOBIP_BASE_URL'));

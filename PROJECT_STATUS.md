@@ -42,7 +42,7 @@ L'architecture Offline utilise désormais **INfiniReach** (https://api.infinirea
 | phoneNormalizer.js | ✅ OK | E.164 + multi-variantes |
 | userResolver.js | ✅ OK | Résolution phone → UID |
 | BullMQ / Redis | ✅ OK si `REDIS_URL` configuré | Inline fallback sinon |
-| LeekPay paiements | ✅ OK | Ne pas toucher |
+| Paiements SaaSPay | ✅ OK | `leekpay_payments` — moteur corrigé Session 14 (`saaspayController.js`) |
 | Transcription Groq | ✅ OK | |
 
 ---
@@ -852,3 +852,87 @@ NOTIFICATIONS  : FIXED
 PAYMENT        : NON TOUCHÉ
 FRONTEND       : NON TOUCHÉ
 ```
+
+## § Session 14 (2026-09-28) — Correction ADMIN + PAIEMENT
+
+### Terminé
+
+- [x] Correction système Admin
+- [x] Correction système paiement
+- [x] Tests Admin
+- [x] Tests paiement
+- [x] Tests non-régression
+
+### Diagnostic (causes réelles constatées, reproduites avec Firestore + fournisseur simulés)
+
+**ADMIN**
+1. `routes/admin.js` combinait `where(égalité)` + `orderBy(autre champ)` → Firestore exige un **index composite absent** → `FAILED_PRECONDITION` → **HTTP 500 `DB_ERROR`** sur `/admin/users?subscribed=…`, `/admin/user/:userId`, `/admin/payments?status=…`.
+2. Les paiements étaient lus uniquement dans `payments_fusionpay` (ancien système, vide) → l'admin n'affichait **aucun paiement SaaSPay** et des compteurs faux (`/admin/stats`).
+3. Routes montées uniquement sous `/admin` → `/api/admin/...` renvoyait 404 (selon l'URL appelée par le frontend).
+4. `requireAdminKey` : `x-admin-key` non-string (en-tête répété) → exception → 500 ; `ADMIN_UIDS` documentée mais jamais utilisée.
+5. Rate limit admin 30 req/5 min — trop strict pour un tableau de bord (stats + users + payments + subscriptions).
+
+**PAIEMENT**
+1. **Cause racine de l'absence d'activation Premium** : `controllers/saaspayController.js`, `handleSuccessfulPayment()` déclarait `const userId = resolvedUserId;` alors que `userId` est un **paramètre destructuré** de la même fonction → zone morte temporelle → `ReferenceError: Cannot access 'userId' before initialization` → **abandon silencieux de toute activation Premium** (webhook ET polling), avant même l'appel à `activatePremiumFirestore()`.
+2. **Variables d'environnement** : `render.yaml` et `.env.example` déclaraient `LEEKPAY_*` alors que `services/saaspay.js` lit **exclusivement** `SAASPAY_*` → sur Render, `isConfigured()` = false → **HTTP 503 `SAASPAY_NOT_CONFIGURED`** (et `/health` affichait malgré tout `payments: ACTIVE`).
+3. **Falsification possible** : `verifyWebhookSignature()` retournait `true` en mode dégradé (clé ou signature absente) et `POST /api/payment/poll/:checkoutId` faisait confiance au `userId` envoyé par le client → un webhook falsifié ou le poll du checkout d'autrui pouvait créditer un utilisateur.
+4. Logs de réponse fournisseur journalisés brut (`JSON.stringify(response.data)`) — risque de fuite de secret.
+
+### Correction (fichiers modifiés)
+
+| Fichier | Modification |
+|---|---|
+| `routes/admin.js` | Requêtes sans index composite (`where` **ou** `orderBy` + tri/filtre en mémoire) ; lecture fusionnée `leekpay_payments` + `payments_fusionpay` ; `Promise.allSettled` (une sous-requête en échec ne casse plus la route) ; logs `[ADMIN]` / `[ADMIN_AUTH]` / `[ADMIN_ERROR]` ; comparaison de clé en temps constant sans troncature ; `x-admin-key` non-string géré ; accès par jeton `ADMIN_UIDS` (si configuré) ; rate limit `ADMIN_RATE_LIMIT_MAX` (défaut 120/5 min) ; 404 JSON sur route admin inconnue. Réponses JSON existantes conservées (+ champs additifs). |
+| `server.js` | Montage `/api/admin` (même routeur, mêmes protections) ; normalisation des variables de paiement au démarrage ; `checkLeekPay()` basé sur les variables réellement lues ; logs `[PAYMENT_CONFIG]` de démarrage (masqués) ; liste des variables manquantes dans `/health`. |
+| `config/paymentEnv.js` **(nouveau)** | Recopie des anciennes variables `LEEKPAY_*` → `SAASPAY_*` réellement lues (`LEEKPAY_BASE_URL` jamais recopiée) + statut de configuration masqué (`getPaymentEnvStatus`), never-logs-secrets. |
+| `controllers/saaspayController.js` | Fix `ReferenceError` (variable homonyme) ; **identification serveur** du bénéficiaire (enregistrement `leekpay_payments` > métadonnées fournisseur > valeur annoncée) ; **vérification autoritative** (signature HMAC valide **ou** statut confirmé par l'API SaaSPay) avant activation ; contrôle montant/devise côté serveur ; idempotence renforcée ; logs `[PAYMENT*]` ; réponse `/poll` véridique (`callerPremium`, `activatedUserId`). |
+| `controllers/leekpayController.js` | Même correctif appliqué au contrôleur legacy (atteignable via `POST /api/payment/webhook`). |
+| `services/saaspay.js` | `verifyWebhookSignature` **fail-closed** (plus de mode « accepté sans vérification ») ; réponse fournisseur journalisée en champs sûrs (masquage `maskSensitiveFields`) ; `getConfigStatus()` masqué. |
+| `render.yaml`, `.env.example` | Variables renommées en `SAASPAY_*` (noms exacts attendus par le code) + note legacy. |
+| `test/admin-payment-tests.js` **(nouveau)** | 61 tests Admin + Paiement + non-régression. |
+
+**Aucune donnée Firestore supprimée, aucun UID modifié, aucune collection renommée :** l'admin lit désormais l'ancienne **et** la nouvelle collection. Les utilisateurs Premium existants sont préservés.
+
+### Tests exécutés (résultats réels)
+
+| Suite | Résultat |
+|---|---|
+| `test/admin-payment-tests.js` (nouveau — Admin A1–A29, Paiement P1–P18, Non-régression N1–N9) | ✅ **61/61** |
+| `test/offline-monetization-tests.js` | ✅ 26/26 |
+| `test/offline-sms-tests.js` | ✅ 37/37 |
+| `test/p0-p4-unit-tests.js` | ✅ 36/36 |
+| `test/phase6-phase7-tests.js` | ✅ 51/51 |
+| `test/routing-matrix-tests.js` | ✅ 57/57 |
+| `test/routing-presence-tests.js` | ✅ 34/34 |
+| `test/session11-inbound-routing-tests.js` | ✅ 19/19 |
+| `test/sms-inbound-tests.js` | ✅ 23/23 |
+| `test/sms-gateway-tests.js` | ✅ 48/48 |
+| `test/session12-username-notif-payment-tests.js` | 54 ✅ / 7 ❌ (7 échecs pré-existants : fichiers Flutter absents de ce repo) — **identique avant/après**, section Paiement P1–P5 21/21 ✅ |
+| `test/session6-tests.js` | 15 ✅ / 12 ❌ (12 échecs pré-existants : frontend absent) — **identique avant/après** |
+| `test/session10-stabilization-tests.js` | échecs pré-existants (chemins `/home/user/webapp` codés en dur) — **identique avant/après** |
+| `test/session11-notification-tests.js` | 18 ✅ / 7 ❌ (frontend absent) — **identique avant/après** |
+| `test/session13-username-audio-notif-tests.js` | ⚠️ non exécutable ici : `socket.io-client` absent (dépendance de test non installée) — inchangé |
+
+**Non-régression** : les ensembles d'échecs des suites en échec sont **identiques** avant/après correction (comparaison ligne à ligne) → aucune régression introduite. Aucun paiement réel n'a été exécuté (tests unitaires + intégration avec fournisseur simulé).
+
+### Variables d'environnement (Render) — noms exacts à vérifier
+
+```text
+SAASPAY_SECRET_KEY  = sk_live_xxx   (requis — Bearer token API)
+SAASPAY_API_KEY     = pk_live_xxx   (requis — signature webhook)
+SAASPAY_BASE_URL    = https://saaspay.me   (optionnel, défaut)
+SAASPAY_WEBHOOK_SECRET = (optionnel, remplace SAASPAY_API_KEY pour la signature HMAC)
+ADMIN_KEY           = (requis en production — protection des routes admin)
+ADMIN_UIDS          = (optionnel — UIDs Firebase des administrateurs)
+ADMIN_RATE_LIMIT_MAX= (optionnel, défaut 120 req/5 min)
+```
+
+- Si seules les anciennes variables `LEEKPAY_*` sont présentes dans Render, elles sont recopiées automatiquement vers `SAASPAY_*` au démarrage (avertissement `[PAYMENT_CONFIG]`) — **les renommer reste recommandé**.
+- Webhook à configurer dans le dashboard SaaSPay : `https://omnisms-backend.onrender.com/api/payment/webhook/saaspay`.
+
+### Problèmes connus (constatés)
+
+1. Variables `SAASPAY_*` à confirmer dans le dashboard Render (l'ancienne configuration `LEEKPAY_*` est compensée automatiquement mais doit être renommée).
+2. `services/saaspay.js` suppose `POST /api/v1/checkout` et `GET /api/v1/checkout/:id` — documentation SaaSPay inaccessible depuis cet environnement ; les endpoints n'ont **pas** été modifiés (ils fonctionnent selon l'implémentation existante).
+3. Suites de tests dépendant du frontend Flutter (`session6`, `session11-notification`, `session12` partiel, `session10`) et `session13` (`socket.io-client`) non exécutables dans ce dépôt — échecs pré-existants, sans lien avec Admin/Paiement.
+4. Aucun index composite Firestore n'est nécessaire côté admin désormais ; si des index sont ajoutés ultérieurement, aucune modification de code n'est requise.
