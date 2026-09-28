@@ -84,6 +84,24 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// JSON diagnostics must tolerate absent/non-serializable bodies.
+function safeJson(value, maxLength = 500) {
+  if (value === undefined) return '[no response body]';
+  try {
+    const text = JSON.stringify(maskSensitiveFields(value));
+    return (text === undefined ? String(value) : text).slice(0, maxLength);
+  } catch (_) {
+    return '[unserializable response body]';
+  }
+}
+
+function responseShape(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (typeof value !== 'object') return typeof value;
+  return Object.keys(value).slice(0, 30);
+}
+
 /**
  * Masque toute valeur sensible dans un objet destiné aux logs
  * (clé, secret, token, signature, authorization…).
@@ -218,7 +236,9 @@ async function createCheckout({
   if (customerName)  payload.customer_name   = customerName;
   if (customerPhone) payload.customer_phone  = customerPhone;
 
+  const requestUrl = `${SAASPAY_BASE_URL}/api/v1/checkout`;
   logger.info('[SaaSPay] POST /api/v1/checkout', {
+    requestUrl,
     amount    : payload.amount,
     currency  : payload.currency,
     metadata  : JSON.stringify(metadata).substring(0, 200),
@@ -238,7 +258,10 @@ async function createCheckout({
     const detail  = err.response?.data;
     logger.error('[PAYMENT_ERROR] SaaSPay — échec POST /api/v1/checkout', {
       status,
-      detail : JSON.stringify(maskSensitiveFields(detail)).substring(0, 500),
+      responseBody: detail === undefined ? null : safeJson(detail),
+      responseShape: detail === undefined ? null : responseShape(detail),
+      errorCode: err.code || null,
+      networkError: !err.response,
       message: err.message,
     });
     throw new Error(
@@ -264,7 +287,8 @@ async function createCheckout({
 
   if (!checkoutId || !paymentUrl) {
     logger.error('[SaaSPay] Réponse inattendue — champs id ou payment_url manquants', {
-      responseData: JSON.stringify(response.data).substring(0, 500),
+      responseShape: responseShape(response.data),
+      responseData: safeJson(response.data),
     });
     throw new Error(
       'Réponse LeekPay invalide : champs id/payment_url manquants. ' +
