@@ -3,7 +3,7 @@
  * OmniSMS — Routes SaaSPay
  * ═══════════════════════════════════════════════════════════════
  *
- * Système de paiement via SaaSPAY.me (Mobile Money + Carte).
+ * Système de paiement via SasPay (Mobile Money + Carte).
  *
  * Routes exposées (toutes montées sous /api/payment) :
  * ┌─────────────────────────────────────────────────────────────┐
@@ -24,16 +24,16 @@
  * └─────────────────────────────────────────────────────────────┘
  *
  * Variables d'environnement requises :
- *   SAASPAY_API_KEY        → pk_live_xxx (clé publique + signature webhook)
- *   SAASPAY_SECRET_KEY     → sk_live_xxx (authentification API)
- *   SAASPAY_BASE_URL       → https://saaspay.me (défaut)
+ *   SAASPAY_API_KEY        → legacy only; SasPay checkout uses SAASPAY_SECRET_KEY
+ *   SAASPAY_SECRET_KEY     → sk_live_xxx (clé API SasPay Bearer, requise)
+ *   SAASPAY_BASE_URL       → optionnelle, défaut https://api.saspay.me
  *   SAASPAY_WEBHOOK_SECRET → Secret optionnel pour la signature webhook
  *   FRONTEND_URL           → URL frontend (retour après paiement)
  *
  * Webhook LeekPay à configurer :
  *   https://omnisms-backend.onrender.com/api/payment/webhook/saaspay
  *
- * @see https://www.saaspay.me/docs
+ * @see https://docs.saspay.me
  */
 
 const express    = require('express');
@@ -79,7 +79,7 @@ function webhookLogger(req, res, next) {
  * Réponse 200 :
  *   {
  *     "success"     : true,
- *     "checkout_url": "https://saaspay.me/pay_AbCdEf...",
+ *     "checkout_url": "https://pay.saspay.me/checkout/...",
  *     "checkout_id" : "checkout_42",
  *     "orderId"     : "OMNI-LP-1234567890-AB12C",
  *     "amount"      : 2000,
@@ -126,7 +126,7 @@ router.post('/leekpay', controller.createPayment);
  *   https://omnisms-backend.onrender.com/api/payment/webhook/saaspay
  */
 router.post('/webhook/leekpay', webhookLogger, controller.handleWebhook);
-// Alias SaaSPay (nouveau endpoint recommandé — configurer dans SaaSPAY.me)
+// Alias SaaSPay (nouveau endpoint recommandé — configurer dans SasPay)
 router.post('/webhook/saaspay', webhookLogger, controller.handleWebhook);
 
 // ══════════════════════════════════════════════════════════════

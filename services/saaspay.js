@@ -3,29 +3,25 @@
  * OmniSMS — Service SaaSPay
  * ═══════════════════════════════════════════════════════════════
  *
- * Client HTTP pour l'API SaaSPay.
- * Documentation officielle : https://saaspay.me/docs
+ * Client HTTP pour l'API SasPay.
+ * Documentation officielle : https://docs.saspay.me
  *
  * Endpoint de création :
- *   POST https://saaspay.me/api/v1/checkout
+ *   POST https://api.saspay.me/api/v1/checkout-sessions/
  *   Authorization: Bearer sk_live_xxx
- *   Réponse : { data: { id, payment_url, status, amount, currency, expires_at, ... } }
+ *   Réponse : { id, checkout_url, status, amount, currency, expires_at, ... }
  *
  * Endpoint de statut :
- *   GET https://saaspay.me/api/v1/checkout/:id
+ *   GET https://api.saspay.me/api/v1/checkout-sessions/:id/
  *   Authorization: Bearer sk_live_xxx
- *   Réponse : { data: { id, status, amount, currency, paid_at, ... } }
+ *   Réponse : { id, status, amount, currency, paid_at, ... }
  *   status = "paid" quand payé
  *
- * Webhook (payment.completed) :
- *   Header X-SaaSPay-Signature: <hmac_sha256_hex>
- *   Body   { event: "payment.completed", data: { checkout_id, status: "paid", ... } }
- *
  * Variables d'environnement :
- *   SAASPAY_SECRET_KEY     → sk_live_xxx  (Bearer token — requis)
- *   SAASPAY_API_KEY        → pk_live_xxx  (signature webhook — requis)
- *   SAASPAY_BASE_URL       → https://saaspay.me (défaut)
- *   SAASPAY_WEBHOOK_SECRET → HMAC secret (optionnel, remplace pk_live_xxx)
+ *   SAASPAY_SECRET_KEY     → sk_live_xxx  (clé API SasPay / Bearer — requis)
+ *   SAASPAY_API_KEY        → legacy seulement; SasPay webhook utilise SAASPAY_WEBHOOK_SECRET
+ *   SAASPAY_BASE_URL       → https://api.saspay.me (défaut)
+ *   SAASPAY_WEBHOOK_SECRET → signing_secret fourni par SasPay (webhook)
  */
 
 const axios  = require('axios');
@@ -34,15 +30,14 @@ const { logger } = require('../middleware/logger');
 const { normalizePaymentEnv, getPaymentEnvStatus, maskSecret } = require('../config/paymentEnv');
 
 /* ── Configuration ───────────────────────────────────────────────
-   Les anciennes variables (legacy) éventuellement encore présentes
-   dans l'environnement Render sont recopiées vers les variables
-   SAASPAY_* lues ci-dessous (voir config/paymentEnv.js).
+   La clé API secrète est l'unique identifiant requis pour l'API SasPay.
+   Les identifiants LEEKPAY_* ne sont jamais utilisés comme fallback.
    Aucune valeur secrète n'est journalisée.
 ──────────────────────────────────────────────────────────────── */
 normalizePaymentEnv({ logger });
 
 /* ── Constantes ──────────────────────────────────────────────── */
-const SAASPAY_BASE_URL  = (process.env.SAASPAY_BASE_URL || 'https://saaspay.me').replace(/\/$/, '');
+const SAASPAY_BASE_URL  = (process.env.SAASPAY_BASE_URL || 'https://api.saspay.me').replace(/\/$/, '');
 const SAASPAY_TIMEOUT   = 25_000;   // 25 s
 const MAX_RETRIES       = 2;
 const RETRY_DELAY_MS    = 1_000;
@@ -57,17 +52,12 @@ const MIN_AMOUNTS        = { XOF: 100, EUR: 1, USD: 1, GHS: 1, KES: 1, NGN: 100 
 
 function resolveKeys() {
   const secretKey = (process.env.SAASPAY_SECRET_KEY || '').trim();
-  const apiKey    = (process.env.SAASPAY_API_KEY    || '').trim();
   if (!secretKey) throw new Error('SAASPAY_SECRET_KEY manquante (sk_live_xxx).');
-  if (!apiKey)    throw new Error('SAASPAY_API_KEY manquante (pk_live_xxx).');
-  return { secretKey, apiKey };
+  return { secretKey };
 }
 
 function isConfigured() {
-  return !!(
-    (process.env.SAASPAY_SECRET_KEY || '').trim() &&
-    (process.env.SAASPAY_API_KEY    || '').trim()
-  );
+  return !!(process.env.SAASPAY_SECRET_KEY || '').trim();
 }
 
 function buildHeaders() {
@@ -134,7 +124,7 @@ function getConfigStatus() {
     configured    : status.configured,
     baseUrl       : status.baseUrl,
     secretKey     : status.required.SAASPAY_SECRET_KEY,
-    apiKey        : status.required.SAASPAY_API_KEY,
+    apiKey        : status.optional.SAASPAY_API_KEY,
     webhookSecret : status.optional.SAASPAY_WEBHOOK_SECRET,
     backendUrl    : status.optional.BACKEND_URL,
     frontendUrl   : status.optional.FRONTEND_URL,
@@ -177,9 +167,9 @@ function validateAmount(amount, currency) {
     throw new Error(`Montant minimum pour ${curr} : ${minAmt}. Reçu : ${amt}.`);
 }
 
-/* ── Extraire les données d'une réponse API LeekPay ─────────── */
-// La réponse officielle est : { data: { id, payment_url, status, ... } }
-// Certaines implémentations retournent directement l'objet sans wrapper data
+/* ── Extraire les données de la réponse SasPay ──────────────── */
+// La réponse officielle est directe; l'enveloppe { data: ... } reste tolérée.
+
 function extractData(responseData) {
   if (!responseData) return null;
   // Cas 1 : { data: { ... } }  ← format officiel
@@ -192,9 +182,9 @@ function extractData(responseData) {
 
 /* ═══════════════════════════════════════════════════════════════
    API 1 — Créer un checkout
-   POST /api/v1/checkout
+   POST /api/v1/checkout-sessions/
    Authorization: Bearer sk_live_xxx
-   Réponse officielle : { data: { id, payment_url, status, expires_at, amount, currency } }
+   Réponse officielle : { id, checkout_url, status, expires_at, amount, currency }
 ══════════════════════════════════════════════════════════════════ */
 /**
  * @param {object} params
@@ -222,22 +212,22 @@ async function createCheckout({
 }) {
   validateAmount(amount, currency);
 
-  // Payload conforme à la doc officielle LeekPay
+  // Payload conforme à la documentation officielle SasPay checkout-sessions.
   const payload = {
-    amount     : Number(amount),
+    amount     : Number(amount).toFixed(2),
     currency   : currency.toUpperCase(),
     description: description || 'OmniSMS Premium',
+    country    : 'BF',
     metadata,
   };
 
   if (returnUrl)     payload.return_url      = returnUrl;
-  if (cancelUrl)     payload.cancel_url      = cancelUrl;
   if (customerEmail) payload.customer_email  = customerEmail;
   if (customerName)  payload.customer_name   = customerName;
   if (customerPhone) payload.customer_phone  = customerPhone;
 
-  const requestUrl = `${SAASPAY_BASE_URL}/api/v1/checkout`;
-  logger.info('[SaaSPay] POST /api/v1/checkout', {
+  const requestUrl = `${SAASPAY_BASE_URL}/api/v1/checkout-sessions/`;
+  logger.info('[SasPay] POST /api/v1/checkout-sessions/', {
     requestUrl,
     amount    : payload.amount,
     currency  : payload.currency,
@@ -248,7 +238,7 @@ async function createCheckout({
   try {
     response = await withRetry(() =>
       axios.post(
-        `${SAASPAY_BASE_URL}/api/v1/checkout`,
+        `${SAASPAY_BASE_URL}/api/v1/checkout-sessions/`,
         payload,
         { headers: buildHeaders(), timeout: SAASPAY_TIMEOUT }
       )
@@ -256,7 +246,7 @@ async function createCheckout({
   } catch (err) {
     const status  = err.response?.status;
     const detail  = err.response?.data;
-    logger.error('[PAYMENT_ERROR] SaaSPay — échec POST /api/v1/checkout', {
+    logger.error('[PAYMENT_ERROR] SasPay — échec POST /api/v1/checkout-sessions/', {
       status,
       responseBody: detail === undefined ? null : safeJson(detail),
       responseShape: detail === undefined ? null : responseShape(detail),
@@ -265,12 +255,12 @@ async function createCheckout({
       message: err.message,
     });
     throw new Error(
-      `SaaSPay API error (${status || 'network'}): ` +
+      `SasPay API error (${status || 'network'}): ` +
       (detail?.message || detail?.error || err.message)
     );
   }
 
-  // Extraire les données — format officiel : { data: { id, payment_url, ... } }
+  // Extraire la réponse directe SasPay ou son enveloppe { data: ... }.
   const data = extractData(response.data);
 
   logger.info('[PAYMENT] SaaSPay — réponse création checkout', {
@@ -278,12 +268,12 @@ async function createCheckout({
     status     : data?.status || null,
     amount     : data?.amount || null,
     currency   : data?.currency || null,
-    hasPaymentUrl: !!(data?.payment_url || data?.url || data?.checkout_url),
+    hasPaymentUrl: !!(data?.checkout_url || data?.payment_url || data?.url),
   });
 
   // Vérifier les champs obligatoires
   const checkoutId = data?.id || data?.checkout_id || null;
-  const paymentUrl = data?.payment_url || data?.url || data?.checkout_url || null;
+  const paymentUrl = data?.checkout_url || data?.payment_url || data?.url || null;
 
   if (!checkoutId || !paymentUrl) {
     logger.error('[SaaSPay] Réponse inattendue — champs id ou payment_url manquants', {
@@ -291,14 +281,14 @@ async function createCheckout({
       responseData: safeJson(response.data),
     });
     throw new Error(
-      'Réponse LeekPay invalide : champs id/payment_url manquants. ' +
-      'Vérifiez SAASPAY_SECRET_KEY et SAASPAY_API_KEY.'
+      'Réponse SasPay invalide : champs id/checkout_url manquants. ' +
+      'Vérifiez la clé API SasPay et son scope PAYIN.'
     );
   }
 
   return {
     checkoutId  : checkoutId,
-    paymentUrl  : paymentUrl,           // ← data.payment_url (officiel)
+    paymentUrl  : paymentUrl,           // ← data.checkout_url (SasPay officiel)
     status      : data?.status         || 'pending',
     expiresAt   : data?.expires_at     || null,
     amount      : data?.amount         || Number(amount),
@@ -309,7 +299,7 @@ async function createCheckout({
 
 /* ═══════════════════════════════════════════════════════════════
    API 2 — Statut d'un checkout (polling)
-   GET /api/v1/checkout/:id
+   GET /api/v1/checkout-sessions/:id/
    Réponse officielle : { data: { id, status, amount, currency, paid_at, ... } }
    status = "paid" quand le paiement est confirmé
 ══════════════════════════════════════════════════════════════════ */
@@ -322,24 +312,24 @@ async function getCheckoutStatus(checkoutId) {
     throw new Error('checkoutId invalide.');
   }
 
-  logger.info('[SaaSPay] GET /api/v1/checkout/:id', { checkoutId });
+  logger.info('[SaaSPay] GET /api/v1/checkout-sessions/:id/', { checkoutId });
 
   let response;
   try {
     response = await withRetry(() =>
       axios.get(
-        `${SAASPAY_BASE_URL}/api/v1/checkout/${encodeURIComponent(checkoutId)}`,
+        `${SAASPAY_BASE_URL}/api/v1/checkout-sessions/${encodeURIComponent(checkoutId)}/`,
         { headers: buildHeaders(), timeout: SAASPAY_TIMEOUT }
       )
     );
   } catch (err) {
     const status = err.response?.status;
     const detail = err.response?.data;
-    logger.error('[SaaSPay] Erreur GET /api/v1/checkout/:id', {
+    logger.error('[SaaSPay] Erreur GET /api/v1/checkout-sessions/:id/', {
       checkoutId, status, message: err.message,
     });
     throw new Error(
-      `SaaSPay status error (${status || 'network'}): ` +
+      `SasPay status error (${status || 'network'}): ` +
       (detail?.message || err.message)
     );
   }
@@ -361,7 +351,7 @@ async function getCheckoutStatus(checkoutId) {
     paymentMethod: data?.payment_method || null,
     metadata     : data?.metadata     || {},
     customer     : data?.customer     || {},
-    isPaid       : (data?.status || '').toLowerCase() === 'paid',
+    isPaid       : ['paid', 'success'].includes(String(data?.status || '').toLowerCase()),
   };
 }
 

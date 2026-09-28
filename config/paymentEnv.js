@@ -1,44 +1,21 @@
 'use strict';
 /**
- * OmniSMS — Normalisation de la configuration Paiement
- * ═══════════════════════════════════════════════════════════════
- *
- * Le code de paiement (services/saaspay.js) lit EXCLUSIVEMENT les
- * variables d'environnement SAASPAY_*.
- *
- * Problème constaté : render.yaml et .env.example déclaraient encore
- * les anciennes variables LEEKPAY_* → en production, SAASPAY_SECRET_KEY
- * et SAASPAY_API_KEY étaient absents, le service répondait 503
- * SAASPAY_NOT_CONFIGURED alors que l'infrastructure était "configurée".
- *
- * Ce module fait donc UNIQUEMENT deux choses :
- *   1. Recopier les anciennes variables LEEKPAY_* vers les variables
- *      SAASPAY_* réellement lues par le code (compatibilité ascendante,
- *      le temps de la migration des variables Render).
- *   2. Exposer un état de configuration MASQUÉ (jamais de secret en clair)
- *      pour les logs de démarrage et les diagnostics.
- *
- * ⚠️ LEEKPAY_BASE_URL n'est JAMAIS recopiée : l'API réellement utilisée
- *    est https://saaspay.me (défaut de services/saaspay.js).
- *
- * Aucun secret n'est jamais retournée ni journalisée en clair par ce module.
+ * OmniSMS — Configuration Paiement SasPay.
+ * Les anciennes variables LEEKPAY_* ne sont volontairement jamais
+ * copiées : les identifiants LeekPay ne sont pas des clés SasPay.
+ * La base URL est facultative et le code utilise https://api.saspay.me.
+ * Les journaux n'exposent jamais les valeurs complètes des secrets.
  */
 
-/* Anciennes variables (legacy) → variables réellement lues par le code */
-const LEGACY_FALLBACK = Object.freeze({
-  SAASPAY_API_KEY        : 'LEEKPAY_API_KEY',
-  SAASPAY_SECRET_KEY     : 'LEEKPAY_SECRET_KEY',
-  SAASPAY_WEBHOOK_SECRET : 'LEEKPAY_WEBHOOK_SECRET',
-  SAASPAY_PREMIUM_AMOUNT : 'LEEKPAY_PREMIUM_AMOUNT',
-  SAASPAY_PREMIUM_CURRENCY: 'LEEKPAY_PREMIUM_CURRENCY',
-});
+const LEGACY_FALLBACK = Object.freeze({}); // volontairement vide : pas de migration de secrets entre fournisseurs
 
 /* Variables requises par services/saaspay.js */
-const REQUIRED_VARS = Object.freeze(['SAASPAY_SECRET_KEY', 'SAASPAY_API_KEY']);
+const REQUIRED_VARS = Object.freeze(['SAASPAY_SECRET_KEY']);
 
 /* Variables optionnelles (valeurs par défaut dans le code) */
 const OPTIONAL_VARS = Object.freeze([
   'SAASPAY_BASE_URL',
+  'SAASPAY_API_KEY',
   'SAASPAY_WEBHOOK_SECRET',
   'SAASPAY_PREMIUM_AMOUNT',
   'SAASPAY_PREMIUM_CURRENCY',
@@ -47,7 +24,10 @@ const OPTIONAL_VARS = Object.freeze([
 ]);
 
 /* Variables legacy qui ne sont volontairement PAS recopiées */
-const LEGACY_IGNORED = Object.freeze(['LEEKPAY_BASE_URL']);
+const LEGACY_IGNORED = Object.freeze([
+  'LEEKPAY_API_KEY', 'LEEKPAY_SECRET_KEY', 'LEEKPAY_WEBHOOK_SECRET',
+  'LEEKPAY_BASE_URL', 'LEEKPAY_PREMIUM_AMOUNT', 'LEEKPAY_PREMIUM_CURRENCY',
+]);
 
 const state = {
   normalized     : false,
@@ -67,49 +47,26 @@ function maskSecret(value) {
   return `SET (${trimmed.length} chars${prefix ? `, ${prefix}…` : ''})`;
 }
 
-function setIfPresent(name) {
-  const current = (process.env[name] || '').trim();
-  if (current) return false;
-  const legacyName = LEGACY_FALLBACK[name];
-  if (!legacyName) return false;
-  const legacyValue = (process.env[legacyName] || '').trim();
-  if (!legacyValue) return false;
-  process.env[name] = legacyValue;
-  return true;
-}
-
 /**
- * Recopie les anciennes variables LEEKPAY_* vers SAASPAY_* manquantes.
- * Idempotent : peut être appelé plusieurs fois sans effet de bord.
+ * Contrôle la configuration SasPay. Les variables LEEKPAY_* sont
+ * signalées mais volontairement jamais copiées vers SAASPAY_*.
  * @param {{ logger?: object }} [options]
  * @returns {{ applied: string[], missing: string[], legacyVars: string[] }}
  */
 function normalizePaymentEnv(options = {}) {
   const logger = options.logger || null;
-  const applied = [];
-
-  for (const name of Object.keys(LEGACY_FALLBACK)) {
-    if (setIfPresent(name)) {
-      applied.push(`${LEGACY_FALLBACK[name]} → ${name}`);
-    }
-  }
-
-  if (!state.normalized) {
-    state.normalized = true;
-    state.legacyApplied = [...applied];
-  }
-
+  if (!state.normalized) state.normalized = true;
   const missing = REQUIRED_VARS.filter(v => !(process.env[v] || '').trim());
+  const legacyPresent = LEGACY_IGNORED.filter(name => !!(process.env[name] || '').trim());
 
-  if (applied.length && logger && typeof logger.warn === 'function') {
-    logger.warn('[PAYMENT_CONFIG] Anciennes variables détectées — recopiées vers les variables SAASPAY_* lues par le code. ' +
-      'Renommez-les dans Render (Settings → Environment).', {
-      mappingApplied: applied,
-      hint           : 'Variables attendues par le code : SAASPAY_SECRET_KEY + SAASPAY_API_KEY',
+  if (legacyPresent.length && logger && typeof logger.warn === 'function') {
+    logger.warn('[PAYMENT_CONFIG] Variables LEEKPAY_* détectées mais ignorées pour SasPay.', {
+      legacyPresent,
+      hint: 'Configurer SAASPAY_SECRET_KEY avec la clé secrète SasPay sk_live_/sk_test_.',
     });
   }
 
-  return { applied, missing, legacyVars: applied };
+  return { applied: [], missing, legacyVars: legacyPresent };
 }
 
 /**
@@ -129,14 +86,15 @@ function getPaymentEnvStatus() {
 
   const missingRequired = REQUIRED_VARS.filter(v => !(process.env[v] || '').trim());
 
-  const legacyPresent = Object.values(LEGACY_FALLBACK)
+  // Signale les anciennes vars sans jamais les adopter pour l'API SasPay.
+  const legacyPresent = LEGACY_IGNORED
     .filter(name => !!(process.env[name] || '').trim());
 
   const legacyIgnoredPresent = LEGACY_IGNORED
     .filter(name => !!(process.env[name] || '').trim());
 
   return {
-    provider      : 'SaaSPay',
+    provider      : 'SasPay',
     configured    : missingRequired.length === 0,
     required,
     optional,
@@ -144,7 +102,7 @@ function getPaymentEnvStatus() {
     legacyPresent,
     legacyIgnoredPresent,
     legacyApplied : state.legacyApplied,
-    baseUrl       : (process.env.SAASPAY_BASE_URL || 'https://saaspay.me').replace(/\/$/, ''),
+    baseUrl       : (process.env.SAASPAY_BASE_URL || 'https://api.saspay.me').replace(/\/$/, ''),
     premiumAmount : parseInt(process.env.SAASPAY_PREMIUM_AMOUNT, 10) || 2000,
     premiumCurrency: (process.env.SAASPAY_PREMIUM_CURRENCY || 'XOF').toUpperCase(),
     webhookPath   : '/api/payment/webhook/saaspay',

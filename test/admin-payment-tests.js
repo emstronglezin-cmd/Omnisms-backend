@@ -209,7 +209,7 @@ const provider = {
     provider.checkouts[id] = { status: 'pending', amount, currency, metadata };
     return {
       checkoutId: id,
-      paymentUrl: `https://saaspay.me/pay/${id}`,
+      paymentUrl: `https://pay.saspay.me/checkout/${id}`,
       status    : 'pending',
       expiresAt : '2026-12-31T23:59:59Z',
       amount,
@@ -242,7 +242,7 @@ const provider = {
     const MIN = { XOF: 100, EUR: 1, USD: 1, GHS: 1, KES: 1, NGN: 100 };
     if (amt < (MIN[curr] || 1)) throw new Error(`Montant minimum pour ${curr} : ${MIN[curr]}. Reçu : ${amt}.`);
   },
-  getConfigStatus: () => ({ configured: provider.configured, provider: 'SaaSPay', baseUrl: 'https://saaspay.me' }),
+  getConfigStatus: () => ({ configured: provider.configured, provider: 'SaaSPay', baseUrl: 'https://api.saspay.me' }),
   maskSensitiveFields: (o) => o,
   PREMIUM_AMOUNT  : 2000,
   PREMIUM_CURRENCY: 'XOF',
@@ -306,7 +306,7 @@ function paymentDoc(db, id) {
   ══════════════════════════════════════════════════════════ */
   console.log('\n━━━ PARTIE A — CONFIGURATION & SIGNATURE (unitaire) ━━━━━━━\n');
 
-  await test('A1 — config/paymentEnv recopie les anciennes variables vers SAASPAY_* (sans BASE_URL)', async () => {
+  await test('A1 — les variables LEEKPAY_* ne prennent jamais le dessus sur SasPay', async () => {
     const saved = {
       SAASPAY_API_KEY: process.env.SAASPAY_API_KEY,
       SAASPAY_SECRET_KEY: process.env.SAASPAY_SECRET_KEY,
@@ -319,22 +319,20 @@ function paymentDoc(db, id) {
       delete process.env.SAASPAY_API_KEY;
       delete process.env.SAASPAY_SECRET_KEY;
       delete process.env.SAASPAY_BASE_URL;
-      process.env.LEEKPAY_API_KEY     = 'pk_legacy_value';
-      process.env.LEEKPAY_SECRET_KEY  = 'sk_legacy_value';
-      process.env.LEEKPAY_BASE_URL    = 'https://leekpay.fr';
-
+      process.env.LEEKPAY_API_KEY = 'pk_legacy_value';
+      process.env.LEEKPAY_SECRET_KEY = 'sk_legacy_value';
+      process.env.LEEKPAY_BASE_URL = 'https://leekpay.fr';
       delete require.cache[require.resolve(path.join(ROOT, 'config/paymentEnv'))];
       const paymentEnv = require(path.join(ROOT, 'config/paymentEnv'));
       const result = paymentEnv.normalizePaymentEnv();
-
-      assertEqual(process.env.SAASPAY_API_KEY,    'pk_legacy_value', 'SAASPAY_API_KEY recopiée');
-      assertEqual(process.env.SAASPAY_SECRET_KEY, 'sk_legacy_value', 'SAASPAY_SECRET_KEY recopiée');
-      assert(result.applied.length === 2, 'deux recopies attendues');
-      assert(!process.env.SAASPAY_BASE_URL, 'LEEKPAY_BASE_URL ne doit JAMAIS être recopiée');
-
       const status = paymentEnv.getPaymentEnvStatus();
-      assertEqual(status.configured, true, 'configuration considérée comme complète');
-      assert(status.baseUrl === 'https://saaspay.me', 'base URL SaaSPay par défaut');
+      assertEqual(result.applied.length, 0, 'aucune variable LeekPay recopiée');
+      assertEqual(process.env.SAASPAY_SECRET_KEY, undefined, 'clé SasPay absente reste absente');
+      assertEqual(process.env.SAASPAY_API_KEY, undefined, 'aucune ancienne clé publique recopiée');
+      assertEqual(status.configured, false, 'ancienne clé seule ne configure pas SasPay');
+      assert(status.missingRequired.includes('SAASPAY_SECRET_KEY'), 'clé SasPay requise');
+      assert(status.baseUrl === 'https://api.saspay.me', 'base URL officielle par défaut sans env');
+      assert(status.legacyPresent.includes('LEEKPAY_SECRET_KEY'), 'présence legacy diagnostiquée sans adoption');
       assert(!JSON.stringify(status).includes('sk_legacy_value'), 'aucun secret dans le statut');
     } finally {
       for (const [k, v] of Object.entries(saved)) {
@@ -383,15 +381,70 @@ function paymentDoc(db, id) {
       const paymentEnv = require(path.join(ROOT, 'config/paymentEnv'));
       const status = paymentEnv.getPaymentEnvStatus();
       assertEqual(status.configured, false, 'configuration détectée comme incomplète');
-      assertEqual(status.missingRequired.length, 2, 'deux variables manquantes signalées');
+      assertEqual(status.missingRequired.length, 1, 'seule la clé API secrète est requise');
       assert(status.missingRequired.includes('SAASPAY_SECRET_KEY'), 'nom exact signalé');
-      assert(status.missingRequired.includes('SAASPAY_API_KEY'), 'nom exact signalé');
+      assert(!status.missingRequired.includes('SAASPAY_API_KEY'), 'clé séparée non requise par SasPay');
     } finally {
       if (savedKey) process.env.SAASPAY_SECRET_KEY = savedKey;
       if (savedApi) process.env.SAASPAY_API_KEY = savedApi;
       if (savedLeg) process.env.LEEKPAY_API_KEY = savedLeg;
       if (savedLeg2) process.env.LEEKPAY_SECRET_KEY = savedLeg2;
       delete require.cache[require.resolve(path.join(ROOT, 'config/paymentEnv'))];
+    }
+  });
+
+  await test('A4 — contrat API SasPay : base par défaut, checkout 2000 XOF et statut PAID', async () => {
+    const axios = require('axios');
+    const saved = {
+      SAASPAY_SECRET_KEY: process.env.SAASPAY_SECRET_KEY,
+      SAASPAY_API_KEY: process.env.SAASPAY_API_KEY,
+      SAASPAY_BASE_URL: process.env.SAASPAY_BASE_URL,
+    };
+    const originalPost = axios.post;
+    const originalGet = axios.get;
+    try {
+      process.env.SAASPAY_SECRET_KEY = 'sk_test_contract';
+      delete process.env.SAASPAY_API_KEY;
+      delete process.env.SAASPAY_BASE_URL;
+      delete require.cache[require.resolve(path.join(ROOT, 'services/saaspay'))];
+      const saaspay = require(path.join(ROOT, 'services/saaspay'));
+      let request;
+      axios.post = async (url, body, options) => {
+        request = { url, body, options };
+        return { status: 201, data: {
+          id: 'checkout-contract', checkout_url: 'https://pay.saspay.me/checkout/contract',
+          status: 'PENDING', amount: '2000.00', currency: 'XOF',
+        } };
+      };
+      const metadata = { userId: 'user-contract', orderId: 'order-contract', app: 'OmniSMS', webhookUrl: 'https://omnisms-backend.onrender.com/api/payment/webhook/saaspay' };
+      const checkout = await saaspay.createCheckout({
+        amount: 2000, currency: 'XOF', description: 'OmniSMS Premium',
+        returnUrl: 'https://frontend.example/success', customerEmail: 'buyer@example.com',
+        customerName: 'Buyer', metadata,
+      });
+      assertEqual(saaspay.isConfigured(), true, 'la clé secrète unique suffit');
+      assertEqual(request.url, 'https://api.saspay.me/api/v1/checkout-sessions/', 'endpoint officiel checkout-sessions');
+      assertEqual(request.body.amount, '2000.00', 'montant envoyé en décimal chaîne');
+      assertEqual(request.body.currency, 'XOF', 'devise XOF');
+      assertEqual(request.body.country, 'BF', 'pays Burkina Faso');
+      assertEqual(request.body.metadata.orderId, metadata.orderId, 'metadata orderId conservée');
+      assertEqual(request.options.headers.Authorization, 'Bearer sk_test_contract', 'auth Bearer secret SasPay');
+      assertEqual(checkout.paymentUrl, 'https://pay.saspay.me/checkout/contract', 'checkout_url extraite');
+
+      axios.get = async (url) => {
+        assertEqual(url, 'https://api.saspay.me/api/v1/checkout-sessions/checkout-contract/', 'endpoint de détail officiel');
+        return { status: 200, data: { id: 'checkout-contract', status: 'PAID', amount: '2000.00', currency: 'XOF' } };
+      };
+      const status = await saaspay.getCheckoutStatus('checkout-contract');
+      assertEqual(status.isPaid, true, 'PAID fournisseur reconnu');
+      assertEqual(Number(status.amount), 2000, 'montant de statut disponible pour vérification serveur');
+    } finally {
+      axios.post = originalPost;
+      axios.get = originalGet;
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+      delete require.cache[require.resolve(path.join(ROOT, 'services/saaspay'))];
     }
   });
 
@@ -1005,7 +1058,7 @@ function paymentDoc(db, id) {
     assert(src.includes("app.use('/admin'"), 'routes admin montées');
     assert(src.includes('payment.saaspay'), 'routes saaspay montées');
     assert(src.includes('payment.leekpay'), 'routes leekpay (legacy) montées');
-    assert(src.includes('SAASPAY_API_KEY') && src.includes('SAASPAY_SECRET_KEY'), 'vérification de configuration conservée');
+    assert(src.includes('SAASPAY_SECRET_KEY'), 'clé API SasPay vérifiée');
   });
 
   await test('N3 — services/saaspay.js : aucun nom de variable legacy (contrainte Session 12)', async () => {
@@ -1013,7 +1066,7 @@ function paymentDoc(db, id) {
     assert(src.includes('SAASPAY_SECRET_KEY'), 'SAASPAY_SECRET_KEY utilisé');
     assert(src.includes('SAASPAY_API_KEY'), 'SAASPAY_API_KEY utilisé');
     assert(!src.includes('LEEKPAY_SECRET_KEY') && !src.includes('LEEKPAY_API_KEY'), 'aucune variable legacy');
-    assert(src.includes('saaspay.me'), 'URL SaaSPay présente');
+    assert(src.includes('api.saspay.me'), 'URL API SasPay officielle présente');
     assert(!src.includes('leekpay.fr'), 'URL LeekPay absente');
   });
 

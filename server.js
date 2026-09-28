@@ -92,9 +92,9 @@ app.use(
 
 /* ── Checks de configuration ─────────────────────────────── */
 /**
- * Le service de paiement (services/saaspay.js) exige SAASPAY_SECRET_KEY
- * + SAASPAY_API_KEY. Les anciennes variables LEEKPAY_* éventuellement
- * présentes sont recopiées au démarrage par config/paymentEnv.js.
+ * Le service de paiement SasPay (services/saaspay.js) exige uniquement
+ * SAASPAY_SECRET_KEY (clé API secrète sk_live_/sk_test_). Les anciennes variables LEEKPAY_* ne sont jamais reprises comme
+ * identifiants SasPay.
  * @returns {boolean} true uniquement si le service peut réellement appeler l'API
  */
 function checkLeekPay() {
@@ -144,7 +144,7 @@ if (!paymentConfigLegacy.missing.length) {
 } else {
   logger.error('[PAYMENT_CONFIG] Configuration SaaSPay INCOMPLÈTE — le paiement répondra 503', {
     missingRequired: paymentConfigLegacy.missing,
-    expected       : 'SAASPAY_SECRET_KEY + SAASPAY_API_KEY (Render → Settings → Environment)',
+    expected       : 'SAASPAY_SECRET_KEY (sk_live_… SasPay API key)',
     legacyPresent  : paymentConfigLegacy.applied,
   });
 }
@@ -161,7 +161,7 @@ app.get('/', (_req, res) => {
     payments : lpOk,
     sms      : infobipOk,
     realtime : true,
-    payments : lpOk      ? 'ACTIVE' : 'INACTIVE — set SAASPAY_API_KEY + SAASPAY_SECRET_KEY (or legacy LEEKPAY_*)',
+    payments : lpOk      ? 'ACTIVE' : 'INACTIVE — set SAASPAY_SECRET_KEY (or legacy LEEKPAY_SECRET_KEY)',
     infobip  : infobipOk ? 'ACTIVE' : 'INACTIVE — set INFOBIP_API_KEY + INFOBIP_BASE_URL',
     env      : process.env.NODE_ENV || 'development',
     time     : new Date().toISOString(),
@@ -203,7 +203,7 @@ app.get('/health', (_req, res) => {
       firebase      : firebaseOk      ? 'ok' : 'MISSING — set FIREBASE_SERVICE_ACCOUNT_JSON',
       jwt           : jwtOk           ? 'ok' : 'MISSING — set JWT_SECRET',
       payments      : lpOk            ? 'ACTIVE'
-                                        : `INACTIVE — variables manquantes : ${paymentEnv.getPaymentEnvStatus().missingRequired.join(', ') || 'SAASPAY_API_KEY + SAASPAY_SECRET_KEY'}`,
+                                        : `INACTIVE — variables manquantes : ${paymentEnv.getPaymentEnvStatus().missingRequired.join(', ') || 'SAASPAY_SECRET_KEY'}`,
       infobip       : infobipOk       ? 'ACTIVE' : 'INACTIVE — set INFOBIP_API_KEY + INFOBIP_BASE_URL',
       redis         : redisOk         ? 'CONFIGURED' : 'MISSING — using memory fallback (set REDIS_URL)',
       socketio      : 'ACTIVE',
@@ -371,7 +371,7 @@ app.get('/api/diag', (_req, res) => {
     'REDIS_URL',
     'GROQ_API_KEY', 'GROQ_WHISPER_MODEL',
     'INFOBIP_API_KEY', 'INFOBIP_BASE_URL', 'INFOBIP_SENDER_ID', 'INFOBIP_SENDER',
-    'SAASPAY_API_KEY', 'SAASPAY_SECRET_KEY', 'SAASPAY_BASE_URL',
+    'SAASPAY_SECRET_KEY', 'SAASPAY_BASE_URL',
     'DEFAULT_PHONE_COUNTRY', 'WHISPER_MODEL', 'WHISPER_LANGUAGE',
   ];
 
@@ -573,7 +573,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('🔑 JWT        : ' + (jwtOk ? '✅ configured' : '❌ MISSING — set JWT_SECRET'));
   console.log('💳 SaaSPay    : ' + (lpOk
     ? `✅ ACTIVE — ${getPaymentConfigStatus().baseUrl} (webhook ${getPaymentConfigStatus().webhookUrl})`
-    : `⚠️  INACTIVE — variables manquantes : ${paymentEnv.getPaymentEnvStatus().missingRequired.join(', ') || 'SAASPAY_API_KEY + SAASPAY_SECRET_KEY'}`));
+    : `⚠️  INACTIVE — variables manquantes : ${paymentEnv.getPaymentEnvStatus().missingRequired.join(', ') || 'SAASPAY_SECRET_KEY'}`));
   console.log('📡 Infobip    : ' + (infobipOk
     ? `✅ ACTIVE — key:${infobipKeyPrefix}... url:${infobipNormUrl} hasHttps:${!!infobipHasHttps}`
     : '❌ INACTIVE — set INFOBIP_API_KEY and INFOBIP_BASE_URL'));

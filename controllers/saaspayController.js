@@ -3,14 +3,14 @@
  * OmniSMS — SaaSPay Controller
  * ═══════════════════════════════════════════════════════════════
  *
- * Documentation officielle SaaSPay : https://saaspay.me/docs
+ * Documentation officielle SasPay : https://docs.saspay.me
  *
  * Flux paiement :
  *   1. POST /api/payment/leekpay  { userId, amount?, currency?, phone?, email?, name? }
- *   2. Backend → POST https://saaspay.me/api/v1/checkout → { data: { id, payment_url } }
+ *   2. Backend → POST https://api.saspay.me/api/v1/checkout-sessions/ → { id, checkout_url }
  *   3. Frontend ouvre data.payment_url
  *   4. SaaSPay → POST /api/payment/webhook/saaspay { event: "payment.completed", data: { status: "paid" } }
- *   5. Si aucun webhook → polling GET /api/v1/checkout/:id jusqu'à status = "paid"
+ *   5. En fallback webhook → polling SasPay checkout-session status (GET) jusqu'à PAID
  *
  * Activation premium : Firestore users/<userId>.isSubscribed = true
  */
@@ -103,7 +103,7 @@ function generateOrderId() {
 /* ═══════════════════════════════════════════════════════════════
    POLLING — vérifier le statut après retour frontend
    Appelé si aucun webhook reçu (fallback officiel)
-   Utilise GET /api/v1/checkout/:id jusqu'à status = "paid"
+   Utilise GET /api/v1/checkout-sessions/:id/ et vérifie le statut SasPay
 ══════════════════════════════════════════════════════════════════ */
 async function pollCheckoutStatus(checkoutId, userId, orderId, maxAttempts = 10, intervalMs = 5000) {
   let attempts = 0;
@@ -119,7 +119,7 @@ async function pollCheckoutStatus(checkoutId, userId, orderId, maxAttempts = 10,
       const statusData = await saaspay.getCheckoutStatus(checkoutId);
       logger.info('[SaaSPay] Polling statut', { checkoutId, status: statusData.status, attempt: attempts });
 
-      if (statusData.isPaid || statusData.status === 'paid') {
+      if (statusData.isPaid || String(statusData.status || '').toLowerCase() === 'paid') {
         // Paiement confirmé → activer le premium
         const alreadyDone = await isAlreadyProcessed(checkoutId);
         if (!alreadyDone) {
@@ -140,7 +140,7 @@ async function pollCheckoutStatus(checkoutId, userId, orderId, maxAttempts = 10,
         return;  // polling terminé
       }
 
-      if (['failed', 'cancelled', 'expired'].includes(statusData.status)) {
+      if (['failed', 'cancelled', 'expired'].includes(String(statusData.status || '').toLowerCase())) {
         logger.info('[SaaSPay] Polling : paiement échoué/annulé', { checkoutId, status: statusData.status });
         await savePayment(checkoutId, { status: statusData.status, userId, pollEnded: true });
         return;
@@ -174,7 +174,7 @@ async function createPayment(req, res) {
   }
 
   if (!saaspay.isConfigured()) {
-    logger.error('[PAYMENT_CONFIG] SaaSPay non configuré — SAASPAY_SECRET_KEY ou SAASPAY_API_KEY manquante');
+    logger.error('[PAYMENT_CONFIG] SasPay non configuré — SAASPAY_SECRET_KEY manquante');
     return res.status(503).json({
       success: false,
       error  : 'Service de paiement non disponible.',
@@ -223,7 +223,7 @@ async function createPayment(req, res) {
     premiumActivated: false,
   });
 
-  // Appeler l'API LeekPay → POST /api/v1/checkout
+  // Appeler l'API SasPay → POST /api/v1/checkout-sessions/
   let checkout;
   try {
     checkout = await saaspay.createCheckout({
@@ -698,7 +698,7 @@ async function handleSuccessfulPayment({
         claimedUserId: userId,
         resolvedUserId: identity.userId,
         resolutionSource: identity.source,
-        hint: 'Aucune signature webhook valide et statut non confirmable auprès de SaaSPay. Vérifier SAASPAY_SECRET_KEY / SAASPAY_API_KEY.',
+        hint: 'Aucune signature webhook valide et statut non confirmable auprès de SaaSPay. Vérifier SAASPAY_SECRET_KEY et confirmer le statut via SasPay.',
       });
       if (checkoutId) {
         await savePayment(checkoutId, {
@@ -795,7 +795,7 @@ async function getPaymentStatus(req, res) {
     logger.warn('[SaaSPay] Firestore indisponible pour statut', { error: err.message, transactionId: cleanId });
   }
 
-  // 2. Appeler GET /api/v1/checkout/:id
+  // 2. Vérifier la session de checkout via l'API SasPay
   if (!saaspay.isConfigured()) {
     return res.status(404).json({ success: false, error: 'Transaction introuvable.', code: 'NOT_FOUND' });
   }

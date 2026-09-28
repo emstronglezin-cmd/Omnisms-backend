@@ -11,9 +11,9 @@
 #
 # 🔄 Auto-deploy : chaque push sur main déclenche un redéploiement
 #
-# 💳 Paiement : LeekPay.me (Mobile Money + Carte)
+# 💳 Paiement : SasPay (Mobile Money + Carte)
 #   Webhook URL : https://omnisms-backend.onrender.com/api/payment/webhook/leekpay
-#   Configurer dans : https://www.leekpay.me → Dashboard → Clés API
+#   Configurer dans : https://app.saspay.me → Développeur → Clés API
 #
 # 📊 Health check : GET /health
 # ════════════════════════════════════════════════════════════════
@@ -70,27 +70,22 @@ services:
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
 
-      # ── LeekPay (Paiements — Mobile Money & Carte) ─────────
-      # Créez votre compte : https://www.leekpay.me/register
-      # Dashboard → Clés API → Nouvelle clé API
+      # ── SasPay (Paiements — Mobile Money & Carte) ────────────
+      # Clés API : https://app.saspay.me → Développeur
 
       # ⚠️ NOMS EXACTS attendus par le code (services/saaspay.js)
 
-      # Clé secrète (sk_live_xxx) — Bearer token API (jamais exposée côté client)
+      # Clé API secrète SasPay (sk_live_... / sk_test_...) — appels serveur uniquement
       - key: SAASPAY_SECRET_KEY
         sync: false
 
-      # Clé publique (pk_live_xxx) — signature des webhooks
-      - key: SAASPAY_API_KEY
-        sync: false
-
-      # URL base API SaaSPay (défaut https://saaspay.me)
-      - key: SAASPAY_BASE_URL
-        value: https://saaspay.me
-
-      # Secret webhook optionnel (si vide, SAASPAY_API_KEY est utilisée pour la signature)
+      # SasPay utilise un signing_secret distinct, configuré après création du webhook.
       - key: SAASPAY_WEBHOOK_SECRET
         sync: false
+
+      # URL API officielle, explicitement fixée pour éviter un override Render obsolète.
+      - key: SAASPAY_BASE_URL
+        value: https://api.saspay.me
 
       # Montant abonnement Premium (défaut 2000)
       - key: SAASPAY_PREMIUM_AMOUNT
