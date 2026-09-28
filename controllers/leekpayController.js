@@ -1,15 +1,15 @@
 'use strict';
 /**
- * OmniSMS — LeekPay Controller
+ * OmniSMS — LeekPay Controller (legacy — même moteur que saaspayController)
  * ═══════════════════════════════════════════════════════════════
  *
- * Documentation officielle LeekPay : https://leekpay.fr/docs
+ * Alias legacy du moteur de paiement — voir controllers/saaspayController.js (même logique, service services/leekpay)
  *
  * Flux paiement :
  *   1. POST /api/payment/leekpay  { userId, amount?, currency?, phone?, email?, name? }
- *   2. Backend → POST https://leekpay.fr/api/v1/checkout → { data: { id, payment_url } }
+ *   2. Backend → POST https://saaspay.me/api/v1/checkout → { data: { id, payment_url } }
  *   3. Frontend ouvre data.payment_url
- *   4. LeekPay → POST /api/payment/webhook/leekpay { event: "payment.completed", data: { status: "paid" } }
+ *   4. SaaSPay → POST /api/payment/webhook/saaspay { event: "payment.completed", data: { status: "paid" } }
  *   5. Si aucun webhook → polling GET /api/v1/checkout/:id jusqu'à status = "paid"
  *
  * Activation premium : Firestore users/<userId>.isSubscribed = true
@@ -49,7 +49,7 @@ async function savePayment(docId, data) {
       { merge: true }
     );
   } catch (err) {
-    logger.warn('[LeekPay] Firestore savePayment error', { docId, error: err.message });
+    logger.warn('[SaaSPay] Firestore savePayment error', { docId, error: err.message });
   }
 }
 
@@ -90,9 +90,9 @@ async function activatePremiumFirestore(userId, { checkoutId, transactionId, amo
       createdAt     : now,
     });
 
-    logger.info('[LeekPay] ✅ Premium activé', { userId, checkoutId, transactionId });
+    logger.info('[PAYMENT_PREMIUM] Premium activé (legacy)', { userId, checkoutId, transactionId, amount: amount || leekpay.PREMIUM_AMOUNT, currency: currency || leekpay.PREMIUM_CURRENCY });
   } catch (err) {
-    logger.error('[LeekPay] Erreur activation premium Firestore', { userId, checkoutId, error: err.message });
+    logger.error('[PAYMENT_ERROR] Erreur activation premium Firestore', { userId, checkoutId, error: err.message });
   }
 }
 
@@ -111,13 +111,13 @@ async function pollCheckoutStatus(checkoutId, userId, orderId, maxAttempts = 10,
   const poll = async () => {
     attempts++;
     if (attempts > maxAttempts) {
-      logger.warn('[LeekPay] Polling max attempts atteint', { checkoutId, userId });
+      logger.warn('[SaaSPay] Polling max attempts atteint', { checkoutId, userId });
       return;
     }
 
     try {
       const statusData = await leekpay.getCheckoutStatus(checkoutId);
-      logger.info('[LeekPay] Polling statut', { checkoutId, status: statusData.status, attempt: attempts });
+      logger.info('[SaaSPay] Polling statut', { checkoutId, status: statusData.status, attempt: attempts });
 
       if (statusData.isPaid || statusData.status === 'paid') {
         // Paiement confirmé → activer le premium
@@ -133,13 +133,15 @@ async function pollCheckoutStatus(checkoutId, userId, orderId, maxAttempts = 10,
             paymentMethod: statusData.paymentMethod,
             paidAt       : statusData.paidAt,
             customer     : statusData.customer || {},
+            signatureValid: null,
+            source       : 'polling',
           });
         }
         return;  // polling terminé
       }
 
       if (['failed', 'cancelled', 'expired'].includes(statusData.status)) {
-        logger.info('[LeekPay] Polling : paiement échoué/annulé', { checkoutId, status: statusData.status });
+        logger.info('[SaaSPay] Polling : paiement échoué/annulé', { checkoutId, status: statusData.status });
         await savePayment(checkoutId, { status: statusData.status, userId, pollEnded: true });
         return;
       }
@@ -148,7 +150,7 @@ async function pollCheckoutStatus(checkoutId, userId, orderId, maxAttempts = 10,
       setTimeout(poll, intervalMs);
 
     } catch (err) {
-      logger.error('[LeekPay] Erreur polling', { checkoutId, attempt: attempts, error: err.message });
+      logger.error('[SaaSPay] Erreur polling', { checkoutId, attempt: attempts, error: err.message });
       if (attempts < maxAttempts) setTimeout(poll, intervalMs * 2);
     }
   };
@@ -172,11 +174,11 @@ async function createPayment(req, res) {
   }
 
   if (!leekpay.isConfigured()) {
-    logger.error('[LeekPay] Non configuré — LEEKPAY_SECRET_KEY ou LEEKPAY_API_KEY manquante');
+    logger.error('[PAYMENT_CONFIG] SaaSPay non configuré — SAASPAY_SECRET_KEY ou SAASPAY_API_KEY manquante');
     return res.status(503).json({
       success: false,
       error  : 'Service de paiement non disponible.',
-      code   : 'LEEKPAY_NOT_CONFIGURED',
+      code   : 'SAASPAY_NOT_CONFIGURED',
     });
   }
 
@@ -205,7 +207,7 @@ async function createPayment(req, res) {
 
   const returnUrl    = `${frontendUrl}/payment/success?orderId=${encodeURIComponent(orderId)}&userId=${encodeURIComponent(cleanUserId)}`;
   const cancelUrl    = `${frontendUrl}/payment/cancel?orderId=${encodeURIComponent(orderId)}`;
-  const webhookUrl   = `${backendUrl}/api/payment/webhook/leekpay`;
+  const webhookUrl   = `${backendUrl}/api/payment/webhook/saaspay`;
 
   // Sauvegarder état pending avant l'appel API
   await savePayment(orderId, {
@@ -242,7 +244,7 @@ async function createPayment(req, res) {
     });
   } catch (err) {
     await savePayment(orderId, { status: 'error', errorMessage: err.message });
-    logger.error('[LeekPay] Erreur création checkout', { userId: cleanUserId, orderId, error: err.message });
+    logger.error('[PAYMENT_ERROR] Erreur création checkout', { userId: cleanUserId, orderId, error: err.message });
     return res.status(502).json({
       success: false,
       error  : 'Impossible de contacter le service de paiement. Réessayez.',
@@ -265,7 +267,7 @@ async function createPayment(req, res) {
     premiumActivated: false,
   });
 
-  logger.info('[LeekPay] Checkout créé ✅', {
+  logger.info('[PAYMENT] Checkout créé (legacy)', {
     userId    : cleanUserId,
     orderId,
     checkoutId: checkout.checkoutId,
@@ -301,24 +303,27 @@ async function createPayment(req, res) {
 
 /* ═══════════════════════════════════════════════════════════════
    ACTION 2 — Webhook LeekPay
-   POST /api/payment/webhook/leekpay
+   POST /api/payment/webhook/saaspay
    Event : payment.completed
 ══════════════════════════════════════════════════════════════════ */
 async function handleWebhook(req, res) {
-  const rawBody   = req.rawBody || JSON.stringify(req.body || {});
-  const signature = req.headers['x-leekpay-signature'] || '';
-  const event     = req.headers['x-leekpay-event']     || req.body?.event || '';
-  const delivery  = req.headers['x-leekpay-delivery']  || '';
   const body      = req.body || {};
+  const rawBody   = req.rawBody || JSON.stringify(body);
+  // En-têtes SaaSPay (nouveau) + LeekPay (legacy) — compatibles
+  const signature = req.headers['x-saaspay-signature'] || req.headers['x-leekpay-signature'] || '';
+  const event     = req.headers['x-saaspay-event']     || req.headers['x-leekpay-event']
+                 || body.event || '';
+  const delivery  = req.headers['x-saaspay-delivery']  || req.headers['x-leekpay-delivery']  || '';
 
-  logger.info('[LeekPay Webhook] Réception', {
+  logger.info('[PAYMENT] Webhook reçu', {
     event,
     delivery,
+    signaturePresent: !!signature,
     status    : body.data?.status || body.status,
     checkoutId: body.data?.checkout_id || body.data?.id,
   });
 
-  // Répondre 200 immédiatement (évite timeout LeekPay)
+  // Répondre 200 immédiatement (évite le timeout du fournisseur)
   res.status(200).json({ received: true, timestamp: new Date().toISOString() });
 
   // Traitement asynchrone
@@ -326,16 +331,25 @@ async function handleWebhook(req, res) {
     try {
       await processWebhookPayload(body, rawBody, signature, event);
     } catch (err) {
-      logger.error('[LeekPay Webhook] Erreur traitement', { error: err.message, event, delivery });
+      logger.error('[PAYMENT_ERROR] Erreur traitement webhook', { error: err.message, event, delivery });
     }
   });
 }
 
-async function processWebhookPayload(body, rawBody, signature, event) {
-  // Vérification signature HMAC
-  if (!leekpay.verifyWebhookSignature(rawBody, signature)) {
-    logger.error('[LeekPay Webhook] Signature invalide — ignoré');
-    return;
+async function processWebhookPayload(body, rawBody, signature, event, options = {}) {
+  // Vérification signature HMAC (fail-closed).
+  // Une signature invalide n'interrompt PLUS le traitement : la décision
+  // d'activer Premium est prise dans handleSuccessfulPayment(), qui exige
+  // alors une confirmation du statut auprès de l'API SaaSPay.
+  const signatureValid = typeof options.signatureValid === 'boolean'
+    ? options.signatureValid
+    : leekpay.verifyWebhookSignature(rawBody, signature);
+
+  if (!signatureValid) {
+    logger.warn('[PAYMENT_VERIFY] Webhook sans signature valide — confirmation fournisseur obligatoire', {
+      hasSignature: !!signature,
+      event,
+    });
   }
 
   // Extraire les données
@@ -355,14 +369,18 @@ async function processWebhookPayload(body, rawBody, signature, event) {
   const userId  = metadata.userId  || data.userId  || null;
   const orderId = metadata.orderId || data.orderId || null;
 
-  logger.info('[LeekPay Webhook] Payload', {
-    event, status, checkoutId, transactionId, userId, amount, currency,
+  logger.info('[PAYMENT] Webhook reçu', {
+    event, status, checkoutId, transactionId, amount, currency,
+    signatureValid,
+    hasUserId: !!userId,
   });
 
   if (status === 'paid') {
     await handleSuccessfulPayment({
       checkoutId, transactionId, userId, orderId,
       amount, currency, paymentMethod, paidAt, customer,
+      signatureValid,
+      source: 'webhook',
     });
 
   } else if (['failed', 'cancelled', 'expired'].includes(status)) {
@@ -382,29 +400,202 @@ async function processWebhookPayload(body, rawBody, signature, event) {
   }
 }
 
-async function handleSuccessfulPayment({ checkoutId, transactionId, userId, orderId, amount, currency, paymentMethod, paidAt, customer }) {
-  logger.info('[LeekPay] Paiement confirmé (paid) ✅', { checkoutId, transactionId, userId, amount, currency });
+/* ═══════════════════════════════════════════════════════════════
+   HELPERS AUTHENTIFICATION PAIEMENT (côté SERVEUR)
+   ═══════════════════════════════════════════════════════════════ */
 
-  // Anti-concurrent
-  if (checkoutId && processingPayments.has(checkoutId)) {
-    logger.info('[LeekPay] Traitement concurrent — ignoré', { checkoutId });
-    return;
+/**
+ * Recherche l'enregistrement serveur d'un paiement (source de vérité).
+ * 1) leekpay_payments/{checkoutId|orderId}
+ * 2) query leekpay_payments.where('checkoutId','==',id)
+ * @returns {Promise<object|null>}
+ */
+async function findStoredPayment(id) {
+  if (!id) return null;
+  const key = String(id);
+
+  try {
+    const db   = require('../config/firebase');
+    const snap = await db.collection('leekpay_payments').doc(key).get();
+    if (snap.exists) return { id: key, ...(snap.data() || {}) };
+  } catch (err) {
+    logger.warn('[PAYMENT] Lecture Firestore leekpay_payments/{id} impossible', { id: key, error: err.message });
   }
 
-  // Anti-replay
+  try {
+    const db        = require('../config/firebase');
+    const querySnap = await db.collection('leekpay_payments')
+      .where('checkoutId', '==', key)
+      .limit(1)
+      .get();
+    if (!querySnap.empty) {
+      const doc = querySnap.docs[0];
+      return { id: doc.id, ...(doc.data() || {}) };
+    }
+  } catch (err) {
+    logger.warn('[PAYMENT] Query Firestore leekpay_payments.checkoutId impossible', { id: key, error: err.message });
+  }
+
+  return null;
+}
+
+/**
+ * Identifie l'utilisateur à créditer CÔTÉ SERVEUR.
+ * L'enregistrement Firestore créé par createPayment() fait foi ;
+ * le userId fourni par le client/webhook n'est qu'un indice.
+ */
+async function resolvePaymentUser({ checkoutId, orderId, claimedUserId, providerMetadataUserId, storedPayment = undefined }) {
+  const stored = storedPayment !== undefined
+    ? storedPayment
+    : ((await findStoredPayment(checkoutId)) || (await findStoredPayment(orderId)) || null);
+  const storedUserId = stored?.userId || null;
+
+  if (storedUserId && claimedUserId && claimedUserId !== storedUserId) {
+    logger.error('[PAYMENT_ERROR] userId du webhook différent de l\'enregistrement serveur — l\'enregistrement serveur fait foi', {
+      checkoutId, orderId, claimedUserId, storedUserId,
+    });
+  }
+
+  if (storedUserId && providerMetadataUserId && providerMetadataUserId !== storedUserId) {
+    logger.error('[PAYMENT_ERROR] userId métadonnées fournisseur différent de l\'enregistrement serveur — l\'enregistrement serveur fait foi', {
+      checkoutId, orderId, providerMetadataUserId, storedUserId,
+    });
+  }
+
+  const userId = storedUserId || providerMetadataUserId || claimedUserId || null;
+
+  return {
+    userId,
+    source          : storedUserId ? 'firestore' : (providerMetadataUserId ? 'provider_metadata' : 'payload'),
+    expectedAmount  : stored?.amount   || null,
+    expectedCurrency: stored?.currency || null,
+    stored,
+  };
+}
+
+/**
+ * Vérification autoritative du paiement.
+ *  - signature HMAC valide  → payload authentique (accepté)
+ *  - sinon                  → confirmation du statut + du montant auprès de l'API SaaSPay
+ * @returns {Promise<{verified:boolean, via:string, reason:string|null, amount:number, currency:string,
+ *                    metadataUserId:string|null, paymentMethod:string|null}>}
+ */
+async function verifyPaymentWithProvider({ checkoutId, expectedAmount, expectedCurrency, signatureValid }) {
+  if (!checkoutId) {
+    return { verified: false, via: 'none', reason: 'NO_CHECKOUT_ID', amount: 0, currency: null, metadataUserId: null };
+  }
+
+  if (signatureValid === true) {
+    logger.info('[PAYMENT_VERIFY] Signature webhook valide — payload authentifié', { checkoutId });
+    return { verified: true, via: 'signature', reason: null, amount: Number(expectedAmount) || 0, currency: expectedCurrency || null, metadataUserId: null };
+  }
+
+  const configured = typeof leekpay.isConfigured === 'function' ? leekpay.isConfigured() : false;
+  if (!configured) {
+    logger.error('[PAYMENT_ERROR] Fournisseur non configuré — vérification serveur impossible', { checkoutId });
+    return { verified: false, via: 'none', reason: 'PROVIDER_NOT_CONFIGURED', amount: 0, currency: null, metadataUserId: null };
+  }
+
+  try {
+    const statusData = await leekpay.getCheckoutStatus(checkoutId);
+    const isPaid     = statusData.isPaid === true || String(statusData.status || '').toLowerCase() === 'paid';
+    const amount     = Number(statusData.amount) || 0;
+    const currency   = statusData.currency ? String(statusData.currency).toUpperCase() : null;
+    const expected   = Number(expectedAmount) || 0;
+
+    const amountOk   = !expected || !amount || amount >= expected;   // tolérance : frais éventuels
+    const currencyOk = !expectedCurrency || !currency || currency === String(expectedCurrency).toUpperCase();
+    const verified   = isPaid && amountOk && currencyOk;
+
+    const reason = verified ? null
+                 : (!isPaid ? 'PROVIDER_NOT_PAID'
+                 : (!amountOk ? 'PROVIDER_AMOUNT_MISMATCH' : 'PROVIDER_CURRENCY_MISMATCH'));
+
+    logger.info('[PAYMENT_VERIFY] Confirmation fournisseur', {
+      checkoutId,
+      status  : statusData.status,
+      isPaid,
+      amount,
+      currency,
+      expectedAmount : expected,
+      expectedCurrency,
+      amountOk,
+      currencyOk,
+      verified,
+      reason,
+    });
+
+    return {
+      verified,
+      via            : 'provider',
+      reason,
+      amount,
+      currency,
+      metadataUserId : statusData.metadata?.userId || null,
+      paymentMethod  : statusData.paymentMethod || null,
+    };
+
+  } catch (err) {
+    logger.error('[PAYMENT_ERROR] Vérification fournisseur impossible', { checkoutId, error: err.message });
+    return { verified: false, via: 'provider', reason: 'PROVIDER_ERROR', amount: 0, currency: null, metadataUserId: null };
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ACTION 2bis — Traitement d'un paiement confirmé
+   ═══════════════════════════════════════════════════════════════
+   Le backend reste SEUL juge :
+     1. enregistrement du paiement (traçabilité)
+     2. identification serveur de l'utilisateur
+     3. vérification signature HMAC OU confirmation fournisseur
+     4. contrôle du montant / de la devise
+     5. activation Premium (une seule fois — idempotence)
+══════════════════════════════════════════════════════════════════ */
+async function handleSuccessfulPayment({
+  checkoutId,
+  transactionId,
+  userId,
+  orderId,
+  amount,
+  currency,
+  paymentMethod,
+  paidAt,
+  customer,
+  signatureValid = null,
+  source         = 'webhook',
+}) {
+  logger.info('[PAYMENT] Paiement confirmé (paid) — traitement', {
+    checkoutId, transactionId, userId, orderId, amount, currency, source,
+    signatureValid,
+  });
+
+  /* ── Anti-concurrent ─────────────────────────────────────── */
+  if (checkoutId && processingPayments.has(checkoutId)) {
+    logger.info('[PAYMENT] Traitement concurrent en cours — ignoré', { checkoutId });
+    return { activated: false, reason: 'CONCURRENT' };
+  }
+
+  /* ── Anti-replay / idempotence ───────────────────────────── */
   if (checkoutId && await isAlreadyProcessed(checkoutId)) {
-    logger.info('[LeekPay] Déjà traité (idempotence)', { checkoutId });
-    return;
+    logger.info('[PAYMENT] Paiement déjà traité (idempotence) — Premium non réactivé', { checkoutId });
+    return { activated: false, reason: 'ALREADY_PROCESSED' };
   }
 
   if (checkoutId) processingPayments.add(checkoutId);
 
   try {
+    /* 1. Enregistrement serveur déjà existant (créé par createPayment) */
+    const storedPayment = (await findStoredPayment(checkoutId)) || (await findStoredPayment(orderId)) || null;
+
+    /* Traçabilité — le paiement est enregistré même si l'activation est refusée.
+       ⚠️ `userId` n'est écrit que s'il est absent : le userId du client ne doit
+       JAMAIS écraser l'enregistrement serveur créé par createPayment(). */
     if (checkoutId) {
       await savePayment(checkoutId, {
         status          : 'paid',
         transactionId,
-        userId,
+        userId          : storedPayment?.userId || userId,
+        claimedUserId   : userId,
         orderId,
         amount,
         currency,
@@ -413,69 +604,120 @@ async function handleSuccessfulPayment({ checkoutId, transactionId, userId, orde
         customer,
         webhookReceived : new Date().toISOString(),
         premiumActivated: false,
+        activationSource: source,
       });
     }
 
-    // ── P7 FIX : userId null — fallback Firestore ────────────────────────────
-    // Si LeekPay ne retourne pas metadata.userId dans le webhook (metadata non réinjectée),
-    // on retrouve le userId via leekpay_payments/{checkoutId} ou leekpay_payments/{orderId}
-    // qui ont été sauvés lors de createPayment().
-    let resolvedUserId = userId;
-    if (!resolvedUserId && checkoutId) {
-      try {
-        const db = require('../config/firebase');
-        // Chercher par checkoutId
-        const ckSnap = await db.collection('leekpay_payments').doc(checkoutId).get();
-        if (ckSnap.exists && ckSnap.data()?.userId) {
-          resolvedUserId = ckSnap.data().userId;
-          logger.info('[LeekPay] userId récupéré via Firestore checkoutId', {
-            checkoutId, resolvedUserId,
-          });
-        }
-        // Si toujours pas trouvé, chercher par orderId
-        if (!resolvedUserId && orderId) {
-          const orSnap = await db.collection('leekpay_payments').doc(orderId).get();
-          if (orSnap.exists && orSnap.data()?.userId) {
-            resolvedUserId = orSnap.data().userId;
-            logger.info('[LeekPay] userId récupéré via Firestore orderId', {
-              orderId, resolvedUserId,
-            });
-          }
-        }
-        // Dernier recours : query par checkoutId (si doc est stocké sous un autre format)
-        if (!resolvedUserId) {
-          const querySnap = await db.collection('leekpay_payments')
-            .where('checkoutId', '==', checkoutId)
-            .limit(1)
-            .get();
-          if (!querySnap.empty && querySnap.docs[0].data()?.userId) {
-            resolvedUserId = querySnap.docs[0].data().userId;
-            logger.info('[LeekPay] userId récupéré via Firestore query checkoutId', {
-              checkoutId, resolvedUserId,
-            });
-          }
-        }
-      } catch (lookupErr) {
-        logger.warn('[LeekPay] Erreur lookup userId Firestore', { error: lookupErr.message, checkoutId });
-      }
-    }
+    /* 2. Vérification autoritative (signature OU fournisseur) */
+    const preVerification = await verifyPaymentWithProvider({
+      checkoutId,
+      expectedAmount  : null,
+      expectedCurrency: null,
+      signatureValid,
+    });
 
-    if (!resolvedUserId) {
-      logger.error('[LeekPay] ⚠️ CRITIQUE : userId introuvable — activation premium IMPOSSIBLE', {
+    /* 3. Identification serveur de l'utilisateur
+          (ordre : enregistrement serveur > métadonnées fournisseur > valeur annoncée) */
+    const identity = await resolvePaymentUser({
+      checkoutId,
+      orderId,
+      claimedUserId          : userId,
+      providerMetadataUserId : preVerification.metadataUserId,
+      storedPayment,
+    });
+
+    if (!identity.userId) {
+      logger.error('[PAYMENT_ERROR] userId introuvable — activation Premium impossible', {
         checkoutId,
         orderId,
-        hint: '1) Vérifier metadata.userId dans createPayment() createCheckout() call. ' +
-              '2) Vérifier que leekpay_payments/{checkoutId} contient userId. ' +
-              '3) Vérifier que LeekPay réinjecte bien metadata dans le webhook.',
+        source,
+        hint: 'Vérifier leekpay_payments/{checkoutId}.userId (écrit par createPayment) et metadata.userId renvoyé par le fournisseur.',
       });
-      return;
+      if (checkoutId) {
+        await savePayment(checkoutId, { premiumActivated: false, activationError: 'USER_ID_NOT_FOUND' });
+      }
+      return { activated: false, reason: 'USER_ID_NOT_FOUND' };
     }
 
-    // Utiliser le userId résolu (depuis metadata OU depuis Firestore fallback)
-    const userId = resolvedUserId;
+    /* Un paiement déclenché par le client (poll) sans enregistrement serveur
+       ni métadonnées fournisseur ne peut pas être attribué de façon fiable. */
+    if (identity.source === 'payload' && source === 'poll') {
+      logger.error('[PAYMENT_ERROR] Paiement non attribuable (aucun enregistrement serveur) — activation refusée', {
+        checkoutId, claimedUserId: userId, source,
+      });
+      if (checkoutId) {
+        await savePayment(checkoutId, { premiumActivated: false, activationError: 'UNATTRIBUTABLE_PAYMENT' });
+      }
+      return { activated: false, reason: 'UNATTRIBUTABLE_PAYMENT' };
+    }
 
-    await activatePremiumFirestore(userId, {
-      checkoutId, transactionId, amount, currency, paymentMethod, paidAt,
+    /* 4. Vérification autoritative avec le montant attendu côté serveur */
+    const expectedAmount   = Number(identity.expectedAmount)   || leekpay.PREMIUM_AMOUNT;
+    const expectedCurrency = String(identity.expectedCurrency || leekpay.PREMIUM_CURRENCY).toUpperCase();
+
+    const verification = signatureValid === true
+      ? { ...preVerification, verified: true }
+      : await verifyPaymentWithProvider({
+          checkoutId,
+          expectedAmount,
+          expectedCurrency,
+          signatureValid: false,
+        });
+
+    /* 5. Contrôle du montant / devise annoncés (le backend reste seul juge) */
+    const claimedAmount   = Number(amount) || 0;
+    const claimedCurrency = String(currency || expectedCurrency).toUpperCase();
+
+    if (claimedAmount && claimedAmount < expectedAmount) {
+      logger.error('[PAYMENT_ERROR] Montant annoncé inférieur au montant attendu — activation refusée', {
+        checkoutId, claimedAmount, expectedAmount,
+      });
+      if (checkoutId) {
+        await savePayment(checkoutId, { premiumActivated: false, activationError: 'AMOUNT_TOO_LOW' });
+      }
+      return { activated: false, reason: 'AMOUNT_TOO_LOW' };
+    }
+
+    if (claimedCurrency && expectedCurrency && claimedCurrency !== expectedCurrency) {
+      logger.error('[PAYMENT_ERROR] Devise annoncée différente de la devise attendue — activation refusée', {
+        checkoutId, claimedCurrency, expectedCurrency,
+      });
+      if (checkoutId) {
+        await savePayment(checkoutId, { premiumActivated: false, activationError: 'CURRENCY_MISMATCH' });
+      }
+      return { activated: false, reason: 'CURRENCY_MISMATCH' };
+    }
+
+    /* 6. Confirmation finale : signature valide OU statut confirmé par le fournisseur */
+    if (verification.verified !== true) {
+      logger.error('[PAYMENT_ERROR] Paiement NON vérifié — activation Premium refusée', {
+        checkoutId,
+        orderId,
+        reason       : verification.reason,
+        signatureValid,
+        claimedUserId: userId,
+        resolvedUserId: identity.userId,
+        resolutionSource: identity.source,
+        hint: 'Aucune signature webhook valide et statut non confirmable auprès de SaaSPay. Vérifier SAASPAY_SECRET_KEY / SAASPAY_API_KEY.',
+      });
+      if (checkoutId) {
+        await savePayment(checkoutId, {
+          premiumActivated    : false,
+          activationError     : verification.reason || 'NOT_VERIFIED',
+          pendingVerification : true,
+        });
+      }
+      return { activated: false, reason: verification.reason || 'NOT_VERIFIED' };
+    }
+
+    /* 7. Activation Premium — identifiant résolu côté serveur uniquement */
+    await activatePremiumFirestore(identity.userId, {
+      checkoutId,
+      transactionId,
+      amount         : claimedAmount || expectedAmount,
+      currency       : expectedCurrency,
+      paymentMethod  : paymentMethod || verification.paymentMethod || 'saaspay',
+      paidAt,
     });
 
     if (checkoutId) {
@@ -483,19 +725,34 @@ async function handleSuccessfulPayment({ checkoutId, transactionId, userId, orde
       await savePayment(checkoutId, {
         premiumActivated: true,
         activatedAt     : new Date().toISOString(),
+        activatedUserId : identity.userId,
+        verifiedVia     : verification.via,
       });
     }
 
-    // Notifier via Socket.IO
+    /* 8. Notification temps réel */
     try {
       const { emitToUser } = require('../services/socketService');
-      emitToUser(userId, 'payment:success', {
-        checkoutId, transactionId, amount, currency, premium: true,
-        activatedAt: new Date().toISOString(),
+      emitToUser(identity.userId, 'payment:success', {
+        checkoutId, transactionId, amount: claimedAmount || expectedAmount, currency: expectedCurrency,
+        premium: true, activatedAt: new Date().toISOString(),
       });
     } catch (_) {}
 
-    logger.info('[LeekPay] Activation terminée ✅', { userId, checkoutId });
+    logger.info('[PAYMENT_PREMIUM] Activation terminée', {
+      userId: identity.userId,
+      checkoutId,
+      verifiedVia      : verification.via,
+      resolutionSource : identity.source,
+    });
+
+    return { activated: true, userId: identity.userId, verifiedVia: verification.via };
+
+  } catch (err) {
+    logger.error('[PAYMENT_ERROR] Erreur traitement paiement', {
+      checkoutId, orderId, error: err.message,
+    });
+    return { activated: false, reason: 'INTERNAL_ERROR' };
 
   } finally {
     if (checkoutId) processingPayments.delete(checkoutId);
@@ -535,7 +792,7 @@ async function getPaymentStatus(req, res) {
       });
     }
   } catch (err) {
-    logger.warn('[LeekPay] Firestore indisponible pour statut', { error: err.message, transactionId: cleanId });
+    logger.warn('[SaaSPay] Firestore indisponible pour statut', { error: err.message, transactionId: cleanId });
   }
 
   // 2. Appeler GET /api/v1/checkout/:id
@@ -602,7 +859,7 @@ async function getUserPremiumStatus(req, res) {
     });
 
   } catch (err) {
-    logger.error('[LeekPay] Erreur statut premium', { userId, error: err.message });
+    logger.error('[SaaSPay] Erreur statut premium', { userId, error: err.message });
     return res.status(200).json({
       success: true, userId, premium: false, isSubscribed: false, source: 'error',
     });
@@ -622,40 +879,65 @@ async function pollPayment(req, res) {
   }
 
   if (!leekpay.isConfigured()) {
-    return res.status(503).json({ success: false, error: 'LeekPay non configuré.' });
+    return res.status(503).json({ success: false, error: 'SaaSPay non configuré.' });
   }
 
   try {
     const statusData = await leekpay.getCheckoutStatus(checkoutId);
     const isPaid     = statusData.isPaid || statusData.status === 'paid';
 
-    if (isPaid && userId) {
-      const alreadyDone = await isAlreadyProcessed(checkoutId);
-      if (!alreadyDone) {
-        await handleSuccessfulPayment({
-          checkoutId,
-          transactionId: statusData.checkoutId,
-          userId,
-          orderId      : null,
-          amount       : statusData.amount,
-          currency     : statusData.currency,
-          paymentMethod: statusData.paymentMethod,
-          paidAt       : statusData.paidAt,
-          customer     : statusData.customer || {},
-        });
+    let activation = null;
+
+    if (isPaid) {
+      // ⚠️ Le userId envoyé par le client n'est qu'un INDICE :
+      // l'utilisateur à créditer est résolu côté serveur
+      // (enregistrement leekpay_payments créé par createPayment()).
+      activation = await handleSuccessfulPayment({
+        checkoutId,
+        transactionId: statusData.checkoutId,
+        userId,
+        orderId      : null,
+        amount       : statusData.amount,
+        currency     : statusData.currency,
+        paymentMethod: statusData.paymentMethod,
+        paidAt       : statusData.paidAt,
+        customer     : statusData.customer || {},
+        signatureValid: null,
+        source       : 'poll',
+      });
+    }
+
+    /* Statut Premium RÉEL de l'utilisateur qui interroge (source : Firestore).
+       `premium` conserve son sens historique (« le paiement est payé ») tandis
+       que `callerPremium` reflète l'état réel du compte. */
+    let callerPremium = false;
+    if (userId) {
+      try {
+        const db   = require('../config/firebase');
+        const snap = await db.collection('users').doc(userId).get();
+        if (snap.exists) {
+          const data = snap.data() || {};
+          callerPremium = data.isSubscribed === true || data.premium === true;
+        }
+      } catch (err) {
+        logger.warn('[PAYMENT] Lecture statut Premium appelant impossible', { userId, error: err.message });
       }
     }
 
     return res.status(200).json({
-      success : true,
-      status  : statusData.status,
+      success        : true,
+      status         : statusData.status,
       isPaid,
-      premium : isPaid,
+      premium        : isPaid,
+      callerPremium,
       checkoutId,
+      activatedUserId: activation?.userId || null,
+      activationState: activation?.activated === true ? 'activated'
+                     : (activation?.reason || null),
     });
 
   } catch (err) {
-    logger.error('[LeekPay] Erreur poll payment', { checkoutId, error: err.message });
+    logger.error('[SaaSPay] Erreur poll payment', { checkoutId, error: err.message });
     return res.status(500).json({ success: false, error: err.message });
   }
 }
