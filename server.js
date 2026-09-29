@@ -214,8 +214,8 @@ app.get('/health', (_req, res) => {
     infobipDetails,
     queue   : queueStatus,
     routes  : {
-      auth          : ['POST /api/auth/register', 'POST /api/auth/login', 'POST /api/auth/google', 'GET /api/auth/me'],
-      contacts      : ['POST /api/contacts/sync', 'POST /api/contacts/add', 'GET /api/contacts', 'DELETE /api/contacts/:phone', 'GET /api/contacts/check/:phone'],
+      auth          : ['POST /api/auth/register', 'POST /api/auth/login', 'POST /api/auth/google', 'GET /api/auth/google', 'GET /api/auth/google/callback', 'POST /api/auth/google/exchange', 'POST /api/auth/google/contacts/authorize', 'GET /api/auth/google/contacts/callback', 'GET /api/auth/me'],
+      contacts      : ['POST /api/contacts/sync', 'POST /api/contacts/google/import', 'POST /api/contacts/add', 'GET /api/contacts', 'DELETE /api/contacts/:phone', 'GET /api/contacts/check/:phone'],
       messages      : [
         'GET  /api/messages                     → liste conversations (paginé)',
         'GET  /api/messages/:conversationId      → historique conversation',
@@ -252,6 +252,7 @@ app.get('/health', (_req, res) => {
 
 /* ── Route imports ───────────────────────────────────────── */
 const authRoutes         = require('./routes/auth');
+const googleAuthRoutes   = require('./routes/auth.google');
 // OTP routes supprimées — inscription directe sans OTP
 const leekPayRoutes      = require('./routes/payment.leekpay');   // backward compat
 const saasPayRoutes      = require('./routes/payment.saaspay');   // SaaSPay (nouveau)
@@ -286,6 +287,7 @@ function loadOptional(routePath, mount) {
 }
 
 /* ── Auth ────────────────────────────────────────────────── */
+app.use('/api/auth', authLimiter, requireJson, googleAuthRoutes);
 app.use('/api/auth', authLimiter, requireJson, authRoutes);
 app.use('/auth',     authLimiter, requireJson, authRoutes);  // retrocompat
 

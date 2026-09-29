@@ -26,6 +26,7 @@ const firebaseAuth  = require('../middleware/firebaseAuth');
 const { normalizePhone, normalizePhoneBatch, isValidPhone } = require('../services/phoneNormalizer');
 const { logger }    = require('../middleware/logger');
 const { resolveUserByPhone, phoneVariants } = require('../services/userResolver');
+const { importGoogleContacts } = require('../controllers/googleContactsController');
 
 /* ── Auth middleware — accepte Firebase ou JWT ────────────── */
 // Utilise firebaseAuth si Firebase configuré, sinon JWT
@@ -52,6 +53,12 @@ function getDb() {
     return db;
   } catch (_) { return null; }
 }
+
+/* ─────────────────────────────────────────────────────────────
+   POST /api/contacts/google/import
+   Récupérer les contacts du compte Google autorisé côté backend.
+   ─────────────────────────────────────────────────────────── */
+router.post('/google/import', auth, importGoogleContacts);
 
 /* ─────────────────────────────────────────────────────────────
    POST /api/contacts/sync

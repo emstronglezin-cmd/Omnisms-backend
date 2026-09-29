@@ -58,6 +58,20 @@ services:
       - key: JWT_SECRET
         sync: false     # Secret JWT long et aléatoire (min 32 chars)
 
+      # ── Google OAuth (Google Cloud Console → OAuth client Web) ──
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://omnisms-backend.onrender.com/api/auth/google/callback
+      - key: GOOGLE_FLUTTER_REDIRECT_URI
+        value: omnisms://auth/google/callback
+      - key: GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI
+        value: omnisms://auth/google/contacts/callback
+      - key: GOOGLE_TOKEN_ENCRYPTION_KEY
+        sync: false     # openssl rand -base64 32
+
       - key: ADMIN_KEY
         sync: false     # Clé admin secrète
 
