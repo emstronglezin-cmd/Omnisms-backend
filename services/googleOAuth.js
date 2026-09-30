@@ -20,21 +20,23 @@ function getConfig() {
     clientId: (process.env.GOOGLE_CLIENT_ID || '').trim(),
     clientSecret: (process.env.GOOGLE_CLIENT_SECRET || '').trim(),
     redirectUri: (process.env.GOOGLE_REDIRECT_URI || '').trim(),
+    contactsRedirectUri: (process.env.GOOGLE_CONTACTS_REDIRECT_URI || '').trim(),
     flutterRedirectUri: (process.env.GOOGLE_FLUTTER_REDIRECT_URI || DEFAULT_FLUTTER_REDIRECT).trim(),
   };
 }
 
 function isConfigured() {
   const c = getConfig();
-  return !!(c.clientId && c.clientSecret && c.redirectUri && c.flutterRedirectUri);
+  return !!(c.clientId && c.clientSecret && c.redirectUri && c.contactsRedirectUri && c.flutterRedirectUri);
 }
 
-function createOAuthClient() {
+function createOAuthClient(contacts = false) {
   const c = getConfig();
-  if (!c.clientId || !c.clientSecret || !c.redirectUri) {
+  const redirectUri = contacts ? c.contactsRedirectUri : c.redirectUri;
+  if (!c.clientId || !c.clientSecret || !redirectUri) {
     throw Object.assign(new Error('Google OAuth is not configured.'), { code: 'GOOGLE_NOT_CONFIGURED' });
   }
-  return new OAuth2Client(c.clientId, c.clientSecret, c.redirectUri);
+  return new OAuth2Client(c.clientId, c.clientSecret, redirectUri);
 }
 
 function safeAppRedirect(purpose = 'login') {
@@ -93,7 +95,7 @@ async function consumeState(state, expectedPurpose) {
 }
 
 function authorizationUrl(state, { contacts = false } = {}) {
-  const client = createOAuthClient();
+  const client = createOAuthClient(contacts);
   const params = {
     access_type: contacts ? 'offline' : 'online',
     include_granted_scopes: contacts ? 'true' : 'false',
@@ -105,11 +107,11 @@ function authorizationUrl(state, { contacts = false } = {}) {
   return client.generateAuthUrl(params);
 }
 
-async function exchangeAndVerify(code) {
+async function exchangeAndVerify(code, { contacts = false } = {}) {
   if (!code || typeof code !== 'string' || code.length > 4096) {
     throw Object.assign(new Error('Google authorization code is missing or invalid.'), { code: 'GOOGLE_CODE_INVALID' });
   }
-  const client = createOAuthClient();
+  const client = createOAuthClient(contacts);
   const { tokens } = await client.getToken(code);
   if (!tokens.id_token) {
     throw Object.assign(new Error('Google did not return an identity token.'), { code: 'GOOGLE_IDENTITY_MISSING' });

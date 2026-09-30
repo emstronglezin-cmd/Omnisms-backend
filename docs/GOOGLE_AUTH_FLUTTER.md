@@ -97,6 +97,7 @@ Errors are JSON with stable `code`: `NO_TOKEN`/`INVALID_TOKEN` (401), `GOOGLE_CO
 - `GOOGLE_CLIENT_ID` — Google OAuth **Web application** client ID.
 - `GOOGLE_CLIENT_SECRET` — its secret; keep only in Render secrets.
 - `GOOGLE_REDIRECT_URI` — exactly `https://omnisms-backend.onrender.com/api/auth/google/callback` and registered in Google Cloud Console.
+- `GOOGLE_CONTACTS_REDIRECT_URI` — exactly `https://omnisms-backend.onrender.com/api/auth/google/contacts/callback` and registered in Google Cloud Console.
 - `GOOGLE_FLUTTER_REDIRECT_URI` — default `omnisms://auth/google/callback`.
 - `GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI` — default `omnisms://auth/google/contacts/callback`.
 - `GOOGLE_TOKEN_ENCRYPTION_KEY` — 32 random bytes in base64 or 64-character hex. Generate with `openssl rand -base64 32`. Keep the same key across deployments; rotating it invalidates stored Google Contacts grants.
@@ -107,7 +108,16 @@ See `GOOGLE_CLIENT_ID`, etc. in Render Environment and `.env.example`. Credentia
 
 1. Create/select a Google Cloud project and configure the OAuth consent screen, authorized app audience, branding and support email.
 2. Enable **People API**.
-3. Create an OAuth client of type **Web application**. Add the exact authorized redirect URI above. Add the production app/backend domains to authorized domains as required by the consent-screen configuration.
+3. Create an OAuth client of type **Web application**. Add both exact backend redirect URIs listed below under **Authorized redirect URIs**. This implementation does not use the Google JavaScript SDK, so **Authorized JavaScript origins can remain empty**; only add a browser origin there if a separate web frontend later calls Google directly from JavaScript. Add the production app/backend domains to authorized domains as required by the consent-screen configuration.
+Authorized redirect URIs:
+
+```text
+https://omnisms-backend.onrender.com/api/auth/google/callback
+https://omnisms-backend.onrender.com/api/auth/google/contacts/callback
+```
+
+For **Authorized JavaScript origins**, leave the field empty for the Flutter/backend-server OAuth flow documented here. Do not enter the Flutter custom scheme (`omnisms://`) as an origin or redirect URI; it is only the app return link after the backend callback.
+
 4. Request only `openid`, `email`, `profile` at login. Request `https://www.googleapis.com/auth/contacts.readonly` only in the separate contacts flow. If Google requires verification for this scope/audience, complete that verification before production use.
 5. Add the client ID/secret and encryption key to Render, then deploy.
 

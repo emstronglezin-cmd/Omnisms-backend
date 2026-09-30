@@ -63,6 +63,17 @@ const google = require('../services/googleOAuth');
 
 (async () => {
   process.env.GOOGLE_TOKEN_ENCRYPTION_KEY = crypto.randomBytes(32).toString('base64');
+  process.env.GOOGLE_CLIENT_ID = 'client-id.apps.googleusercontent.com';
+  process.env.GOOGLE_CLIENT_SECRET = 'test-client-secret';
+  process.env.GOOGLE_REDIRECT_URI = 'https://backend.example/api/auth/google/callback';
+  process.env.GOOGLE_CONTACTS_REDIRECT_URI = 'https://backend.example/api/auth/google/contacts/callback';
+  assert.equal(google.isConfigured(), true);
+  const loginRedirect = new URL(google.authorizationUrl('random-state'));
+  const contactsRedirect = new URL(google.authorizationUrl('random-state', { contacts: true }));
+  assert.equal(loginRedirect.searchParams.get('redirect_uri'), process.env.GOOGLE_REDIRECT_URI);
+  assert.equal(contactsRedirect.searchParams.get('redirect_uri'), process.env.GOOGLE_CONTACTS_REDIRECT_URI);
+  assert.equal(contactsRedirect.searchParams.get('scope').includes(google.CONTACTS_SCOPE), true);
+
   const encrypted = google.encryptRefreshToken('refresh-token-test');
   assert.equal(google.decryptRefreshToken(encrypted), 'refresh-token-test');
   assert.throws(() => google.decryptRefreshToken(`${encrypted.slice(0, -1)}x`), { code: 'GOOGLE_TOKEN_EXPIRED' });
@@ -101,5 +112,5 @@ const google = require('../services/googleOAuth');
   });
   assert.equal(coll('users').size, 2, 'repeated login must not create a duplicate');
 
-  console.log('Google OAuth unit checks: 14 PASS / 0 FAIL');
+  console.log('Google OAuth unit checks: 18 PASS / 0 FAIL');
 })().catch(err => { console.error(err); process.exitCode = 1; });

@@ -113,7 +113,7 @@ async function finishContacts(req, res) {
       return res.redirect(302, google.appendAppParams({ error: 'GOOGLE_OAUTH_DENIED' }, 'contacts'));
     }
 
-    const { profile, tokens } = await google.exchangeAndVerify(req.query.code);
+    const { profile, tokens } = await google.exchangeAndVerify(req.query.code, { contacts: true });
     const db = google.getDb();
     const userRef = db.collection('users').doc(stateData.userId);
     const userSnap = await userRef.get();
