@@ -29,6 +29,16 @@ function publicOAuthError(code) {
   return safeCodes.has(code) ? code : 'GOOGLE_AUTH_FAILED';
 }
 
+/** Safe trace of a redirect target: scheme, host and path only — never the query string (code/error params). */
+function redirectDestination(target) {
+  try {
+    const u = new URL(target);
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch (_) {
+    return 'UNPARSABLE';
+  }
+}
+
 async function startLogin(_req, res) {
   if (!google.isConfigured()) return unavailable(res);
   try {
@@ -50,18 +60,29 @@ async function finishLogin(req, res) {
     stateData = await google.consumeState(req.query.state, 'login');
     if (!stateData) return res.status(400).json({ success: false, error: 'État OAuth invalide ou expiré.', code: 'GOOGLE_STATE_INVALID' });
     if (req.query.error) {
-      return res.redirect(302, google.appendAppParams({ error: 'GOOGLE_OAUTH_DENIED' }));
+      const target = google.appendAppParams({ error: 'GOOGLE_OAUTH_DENIED' });
+      logger.info('[Google OAuth] User denied consent; redirecting to app', { event: 'APP_REDIRECT_TARGET', destination: redirectDestination(target) });
+      return res.redirect(302, target);
     }
 
     const { profile } = await google.exchangeAndVerify(req.query.code);
     const account = await google.findOrCreateOmniUser(profile);
     const code = await google.createLoginExchange(account.id);
-    logger.info('[Google OAuth] Login completed; app exchange code issued', { event: 'APP_EXCHANGE_CODE_ISSUED', uid: account.id });
-    return res.redirect(302, google.appendAppParams({ code }));
+    const target = google.appendAppParams({ code });
+    logger.info('[Google OAuth] Login completed; app exchange code issued', {
+      event: 'APP_EXCHANGE_CODE_ISSUED',
+      uid: account.id,
+      destination: redirectDestination(target),
+    });
+    return res.redirect(302, target);
   } catch (err) {
     const errorCode = publicOAuthError(err.code);
     logger.warn('[Google OAuth] Login callback failed', { code: err.code || 'INTERNAL' });
-    if (stateData) return res.redirect(302, google.appendAppParams({ error: errorCode }));
+    if (stateData) {
+      const target = google.appendAppParams({ error: errorCode });
+      logger.warn('[Google OAuth] Redirecting error to app', { event: 'APP_REDIRECT_TARGET', destination: redirectDestination(target), reason: errorCode });
+      return res.redirect(302, target);
+    }
     return res.status(400).json({ success: false, error: 'Réponse Google invalide.', code: errorCode });
   }
 }
@@ -124,7 +145,9 @@ async function finishContacts(req, res) {
     stateData = await google.consumeState(req.query.state, 'contacts');
     if (!stateData) return res.status(400).json({ success: false, error: 'État OAuth invalide ou expiré.', code: 'GOOGLE_STATE_INVALID' });
     if (req.query.error) {
-      return res.redirect(302, google.appendAppParams({ error: 'GOOGLE_OAUTH_DENIED' }, 'contacts'));
+      const target = google.appendAppParams({ error: 'GOOGLE_OAUTH_DENIED' }, 'contacts');
+      logger.info('[Google Contacts] User denied consent; redirecting to app', { event: 'APP_REDIRECT_TARGET', destination: redirectDestination(target) });
+      return res.redirect(302, target);
     }
 
     const { profile, tokens } = await google.exchangeAndVerify(req.query.code, { contacts: true });
@@ -139,12 +162,21 @@ async function finishContacts(req, res) {
       return res.redirect(302, google.appendAppParams({ error: 'GOOGLE_CONTACTS_ACCOUNT_MISMATCH' }, 'contacts'));
     }
     await google.saveContactsCredential(stateData.userId, profile, tokens.refresh_token);
-    logger.info('[Google Contacts] Authorization stored', { uid: stateData.userId });
-    return res.redirect(302, google.appendAppParams({ authorized: '1' }, 'contacts'));
+    const target = google.appendAppParams({ authorized: '1' }, 'contacts');
+    logger.info('[Google Contacts] Authorization stored; redirecting to app', {
+      event: 'APP_REDIRECT_TARGET',
+      uid: stateData.userId,
+      destination: redirectDestination(target),
+    });
+    return res.redirect(302, target);
   } catch (err) {
     const errorCode = publicOAuthError(err.code === 'GOOGLE_ENCRYPTION_NOT_CONFIGURED' ? err.code : 'GOOGLE_CONTACTS_AUTH_FAILED');
     logger.warn('[Google Contacts] OAuth callback failed', { code: err.code || 'INTERNAL', uid: stateData && stateData.userId });
-    if (stateData) return res.redirect(302, google.appendAppParams({ error: errorCode }, 'contacts'));
+    if (stateData) {
+      const target = google.appendAppParams({ error: errorCode }, 'contacts');
+      logger.warn('[Google Contacts] Redirecting error to app', { event: 'APP_REDIRECT_TARGET', destination: redirectDestination(target), reason: errorCode });
+      return res.redirect(302, target);
+    }
     return res.status(400).json({ success: false, error: 'Réponse Google Contacts invalide.', code: 'GOOGLE_STATE_INVALID' });
   }
 }
