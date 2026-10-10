@@ -71,6 +71,11 @@ services:
         value: omnisms://auth/google/callback
       - key: GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI
         value: omnisms://auth/google/contacts/callback
+      # Optional: HTTPS return URL of the web frontend callback page (target=web flow).
+      - key: GOOGLE_FLUTTER_REDIRECT_URI_WEB
+        sync: false     # ex. https://omnisms.netlify.app/<route callback Google du frontend>
+      - key: GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI_WEB
+        sync: false     # même page callback que le login, ou une route dédiée
       - key: GOOGLE_TOKEN_ENCRYPTION_KEY
         sync: false     # openssl rand -base64 32
 

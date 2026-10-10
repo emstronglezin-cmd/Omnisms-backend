@@ -25,8 +25,14 @@ function publicOAuthError(code) {
     'GOOGLE_IDENTITY_MISSING', 'GOOGLE_IDENTITY_CONFLICT', 'GOOGLE_AUTH_FAILED',
     'GOOGLE_CONTACTS_AUTH_FAILED', 'GOOGLE_CONTACTS_ACCOUNT_MISMATCH',
     'GOOGLE_REFRESH_TOKEN_MISSING', 'GOOGLE_ENCRYPTION_NOT_CONFIGURED',
+    'GOOGLE_WEB_REDIRECT_NOT_CONFIGURED', 'GOOGLE_REDIRECT_MISCONFIGURED',
   ]);
   return safeCodes.has(code) ? code : 'GOOGLE_AUTH_FAILED';
+}
+
+/** Returns 'web' only for ?target=web; every other value keeps the legacy app deep link. */
+function requestedVariant(req) {
+  return req.query.target === 'web' ? 'web' : 'app';
 }
 
 /** Safe trace of a redirect target: scheme, host and path only — never the query string (code/error params). */
@@ -39,12 +45,18 @@ function redirectDestination(target) {
   }
 }
 
-async function startLogin(_req, res) {
+async function startLogin(req, res) {
   if (!google.isConfigured()) return unavailable(res);
+  const variant = requestedVariant(req);
   try {
-    const state = await google.createState('login');
+    if (variant === 'web') google.safeAppRedirect('login', 'web'); // fail-fast if the web redirect is not configured
+    const state = await google.createState('login', null, variant);
     return res.redirect(302, google.authorizationUrl(state));
   } catch (err) {
+    if (err.code === 'GOOGLE_WEB_REDIRECT_NOT_CONFIGURED' || err.code === 'GOOGLE_REDIRECT_MISCONFIGURED') {
+      logger.error('[Google OAuth] Web redirect unavailable', { event: 'APP_EXCHANGE_FAILED', code: err.code });
+      return res.status(503).json({ success: false, error: 'Retour web Google non configuré côté serveur.', code: err.code });
+    }
     logger.error('[Google OAuth] Failed to start login', { code: err.code || 'INTERNAL' });
     return res.status(err.code === 'GOOGLE_NOT_CONFIGURED' ? 503 : 500).json({
       success: false,
@@ -59,8 +71,9 @@ async function finishLogin(req, res) {
   try {
     stateData = await google.consumeState(req.query.state, 'login');
     if (!stateData) return res.status(400).json({ success: false, error: 'État OAuth invalide ou expiré.', code: 'GOOGLE_STATE_INVALID' });
+    const variant = stateData.returnTarget === 'web' ? 'web' : 'app';
     if (req.query.error) {
-      const target = google.appendAppParams({ error: 'GOOGLE_OAUTH_DENIED' });
+      const target = google.appendAppParams({ error: 'GOOGLE_OAUTH_DENIED' }, 'login', variant);
       logger.info('[Google OAuth] User denied consent; redirecting to app', { event: 'APP_REDIRECT_TARGET', destination: redirectDestination(target) });
       return res.redirect(302, target);
     }
@@ -68,7 +81,7 @@ async function finishLogin(req, res) {
     const { profile } = await google.exchangeAndVerify(req.query.code);
     const account = await google.findOrCreateOmniUser(profile);
     const code = await google.createLoginExchange(account.id);
-    const target = google.appendAppParams({ code });
+    const target = google.appendAppParams({ code }, 'login', variant);
     logger.info('[Google OAuth] Login completed; app exchange code issued', {
       event: 'APP_EXCHANGE_CODE_ISSUED',
       uid: account.id,
@@ -79,7 +92,13 @@ async function finishLogin(req, res) {
     const errorCode = publicOAuthError(err.code);
     logger.warn('[Google OAuth] Login callback failed', { code: err.code || 'INTERNAL' });
     if (stateData) {
-      const target = google.appendAppParams({ error: errorCode });
+      // Same variant as the request; fall back to the app deep link if the web target is misconfigured.
+      let target;
+      try {
+        target = google.appendAppParams({ error: errorCode }, 'login', stateData.returnTarget === 'web' ? 'web' : 'app');
+      } catch (_) {
+        target = google.appendAppParams({ error: errorCode }, 'login', 'app');
+      }
       logger.warn('[Google OAuth] Redirecting error to app', { event: 'APP_REDIRECT_TARGET', destination: redirectDestination(target), reason: errorCode });
       return res.redirect(302, target);
     }
@@ -119,17 +138,23 @@ async function authorizeContacts(req, res) {
   if (!google.isConfigured()) return unavailable(res);
   const uid = req.user && (req.user.uid || req.user.userId || req.user.sub);
   if (!uid) return res.status(401).json({ success: false, error: 'Session OmniSMS invalide.', code: 'INVALID_SESSION' });
+  const variant = requestedVariant(req);
   try {
-    const state = await google.createState('contacts', uid);
+    if (variant === 'web') google.safeAppRedirect('contacts', 'web'); // fail-fast if the web redirect is not configured
+    const state = await google.createState('contacts', uid, variant);
     const url = google.authorizationUrl(state, { contacts: true });
     return res.status(200).json({
       success: true,
       authorizationRequired: true,
       authorizationUrl: url,
-      redirectUri: google.safeAppRedirect('contacts'),
+      redirectUri: google.safeAppRedirect('contacts', variant),
       scope: google.CONTACTS_SCOPE,
     });
   } catch (err) {
+    if (err.code === 'GOOGLE_WEB_REDIRECT_NOT_CONFIGURED' || err.code === 'GOOGLE_REDIRECT_MISCONFIGURED') {
+      logger.error('[Google Contacts] Web redirect unavailable', { code: err.code, uid });
+      return res.status(503).json({ success: false, error: 'Retour web Google non configuré côté serveur.', code: err.code });
+    }
     logger.error('[Google Contacts] Failed to create authorization URL', { code: err.code || 'INTERNAL', uid });
     return res.status(err.code === 'GOOGLE_NOT_CONFIGURED' ? 503 : 500).json({
       success: false,
@@ -144,8 +169,9 @@ async function finishContacts(req, res) {
   try {
     stateData = await google.consumeState(req.query.state, 'contacts');
     if (!stateData) return res.status(400).json({ success: false, error: 'État OAuth invalide ou expiré.', code: 'GOOGLE_STATE_INVALID' });
+    const variant = stateData.returnTarget === 'web' ? 'web' : 'app';
     if (req.query.error) {
-      const target = google.appendAppParams({ error: 'GOOGLE_OAUTH_DENIED' }, 'contacts');
+      const target = google.appendAppParams({ error: 'GOOGLE_OAUTH_DENIED' }, 'contacts', variant);
       logger.info('[Google Contacts] User denied consent; redirecting to app', { event: 'APP_REDIRECT_TARGET', destination: redirectDestination(target) });
       return res.redirect(302, target);
     }
@@ -155,14 +181,14 @@ async function finishContacts(req, res) {
     const userRef = db.collection('users').doc(stateData.userId);
     const userSnap = await userRef.get();
     if (!userSnap.exists) {
-      return res.redirect(302, google.appendAppParams({ error: 'GOOGLE_CONTACTS_AUTH_FAILED' }, 'contacts'));
+      return res.redirect(302, google.appendAppParams({ error: 'GOOGLE_CONTACTS_AUTH_FAILED' }, 'contacts', variant));
     }
     const user = userSnap.data();
     if (user.googleOAuthSub && user.googleOAuthSub !== profile.googleUid) {
-      return res.redirect(302, google.appendAppParams({ error: 'GOOGLE_CONTACTS_ACCOUNT_MISMATCH' }, 'contacts'));
+      return res.redirect(302, google.appendAppParams({ error: 'GOOGLE_CONTACTS_ACCOUNT_MISMATCH' }, 'contacts', variant));
     }
     await google.saveContactsCredential(stateData.userId, profile, tokens.refresh_token);
-    const target = google.appendAppParams({ authorized: '1' }, 'contacts');
+    const target = google.appendAppParams({ authorized: '1' }, 'contacts', variant);
     logger.info('[Google Contacts] Authorization stored; redirecting to app', {
       event: 'APP_REDIRECT_TARGET',
       uid: stateData.userId,
@@ -173,7 +199,13 @@ async function finishContacts(req, res) {
     const errorCode = publicOAuthError(err.code === 'GOOGLE_ENCRYPTION_NOT_CONFIGURED' ? err.code : 'GOOGLE_CONTACTS_AUTH_FAILED');
     logger.warn('[Google Contacts] OAuth callback failed', { code: err.code || 'INTERNAL', uid: stateData && stateData.userId });
     if (stateData) {
-      const target = google.appendAppParams({ error: errorCode }, 'contacts');
+      // Same variant as the request; fall back to the app deep link if the web target is misconfigured.
+      let target;
+      try {
+        target = google.appendAppParams({ error: errorCode }, 'contacts', stateData.returnTarget === 'web' ? 'web' : 'app');
+      } catch (_) {
+        target = google.appendAppParams({ error: errorCode }, 'contacts', 'app');
+      }
       logger.warn('[Google Contacts] Redirecting error to app', { event: 'APP_REDIRECT_TARGET', destination: redirectDestination(target), reason: errorCode });
       return res.redirect(302, target);
     }

@@ -39,7 +39,23 @@ function createOAuthClient(contacts = false) {
   return new OAuth2Client(c.clientId, c.clientSecret, redirectUri);
 }
 
-function safeAppRedirect(purpose = 'login') {
+function safeAppRedirect(purpose = 'login', variant = 'app') {
+  if (variant === 'web') {
+    const key = purpose === 'contacts'
+      ? 'GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI_WEB'
+      : 'GOOGLE_FLUTTER_REDIRECT_URI_WEB';
+    const target = (process.env[key] || '').trim();
+    if (!target) {
+      throw Object.assign(new Error('Web app redirect URI is not configured.'), { code: 'GOOGLE_WEB_REDIRECT_NOT_CONFIGURED' });
+    }
+    try {
+      if (new URL(target).protocol !== 'https:') throw new Error('Unsupported redirect scheme');
+      return target;
+    } catch (err) {
+      if (err.code === 'GOOGLE_WEB_REDIRECT_NOT_CONFIGURED') throw err;
+      throw Object.assign(new Error('Web app redirect URI is invalid.'), { code: 'GOOGLE_REDIRECT_MISCONFIGURED' });
+    }
+  }
   const target = purpose === 'contacts'
     ? (process.env.GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI || 'omnisms://auth/google/contacts/callback').trim()
     : getConfig().flutterRedirectUri;
@@ -52,8 +68,8 @@ function safeAppRedirect(purpose = 'login') {
   }
 }
 
-function appendAppParams(values, purpose = 'login') {
-  const target = new URL(safeAppRedirect(purpose));
+function appendAppParams(values, purpose = 'login', variant = 'app') {
+  const target = new URL(safeAppRedirect(purpose, variant));
   for (const [key, value] of Object.entries(values)) {
     if (value !== undefined && value !== null && value !== '') target.searchParams.set(key, String(value));
   }
@@ -66,13 +82,14 @@ function getDb() {
   return db;
 }
 
-async function createState(purpose, userId = null) {
+async function createState(purpose, userId = null, variant = 'app') {
   const db = getDb();
   const state = crypto.randomBytes(32).toString('base64url');
   const now = Date.now();
   await db.collection('google_oauth_states').doc(state).create({
     purpose,
     userId,
+    returnTarget: variant === 'web' ? 'web' : 'app',
     createdAtMs: now,
     expiresAtMs: now + STATE_TTL_MS,
     consumed: false,
