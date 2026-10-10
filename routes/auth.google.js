@@ -56,7 +56,7 @@ async function finishLogin(req, res) {
     const { profile } = await google.exchangeAndVerify(req.query.code);
     const account = await google.findOrCreateOmniUser(profile);
     const code = await google.createLoginExchange(account.id);
-    logger.info('[Google OAuth] Login completed; app exchange code issued', { uid: account.id });
+    logger.info('[Google OAuth] Login completed; app exchange code issued', { event: 'APP_EXCHANGE_CODE_ISSUED', uid: account.id });
     return res.redirect(302, google.appendAppParams({ code }));
   } catch (err) {
     const errorCode = publicOAuthError(err.code);
@@ -68,14 +68,28 @@ async function finishLogin(req, res) {
 
 async function exchangeLogin(req, res) {
   const code = req.body && req.body.code;
+  // Safe trace: presence/length only — the exchange code value is never logged.
+  logger.info('[Google OAuth] App exchange request received', {
+    event: 'APP_EXCHANGE_REQUEST_RECEIVED',
+    hasCode: typeof code === 'string',
+    codeLength: typeof code === 'string' ? code.length : 0,
+  });
   try {
     const session = await google.redeemLoginExchange(code);
     if (!session) {
+      logger.warn('[Google OAuth] App exchange rejected: code invalid, expired or already used', {
+        event: 'APP_EXCHANGE_FAILED',
+        reason: 'GOOGLE_EXCHANGE_CODE_INVALID',
+      });
       return res.status(401).json({ success: false, error: 'Code de connexion expiré ou déjà utilisé.', code: 'GOOGLE_EXCHANGE_CODE_INVALID' });
     }
+    logger.info('[Google OAuth] App session created (exchange validated and consumed)', {
+      event: 'APP_SESSION_CREATED',
+      uid: session.user && session.user.id,
+    });
     return res.status(200).json({ success: true, ...session });
   } catch (err) {
-    logger.error('[Google OAuth] Login exchange failed', { code: err.code || 'INTERNAL' });
+    logger.error('[Google OAuth] Login exchange failed', { event: 'APP_EXCHANGE_FAILED', code: err.code || 'INTERNAL' });
     return res.status(500).json({ success: false, error: 'Impossible de finaliser la session OmniSMS.', code: 'GOOGLE_EXCHANGE_FAILED' });
   }
 }
