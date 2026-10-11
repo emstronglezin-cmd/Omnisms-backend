@@ -665,6 +665,36 @@ async function routeMessage(opts = {}) {
 
       // Si l'envoi direct a échoué → mettre en queue pour retry
       if (smsResult && !smsResult.success) {
+        // ── Quota fournisseur épuisé (ex : INfiniReach 402) ────
+        // Un retry ne peut pas réussir tant que le forfait n'est pas rétabli :
+        // marquer 'failed' immédiatement, sans remplir la file de tentatives
+        // vouées à l'échec. Le message est préservé en Firestore.
+        const quotaExceeded = smsResult.statusCode === 402
+          || /free plan message limit|quota (exceeded|reached)|limit reached/i.test(String(smsResult.error || ''));
+        if (quotaExceeded) {
+          logger.error('[ROUTING] Provider quota exhausted — message failed without retry', {
+            to        : e164Target.replace(/\d{4}$/, '****'),
+            messageId : savedId,
+            transport,
+            statusCode: smsResult.statusCode || 402,
+            action    : 'Upgrade the SMS provider plan or wait for the monthly reset',
+          });
+          if (db && savedId && savedId !== msgId) {
+            await db.collection('messages').doc(savedId).update({
+              status       : 'failed',
+              smsError     : `QUOTA_EXCEEDED: ${smsResult.error || 'provider quota reached'}`,
+              quotaExceeded: true,
+              updatedAt    : new Date().toISOString(),
+            }).catch(() => {});
+          }
+          return {
+            route         : 'SMS_EXTERNE',
+            conversationId: convId,
+            messageId     : savedId,
+            resolvedUid   : resolvedUid || null,
+            smsResult,
+          };
+        }
         logger.warn('[ROUTING] SMS direct failed — enqueueing for retry', {
           to       : e164Target.replace(/\d{4}$/, '****'),
           messageId: savedId,

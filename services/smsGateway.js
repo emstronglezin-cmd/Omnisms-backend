@@ -350,6 +350,8 @@ async function sendSMS({ to, text, messageId = null } = {}) {
 
   const hint = statusCode === 401
     ? 'Clé API invalide — vérifier INFINIREACH_API_KEY dans Render'
+    : statusCode === 402
+    ? 'Quota du forfait INfiniReach atteint (100 messages/mois) — mettre à niveau le plan ou attendre la réinitialisation mensuelle ; aucun retry ne peut réussir avant'
     : statusCode === 404
     ? `Device non trouvé — vérifier que INFINIREACH_FROM_NUMBER (${fromNumber}) est bien enregistré dans l'application INfiniReach sur le Z Fold2. Le numéro SIM doit correspondre exactement au device enregistré dans votre compte INfiniReach.`
     : statusCode === 400

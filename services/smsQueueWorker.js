@@ -74,6 +74,20 @@ function selectTransport() {
   return null;
 }
 
+/* ── Quota classification ───────────────────────────────────── */
+/**
+ * Détecte une erreur de quota fournisseur (ex : INfiniReach 402
+ * "Free plan message limit reached (100 messages/month)").
+ * Une limite de forfait ne peut pas être résolue par un retry : il faut
+ * mettre à niveau le plan ou attendre la réinitialisation mensuelle.
+ * @returns {boolean}
+ */
+function isQuotaExceeded(result) {
+  if (!result || result.success) return false;
+  if (result.statusCode === 402) return true;
+  return /free plan message limit|quota (exceeded|reached)|limit reached/i.test(String(result.error || ''));
+}
+
 /* ── Job processor ──────────────────────────────────────────── */
 /**
  * Process a single SMS job.
@@ -182,6 +196,36 @@ async function processSmsJob(job) {
     error     : result.error,
     statusCode: result.statusCode,
   });
+
+  // ── Quota fournisseur épuisé (ex : INfiniReach 402) ─────────
+  // Un retry ne peut pas réussir tant que le forfait n'est pas rétabli :
+  // on marque le message 'failed' immédiatement et on NE relance PAS de
+  // tentative BullMQ. Les autres tâches en attente sont préservées et
+  // pourront être traitées normalement une fois le quota rétabli.
+  if (isQuotaExceeded(result)) {
+    logger.error('[SmsWorker] Provider quota exhausted — job failed without retry', {
+      jobId      : job.id,
+      messageId,
+      provider   : transport.provider,
+      statusCode : result.statusCode || 402,
+      action     : 'Upgrade the SMS provider plan or wait for the monthly reset',
+      hint       : 'Pending messages are preserved (never deleted) and can be re-sent once the quota is restored.',
+    });
+    if (db && messageId) {
+      try {
+        await db.collection('messages').doc(messageId).update({
+          status       : 'failed',
+          smsError     : `QUOTA_EXCEEDED: ${result.error || 'provider quota reached'}`,
+          quotaExceeded: true,
+          updatedAt    : new Date().toISOString(),
+        });
+      } catch (dbErr) {
+        logger.warn('[SmsWorker] Firestore quota-failure update failed', { error: dbErr.message, messageId });
+      }
+    }
+    // Pas de throw → BullMQ considère le job comme traité (pas de nouveau retry).
+    return { success: false, quotaExceeded: true, nonRetryable: true, statusCode: result.statusCode || 402 };
+  }
 
   // Update Firestore message as failed on last attempt
   if (db && messageId && job.attemptsMade >= 2) {
