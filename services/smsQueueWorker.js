@@ -249,6 +249,24 @@ async function processSmsJob(job) {
     }
   }
 
+  // Dernière tentative (attempts-1) → Dead Letter Queue (audit + replay manuel)
+  const maxAttempts = (job.opts && job.opts.attempts) || 3;
+  if (job.attemptsMade >= maxAttempts - 1) {
+    try {
+      const { addJob } = require('./queueService');
+      await addJob('sms_dlq', {
+        originalJobId: job.id || null,
+        data: job.data,
+        error: String(result.error || 'unknown').slice(0, 500),
+        statusCode: result.statusCode || null,
+        failedAt: new Date().toISOString(),
+      }, { attempts: 1 });
+      logger.error('[SmsWorker] Job moved to DLQ (sms_dlq)', { jobId: job.id, messageId });
+    } catch (dlqErr) {
+      logger.error('[SmsWorker] DLQ push failed', { jobId: job.id, error: dlqErr.message });
+    }
+  }
+
   // Throw to trigger BullMQ retry
   throw new Error(result.error || `SMS send failed via ${transport.provider}`);
 }
@@ -266,16 +284,23 @@ async function processSmsJob(job) {
  * @param {string} [opts.ownerUid]      - OmniSMS sender UID
  * @returns {Promise<{jobId, queued}>}
  */
-async function enqueueSmsJob({ to, text, messageId, conversationId, ownerUid } = {}) {
+async function enqueueSmsJob(params = {}) {
+  const { to, text, messageId, conversationId, ownerUid, priority } = params || {};
   if (!to || !text) {
     logger.warn('[SmsWorker] enqueueSmsJob: to and text are required');
     return { jobId: null, queued: false };
   }
 
-  // Use messageId as dedup key when available (same message → same BullMQ jobId)
+  // Idempotence par messageId + priorités (1 = plus prioritaire) :
+  //   critical → confirmations de paiement / OTP ; high → messages ; default → reste.
+  // Backoff exponentiel de base 3 s (le jitter est appliqué par la stratégie
+  // du worker, voir startSmsWorker).
+  const priorityMap = { critical: 1, high: 3, normal: 5 };
+  const jobPriority = priorityMap[priority] != null ? priorityMap[priority] : priorityMap.normal;
+  const baseJobOpts = { attempts: Number(process.env.SMS_JOB_ATTEMPTS) || 3, backoff: { type: 'exponential', delay: 3000 }, priority: jobPriority };
   const jobOpts = messageId
-    ? { jobId: `sms-${messageId}`, attempts: 3, backoff: { type: 'exponential', delay: 3000 } }
-    : { attempts: 3, backoff: { type: 'exponential', delay: 3000 } };
+    ? { jobId: `sms-${messageId}`, ...baseJobOpts }
+    : baseJobOpts;
 
   return addSmsJob(
     { to, text, messageId: messageId || null, conversationId: conversationId || null, ownerUid: ownerUid || null },
@@ -289,8 +314,22 @@ async function enqueueSmsJob({ to, text, messageId, conversationId, ownerUid } =
  * Safe to call even if Redis is unavailable (inline fallback).
  */
 function startSmsWorker() {
-  createWorker('sms', processSmsJob, 2);
-  logger.info('[SmsWorker] SMS worker started (concurrency: 2).');
+  // Démarrage dans le process web : WORKER_IN_WEB_PROCESS=false → déporté
+  // vers `npm run worker` (processus séparé recommandé à l'échelle).
+  if (String(process.env.WORKER_IN_WEB_PROCESS || 'true').toLowerCase() === 'false') {
+    logger.info('[SmsWorker] WORKER_IN_WEB_PROCESS=false — worker SMS déporté (npm run worker).');
+    return;
+  }
+  const concurrency = Math.max(1, parseInt(process.env.SMS_WORKER_CONCURRENCY, 10) || 2);
+  // Backoff exponentiel avec jitter plein (+/-50%) : évite les retries synchronisés
+  const backoffStrategy = (attemptsMade) => {
+    const base = 3000 * Math.pow(2, attemptsMade);
+    return Math.round(base * (0.5 + Math.random()));
+  };
+  const perMin = parseInt(process.env.SMS_WORKER_MAX_PER_MIN, 10);
+  const limiter = perMin > 0 ? { max: perMin, duration: 60000 } : undefined;
+  createWorker('sms', processSmsJob, concurrency, { backoffStrategy, limiter });
+  logger.info('[SmsWorker] SMS worker started', { concurrency, maxPerMin: perMin || 'unlimited' });
 }
 
 module.exports = {

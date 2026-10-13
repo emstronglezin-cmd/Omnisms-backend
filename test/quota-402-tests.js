@@ -84,11 +84,12 @@ let emitCalls = 0;
     normalizeEmail: (e) => String(e || '').toLowerCase(),
   } };
 }
-const queueState = { jobs: [] };
+const queueState = { jobs: [], dlq: [] };
 {
   const p = path.join(ROOT, 'services', 'queueService.js');
   require.cache[p] = { id: p, filename: p, loaded: true, exports: {
     addSmsJob: async (data, jobOpts) => { queueState.jobs.push({ data, jobOpts }); return { jobId: jobOpts && jobOpts.jobId || `job-${queueState.jobs.length}`, queued: true }; },
+    addJob: async (queue, data, opts) => { if (queue === 'sms_dlq') queueState.dlq.push({ data, opts }); return { jobId: 'dlq', queued: true }; },
     createWorker: () => ({}),
   } };
 }
@@ -160,6 +161,12 @@ const msgDoc = (id) => db._store.get('messages') && db._store.get('messages').ge
   threw = null;
   try { await worker.processSmsJob({ id: 'job-503-b', data: { to: '+22676555444', text: 'x', messageId: added2 }, attemptsMade: 2 }); } catch (e) { threw = e; }
   check('6b. erreur 503 (tentative 2 = dernière) → throw + status=failed', !!threw && (() => { const m = msgDoc(added2); return m && m.status === 'failed'; })());
+  check('6b. échec final → job archivé en DLQ (sms_dlq)', queueState.dlq.length >= 1 && queueState.dlq[queueState.dlq.length - 1].data.data.messageId === added2, queueState.dlq.length);
+  await worker.enqueueSmsJob({ to: '+22676555444', text: 'p', messageId: 'm-prio-n' });
+  await worker.enqueueSmsJob({ to: '+22676555444', text: 'p', messageId: 'm-prio-c', priority: 'critical' });
+  const pn = queueState.jobs[queueState.jobs.length - 2].jobOpts.priority;
+  const pc = queueState.jobs[queueState.jobs.length - 1].jobOpts.priority;
+  check('priorités BullMQ (critical=1 avant normal=5)', pn === 5 && pc === 1, { pn, pc });
 
   /* ── 7. Déduplication : même message → même jobId BullMQ ── */
   await worker.enqueueSmsJob({ to: '+22676555444', text: 'a', messageId: 'msg-dedup' });

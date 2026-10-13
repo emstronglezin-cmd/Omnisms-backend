@@ -560,7 +560,7 @@ try {
 /* ── Worker SMS (retry outbound) ─────────────────────────── */
 try {
   const { startSmsWorker } = require('./services/smsQueueWorker');
-  startSmsWorker();
+  if (String(process.env.WORKER_IN_WEB_PROCESS || 'true').toLowerCase() === 'true') startSmsWorker();
   logger.info('[Worker] SMS queue worker started.');
 } catch (err) {
   logger.warn('[Worker] Could not start SMS worker.', { error: err.message });

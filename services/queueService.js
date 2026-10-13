@@ -208,7 +208,7 @@ async function addJob(queueName, data, opts = {}) {
  * lockDuration: 120000ms — le lock est renouvelé toutes les 60s, ce qui
  * laisse largement le temps à Groq de répondre.
  */
-function createWorker(queueName, processor, concurrency = 2) {
+function createWorker(queueName, processor, concurrency = 2, workerOptions = {}) {
   // Utiliser workerConnection en priorité (sans commandTimeout)
   // Si absent, tomber sur redisConnection, puis inline
   const conn = workerConnection || redisConnection;
@@ -228,6 +228,11 @@ function createWorker(queueName, processor, concurrency = 2) {
     lockDuration: 120000,   // 120s — renouvellement toutes les 60s
     // stalledInterval: 30000 (default) — vérification jobs bloqués toutes les 30s
     // maxStalledCount: 1 (default) — 1 retry si stalled, puis échec
+    // Backoff avec jitter (anti-tempête) + limiteur de débit optionnel
+    settings: workerOptions.backoffStrategy
+      ? { backoffStrategy: workerOptions.backoffStrategy }
+      : undefined,
+    limiter: workerOptions.limiter || undefined,
   });
 
   worker.on('completed', (job, result) => {

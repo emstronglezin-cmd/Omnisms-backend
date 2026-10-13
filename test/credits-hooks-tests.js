@@ -75,11 +75,12 @@ require.cache[path.join(ROOT, 'services/userResolver.js')] = {
     normalizeEmail: (e) => String(e || '').toLowerCase(),
   },
 };
-const queueState = { jobs: [] };
+const queueState = { jobs: [], dlq: [] };
 require.cache[path.join(ROOT, 'services/queueService.js')] = {
   id: 'qs', filename: path.join(ROOT, 'services/queueService.js'), loaded: true,
   exports: {
     addSmsJob: async (data, jobOpts) => { queueState.jobs.push({ data, jobOpts }); return { jobId: (jobOpts && jobOpts.jobId) || `j${queueState.jobs.length}`, queued: true }; },
+    addJob: async (queue, data) => { if (queue === 'sms_dlq') queueState.dlq.push({ data }); return { jobId: 'dlq', queued: true }; },
     createWorker: () => ({}),
   },
 };
@@ -147,6 +148,7 @@ const ledgerEntry = (id) => db._store.get('credit_ledger') && db._store.get('cre
   try { await worker.processSmsJob({ id: `sms-${r4.messageId}`, data: queueState.jobs[0].data, attemptsMade: 2 }); } catch (e) { threw = e; }
   check('worker échec final → throw (retry BullMQ) + remboursement crédits',
     !!threw && !!ledgerEntry(`refd-${r4.messageId}`) && (await ledger.getBalance(db, 'uid-sender')) === 5);
+  check('worker échec final → job en DLQ', queueState.dlq.some((j) => j.data.data.messageId === r4.messageId));
   // Idempotence : rejouer le refund ne crédite pas deux fois
   await billing.refundSmsSend(db, r4.messageId, 'sms_failed_final');
   check('refund idempotent (solde toujours 5)', (await ledger.getBalance(db, 'uid-sender')) === 5);
