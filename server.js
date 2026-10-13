@@ -322,6 +322,7 @@ const { getUserPremiumStatus } = require('./controllers/saaspayController');
 app.get('/api/user/status', (req, res) => getUserPremiumStatus(req, res));
 
 /* ── Admin & feature routes ──────────────────────────────── */
+app.use('/api/admin/credits', require('./routes/credits.admin')); // module crédits (x-admin-key)
 app.use('/admin',         adminRoutes);
 app.use('/api/admin',     adminRoutes);   // alias API (mêmes protections x-admin-key)
 app.use('/groups',        groupRoutes);

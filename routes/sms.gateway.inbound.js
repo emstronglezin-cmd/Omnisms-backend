@@ -419,6 +419,51 @@ async function processSmsReceived(webhookBody) {
   });
 
   // ─────────────────────────────────────────────────────────────
+  // ÉTAPE 0 — Crédits & recharges (CREDITS_ENABLED=true uniquement) :
+  //   a) SMS Orange Money (expéditeur whitelisté) → rapprochement paiement
+  //   b) commandes SOLDE / PACKS / RECHARGE / PAYE / AIDE → réponse 1 segment
+  // Interception AVANT le traitement en message normal ; en cas d'erreur du
+  // module, le message continue son traitement historique.
+  // ─────────────────────────────────────────────────────────────
+  try {
+    const billing = require('../services/creditBilling');
+    if (billing.isCreditsEnabled()) {
+      const omParser    = require('../services/orangeMoneyParser');
+      const recharge    = require('../services/rechargeService');
+      const gwForReplies = getSmsGateway();
+      const sendSystemReply = async (to, text) => {
+        try { if (gwForReplies && gwForReplies.isConfigured()) await gwForReplies.sendSMS({ to, text }); } catch (_) {}
+      };
+
+      const parsedOm = omParser.parseOmConfirmation({ senderId: senderRaw, body: String(textRaw || ''), receivedAt });
+      if (parsedOm && (parsedOm.ok || parsedOm.reason === 'PARSE_FAILED')) {
+        const result = await recharge.handleOmPayment({ db, parsed: parsedOm, notifyReply: sendSystemReply });
+        logger.info('[INfiniReach] Orange Money payment processed', {
+          status: result.status,
+          txnId : parsedOm.ok ? parsedOm.txnId : null,
+          payer : parsedOm.payerPhone ? parsedOm.payerPhone.replace(/\d{4}$/, '****') : null,
+          amount: parsedOm.ok ? parsedOm.amountFcfa : null,
+        });
+        return; // traité — jamais stocké comme message
+      }
+
+      if (omParser.isCreditsCommand(String(textRaw || ''))) {
+        const result = await recharge.handleSmsCommand({ db, phoneE164: fromE164, text: String(textRaw) });
+        if (result.handled) {
+          if (result.reply) await sendSystemReply(fromE164, result.reply);
+          logger.info('[INfiniReach] Credit command handled', {
+            from   : fromE164 ? fromE164.replace(/\d{4}$/, '****') : null,
+            command: String(textRaw).trim().split(/\s+/)[0].toUpperCase(),
+          });
+          return;
+        }
+      }
+    }
+  } catch (creditsErr) {
+    logger.warn('[INfiniReach] credits hook error (message traité normalement)', { error: creditsErr.message });
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // ÉTAPE 1 : Trouver le destinataire OmniSMS (ownerUid)
   // ─────────────────────────────────────────────────────────────
   // Cas A : Le texte commence par # → protocole d'adressage direct
