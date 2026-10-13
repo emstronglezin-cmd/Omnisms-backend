@@ -366,6 +366,8 @@ app.use('/groups',        groupRoutes);
 app.use('/users',         userRoutes);
 app.use('/me',            meRoutes);
 app.use('/api/me',        meRoutes);   // API prefix pour profil + avatar
+app.use('/api/account',   require('./routes/accountDeletion'));  // Conformité Play : suppression de compte (web + in-app)
+app.get('/delete-account', (_req, res) => res.redirect(302, '/api/account/web'));  // URL courte à déclarer dans Play Console
 app.use('/notifications', notifRoutes);
 app.use('/statistics',    statsRoutes);
 
