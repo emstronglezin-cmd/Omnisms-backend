@@ -1,20 +1,29 @@
-# Utiliser une image Node.js stable
-FROM node:18
+# OmniSMS Backend — image de production
+# Note : Render utilise render.yaml (environnement natif) ; cette image sert
+# aux déploiements conteneurisés (Back4App, autre registre, run local).
 
-# Définir le dossier de travail
-WORKDIR /user/src/app
+FROM node:20-alpine
 
-# Copier les fichiers des dépendances
+# curl pour le HEALTHCHECK
+RUN apk add --no-cache curl
+
+WORKDIR /app
+
+# Dépendances reproductibles (lockfile)
 COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
-# Installer les dépendances
-RUN npm install
-
-# Copier tout le code du backend dans le conteneur
+# Code (node_modules local exclu via .dockerignore)
 COPY . .
 
-# Exporter le port par défaut pour Back4App
-EXPOSE 1337
+ENV NODE_ENV=production
+EXPOSE 5000
 
-# Lancer l'application
+# Sanity check applicatif (/livez = liveness, sans dépendances externes)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT:-5000}/livez" || exit 1
+
+# Non-root
+USER node
+
 CMD ["npm", "start"]

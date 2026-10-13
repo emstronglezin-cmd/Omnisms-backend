@@ -117,12 +117,55 @@ jobs:
           [ $FOUND -eq 0 ] && echo "✅ Aucune donnée sensible détectée"
 
   # ────────────────────────────────────────────────────────────
-  # JOB 2 : Deploy sur Render (uniquement sur push main)
+  # JOB TESTS : suites de tests hors-ligne (stubs) — bloque le déploiement
+  # ────────────────────────────────────────────────────────────
+  tests:
+    name: Test suites (offline, stubs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run offline test suites
+        run: |
+          set -e
+          SUITES=(
+            test/routing-presence-tests.js
+            test/routing-matrix-tests.js
+            test/offline-sms-tests.js
+            test/sms-inbound-tests.js
+            test/session11-inbound-routing-tests.js
+            test/quota-402-tests.js
+            test/credits-tests.js
+            test/om-recharge-tests.js
+            test/credits-hooks-tests.js
+            test/ratestore-tests.js
+            test/scaling-metrics-tests.js
+            test/gateway-pool-tests.js
+            test/firestore-utils-tests.js
+            test/account-deletion-tests.js
+          )
+          FAILED=0
+          for t in "${SUITES[@]}"; do
+            echo "▶ $t"
+            node "$t" || { echo "❌ ÉCHEC $t"; FAILED=1; }
+          done
+          [ $FAILED -eq 0 ] && echo "✅ Toutes les suites sont vertes" || exit 1
+
+  # ────────────────────────────────────────────────────────────
+  # JOB 3 : Deploy sur Render (uniquement sur push main)
   # ────────────────────────────────────────────────────────────
   deploy:
     name: Deploy to Render
     runs-on: ubuntu-latest
-    needs: lint-and-audit
+    needs: [lint-and-audit, tests]
     timeout-minutes: 10
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
@@ -187,7 +230,7 @@ jobs:
           exit 0   # Ne pas échouer — Render free tier a un cold start
 
   # ────────────────────────────────────────────────────────────
-  # JOB 3 : Notification de statut (optionnel)
+  # JOB 4 : Notification de statut (optionnel)
   # ────────────────────────────────────────────────────────────
   notify:
     name: Notify Status
