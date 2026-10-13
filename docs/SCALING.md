@@ -9,7 +9,7 @@ renvoie à une observation de code mesurée ; ce qui n'est pas mesuré est dit t
 ## 1. Résumé exécutif
 
 L'architecture est **fonctionnelle et bien dégradée en petit régime** (fallbacks mémoire
-partout), mais elle repose sur des **états en mémoire进程 unique** et des
+partout), mais elle repose sur des **état en mémoire d'un processus unique** et des
 **dépendances optionnelles** qui deviennent des **points de défaillance uniques (SPOF)**
 ou des **incohérences multi-instances** dès que l'on scale horizontalement ou que Redis
 est absent. Le goulot primaire de capacité n'est **pas** le CPU : c'est
