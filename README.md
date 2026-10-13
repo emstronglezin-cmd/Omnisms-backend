@@ -189,3 +189,31 @@ curl http://localhost:5000/admin/stats \
 - [x] Logs structurés
 - [x] Health check `/health`
 - [x] Arrêt propre (SIGTERM)
+
+---
+
+## 💳 Modèle de crédits SMS & recharges Orange Money (v4.4)
+
+**Activé par `CREDITS_ENABLED=true`** (défaut : false → comportement historique).
+
+- Messages **en ligne** (OmniSMS ↔ OmniSMS) : **gratuits**.
+- Messages partant en **SMS** (destinataire externe ou utilisateur OmniSMS hors ligne) :
+  **5 SMS gratuits** par numéro E.164 (`FREE_SMS_QUOTA`, une seule fois, consommés en premier),
+  puis des **crédits** : **1 crédit = 1 segment** (GSM-7 : 160/153, UCS-2 : 70/67).
+- **Ledger immuable** (`credit_ledger`) + soldes (`credit_balances`) mis à jour en
+  transaction Firestore : réservation à l'envoi, capture quand la passerelle accepte,
+  **remboursement automatique** sur échec / expiration / quota 402. Solde jamais négatif,
+  idempotent par `messageId` (jamais de double débit ni de double crédit).
+- **Recharge par SMS uniquement** (utilisateurs offline, sans internet) :
+  `SOLDE` · `PACKS` · `RECHARGE 10|30` · `PAYE <idTransaction>` · `AIDE`.
+  Packs configurables (`PACK_10` = 10 SMS / 250 F, `PACK_30` = 30 SMS / 600 F ; env ou
+  Firestore `app_config/credits`). Confirmation Orange Money reçue sur la passerelle,
+  parseur à liste blanche (`OM_SENDER_IDS`), rapprochement automatique
+  (`incoming_payments`, id transaction unique) + `PAYE` pour les dépôts faits par un tiers.
+- **Anti-fraude** : plafonds journaliers par numéro (recharges / FCFA), limite horaire
+  de commandes, réponses 1 segment limitées, webhook signé (HMAC + secret), règles
+  Firestore interdisant toute écriture client sur soldes/ledger/paiements.
+- **Conformité Google Play** : `IN_APP_PURCHASE_UI=false` — aucune UI d'achat dans l'app
+  tant que la conformité n'est pas validée ; le canal de recharge reste le SMS.
+- Docs : `docs/RUNBOOK_CREDITS.md` (runbook « payé mais non crédité », checklist de
+  validation) · `firestore.rules` · `firestore.indexes.json`.

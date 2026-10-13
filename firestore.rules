@@ -1,0 +1,33 @@
+rules_version = '2';
+/**
+ * OmniSMS — Règles Firestore (module crédits).
+ *
+ * ⚠️ À APPLIQUER MANUELLEMENT dans Firebase Console (Firestore → Rules).
+ * Le backend écrit via le SDK Admin (qui ignore ces règles) ; les règles
+ * protègent contre toute écriture DIRECTE depuis les clients (app/PWA).
+ *
+ * Si le projet n'utilise PAS encore de règles globales, déployer ce fichier
+ * tel quel : tout le reste est refusé par défaut (deny all), les collections
+ * métier existantes étant écrites uniquement via le backend.
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Module crédits : AUCUNE écriture client, lecture interdite aussi ──
+    // (les soldes, le ledger et les paiements ne passent QUE par le backend)
+    match /credit_balances/{uid}      { allow read, write: if false; }
+    match /credit_ledger/{entryId}    { allow read, write: if false; }
+    match /free_sms_quota/{phone}     { allow read, write: if false; }
+    match /payment_intents/{id}       { allow read, write: if false; }
+    match /incoming_payments/{id}     { allow read, write: if false; }
+    match /om_daily_usage/{id}        { allow read, write: if false; }
+    match /app_config/{doc}           { allow read, write: if false; } // config packs (admin SDK only)
+
+    // ── Par défaut : tout refuser ─────────────────────────────────────────
+    // Les autres collections (users, messages, …) sont écrites via le SDK
+    // Admin côté backend. Toute écriture client directe est refusée.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
