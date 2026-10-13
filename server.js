@@ -250,6 +250,43 @@ app.get('/health', (_req, res) => {
   });
 });
 
+/* ── Liveness / Readiness / Métriques (exploitation) ────────── */
+app.get('/livez', (_req, res) => res.status(200).json({ status: 'live', uptime: Math.round(process.uptime()) }));
+
+app.get('/readyz', async (_req, res) => {
+  const checks = { firebase: false, redis: 'memory_fallback', bullmq: false };
+  let ready = false;
+  try { checks.firebase = !!checkFirebase(); } catch (_) {}
+  try {
+    const redisSvc = require('./services/redis');
+    checks.redis = redisSvc.isMemoryFallback ? 'memory_fallback' : 'ok';
+  } catch (_) { checks.redis = 'error'; }
+  try {
+    const qs = require('./services/queueService').getQueueStatus();
+    checks.bullmq = !!qs && qs.redisConnected !== false;
+  } catch (_) {}
+  // Firestore est indispensable ; Redis en fallback mémoire est toléré tant que
+  // REDIS_REQUIRED n'est pas activé (mono-instance).
+  ready = checks.firebase === true;
+  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not_ready', checks, time: new Date().toISOString() });
+});
+
+app.get('/metrics', (req, res) => {
+  const token = process.env.METRICS_TOKEN || '';
+  if (token && String(req.headers['x-metrics-token'] || '') !== token) {
+    return res.status(401).json({ error: 'Token métriques requis.' });
+  }
+  try {
+    const qs = require('./services/queueService').getQueueStatus();
+    if (qs && typeof qs === 'object') {
+      require('./services/metrics').metrics.setGauge('queue_mode_redis', qs.redisConnected ? 1 : 0);
+      require('./services/metrics').metrics.setGauge('queue_mode_inline', qs.redisConnected ? 0 : 1);
+    }
+  } catch (_) {}
+  res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+  return res.send(require('./services/metrics').metrics.render());
+});
+
 /* ── Route imports ───────────────────────────────────────── */
 const authRoutes         = require('./routes/auth');
 const googleAuthRoutes   = require('./routes/auth.google');
@@ -587,6 +624,11 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('🔬 SMS Test   : POST /api/diag/sms-test  (x-admin-key: ADMIN_KEY requis)');
   console.log('❤️  Health     : GET /health');
   console.log('');
+  // Validation des variables d'environnement (warn par défaut ; STRICT_ENV=true → échec du démarrage)
+  try { require('./config/envValidation').validateEnvOrThrow(logger); } catch (err) {
+    logger.error('[ENV] Arrêt : ' + err.message);
+    process.exit(1);
+  }
 });
 
 /* ── Graceful shutdown ───────────────────────────────────── */

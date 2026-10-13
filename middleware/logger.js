@@ -78,6 +78,8 @@ function requestLogger(req, res, next) {
 
   res.on('finish', () => {
     const duration = Date.now() - start;
+    // Métriques HTTP (sans jamais exposer query/headers — aucune donnée perso)
+    try { require('../services/metrics').metricsService.httpRequest(req.method, req.path, res.statusCode, duration); } catch (_) {}
     const level    = res.statusCode >= 500 ? 'error'
                    : res.statusCode >= 400 ? 'warn'
                    : 'info';
