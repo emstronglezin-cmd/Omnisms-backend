@@ -405,6 +405,12 @@ async function processSmsReceived(webhookBody) {
     return;
   }
 
+  // Registre du pool de passerelles : chaque webhook entrant portant un
+  // deviceId rafraîchit le heartbeat de l'appareil (upsert inoffensif).
+  if (deviceId) {
+    try { require('../services/gatewayPool').recordHeartbeat(getDb(), deviceId, { fromNumber: recipientE164 }); } catch (_) {}
+  }
+
   const fromE164      = normalizePhone(senderRaw)    || senderRaw    || '';
   const recipientE164 = normalizePhone(recipientRaw) || recipientRaw || null;
 

@@ -276,6 +276,32 @@ async function sendSMS({ to, text, messageId = null } = {}) {
     throw new Error('[INfiniReach] sendSMS: "to" et "text" sont requis');
   }
 
+  // ── Pool de passerelles (GATEWAY_POOL_ENABLED=true, multi-appareils) ──
+  // Délègue la sélection d'appareil (least-loaded, failover, breaker).
+  // Désactivé par défaut : comportement mono-appareil historique.
+  try {
+    const pool = require('./gatewayPool');
+    if (pool.isEnabled()) {
+      const started = Date.now();
+      const poolRes = await pool.sendViaPool({
+        payload: { to, text, messageId },
+        send: async (_device, p) => _sendDirect(p),
+      });
+      const { metricsService } = require('./metrics');
+      metricsService.smsSend('gateway_pool', poolRes.success, Date.now() - started);
+      return poolRes.success
+        ? { ...poolRes.result, poolDeviceId: poolRes.deviceId }
+        : poolRes.result;
+    }
+  } catch (poolErr) {
+    logger.warn('[INfiniReach] Pool indisponible → envoi direct', { error: poolErr.message });
+  }
+
+  return _sendDirect({ to, text, messageId });
+}
+
+/** Implémentation historique mono-appareil (device par défaut du compte INfiniReach). */
+async function _sendDirect({ to, text, messageId = null } = {}) {
   if (!isConfigured()) {
     throw new Error(
       '[INfiniReach] Non configuré — définir INFINIREACH_API_KEY et INFINIREACH_FROM_NUMBER'
