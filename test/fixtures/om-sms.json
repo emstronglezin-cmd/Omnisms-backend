@@ -1,0 +1,40 @@
+{
+  "_lisez_moi": "FIXTURES « À REMPLACER » — formats PLAUSIBLES de SMS Orange Money Burkina Faso, utilisés par les tests tant que de vrais SMS n'ont pas été fournis. Remplacer `body` par des captures réelles (masquer les numéros personnels) puis ajuster les regex par défaut / OM_REGEX_* si besoin.",
+  "fixtures": [
+    {
+      "name": "confirmation_depot_classique",
+      "status": "À REMPLACER",
+      "senderId": "ORANGE MONEY",
+      "body": "Vous avez recu 250 FCFA du +226 70 11 22 33 le 11/10/2026 a 14:32. ID transaction: MP261011.1432.A12345. Solde: 5 750 FCFA.",
+      "expected": { "amountFcfa": 250, "txnId": "MP261011.1432.A12345", "payerPhone": "+22670112233" }
+    },
+    {
+      "name": "confirmation_format_court",
+      "status": "À REMPLACER",
+      "senderId": "4001",
+      "body": "Trans 600FCFA de +22676554433, ref OM998877665544, le 2026-10-11 15:03. Merci.",
+      "expected": { "amountFcfa": 600, "txnId": "OM998877665544", "payerPhone": "+22676554433" }
+    },
+    {
+      "name": "expediteur_numero_ordinary_rejete",
+      "status": "STABLE",
+      "senderId": "+22670000099",
+      "body": "Vous avez recu 250 FCFA... ID transaction: FAKETX123456",
+      "expected": { "ok": false, "reason": "PHONE_LIKE_SENDER" }
+    },
+    {
+      "name": "expediteur_inconnu_rejete",
+      "status": "STABLE",
+      "senderId": "PUB-99",
+      "body": "GAGNEZ 100000 FCFA...",
+      "expected": { "ok": false, "reason": "NOT_WHITELISTED" }
+    },
+    {
+      "name": "format_illisible_rejete",
+      "status": "STABLE",
+      "senderId": "ORANGE MONEY",
+      "body": "Bonjour, decouvrez nos offres !",
+      "expected": { "ok": false, "reason": "PARSE_FAILED" }
+    }
+  ]
+}
