@@ -28,6 +28,12 @@
 const { addSmsJob, createWorker } = require('./queueService');
 const { logger } = require('../middleware/logger');
 
+/** Facturation crédits (chargement paresseux ; si absent → no-op). */
+function _getBilling() {
+  try { return require('./creditBilling'); }
+  catch (_) { return { refundSmsSend: async () => ({ ok: false }) }; }
+}
+
 /* ── Lazy imports (avoid circular deps at require-time) ─────── */
 function getDb() {
   try {
@@ -203,6 +209,8 @@ async function processSmsJob(job) {
   // tentative BullMQ. Les autres tâches en attente sont préservées et
   // pourront être traitées normalement une fois le quota rétabli.
   if (isQuotaExceeded(result)) {
+    // Crédits : rembourser la réservation (l'envoi ne partira pas).
+    if (db && messageId) await _getBilling().refundSmsSend(db, messageId, 'QUOTA_EXCEEDED').catch(() => {});
     logger.error('[SmsWorker] Provider quota exhausted — job failed without retry', {
       jobId      : job.id,
       messageId,
@@ -227,8 +235,9 @@ async function processSmsJob(job) {
     return { success: false, quotaExceeded: true, nonRetryable: true, statusCode: result.statusCode || 402 };
   }
 
-  // Update Firestore message as failed on last attempt
+  // Update Firestore message as failed on last attempt (+ remboursement crédits)
   if (db && messageId && job.attemptsMade >= 2) {
+    await _getBilling().refundSmsSend(db, messageId, 'sms_failed_final').catch(() => {});
     try {
       await db.collection('messages').doc(messageId).update({
         status   : 'failed',

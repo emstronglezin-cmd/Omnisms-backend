@@ -28,6 +28,12 @@
 
 const { normalizePhone }       = require('./phoneNormalizer');
 const { resolveUserByPhone }   = require('./userResolver');
+
+/** Facturation crédits (chargement paresseux ; si absent → flag off). */
+function _getBilling() {
+  try { return require('./creditBilling'); }
+  catch (_) { return { isCreditsEnabled: () => false, isPushBeforeSmsEnabled: () => false }; }
+}
 const { logger }               = require('../middleware/logger');
 
 /* ── conversationId helpers ─────────────────────────────────── */
@@ -346,6 +352,19 @@ async function routeMessage(opts = {}) {
           } catch (_) { /* fetchSockets non disponible */ }
         }
       }
+
+      // OFFLINE_PUSH_BEFORE_SMS=true : tenter un push FCM (réveil) et
+      // re-vérifier la présence avant de basculer en SMS. Flag désactivé
+      // par défaut → comportement historique.
+      if (!recipientIsOnline) {
+        const _billing0 = _getBilling();
+        if (_billing0.isPushBeforeSmsEnabled()) {
+          try {
+            await _billing0.tryPushWake(db, resolvedUid);
+            recipientIsOnline = await socketSvc.isUserOnline(resolvedUid);
+          } catch (_) { /* push indisponible → SMS */ }
+        }
+      }
     } catch (_) {
       // socketService non disponible → supposer offline (dégradation sécurisée)
       recipientIsOnline = false;
@@ -602,6 +621,45 @@ async function routeMessage(opts = {}) {
     : (senderPhone || 'Un utilisateur OmniSMS');
   const smsText = `[OmniSMS] ${senderDisplay} : ${content ? content.trim() : ''}`;
 
+  // ── Facturation crédits (CREDITS_ENABLED=true uniquement ; sinon aucun
+  // changement de comportement). Réservation = quota gratuit puis segments.
+  let charge = null;
+  const _billing = _getBilling();
+  if (_billing.isCreditsEnabled() && senderUid) {
+    const senderE164 = (opts.senderPhone && normalizePhone(opts.senderPhone)) || null;
+    charge = await _billing.chargeSmsSend({ db, uid: senderUid, senderPhoneE164: senderE164, messageId: savedId, text: smsText });
+    if (!charge.ok) {
+      logger.warn('[ROUTING] Envoi SMS refusé : crédits insuffisants', {
+        senderUid,
+        messageId: savedId,
+        segments: charge.segments,
+        balance: charge.balance,
+      });
+      if (db && savedId && savedId !== msgId) {
+        await db.collection('messages').doc(savedId).update({
+          status   : 'failed',
+          smsError : 'INSUFFICIENT_CREDITS',
+          updatedAt: new Date().toISOString(),
+        }).catch(() => {});
+      }
+      // Réponse explicite à l'expéditeur (limitée dans le temps — anti-spam)
+      const sendReply = (transport === 'sms_gateway' && smsGateway) ? (o) => smsGateway.sendSMS(o)
+        : (useInfobip && infobip ? (o) => infobip.sendSMS(o) : null);
+      await _billing.notifyInsufficientBalance({ db, uid: senderUid, senderPhoneE164: senderE164, sendSms: sendReply });
+      return {
+        route         : 'SMS_EXTERNE',
+        transport,
+        conversationId: convId,
+        messageId     : savedId,
+        externalPhone : e164Target,
+        resolvedUid   : resolvedUid || null,
+        smsResult     : { success: false, error: 'INSUFFICIENT_CREDITS' },
+        billing       : { freeUsed: false, segments: charge.segments, creditsReserved: 0, refused: 'INSUFFICIENT_CREDITS' },
+        message       : msg,
+      };
+    }
+  }
+
   let smsResult = null;
 
   if (transport !== 'none' && type === 'text' && content) {
@@ -662,6 +720,10 @@ async function routeMessage(opts = {}) {
           await updateExternalConvLastMessage(db, convId, content, providerMsgId).catch(() => {});
         }
       }
+      // Crédits : la passerelle a accepté → capture de la réservation (audit).
+      if (charge && charge.ok && smsResult?.success) {
+        await _billing.captureSmsSend(db, savedId).catch(() => {});
+      }
 
       // Si l'envoi direct a échoué → mettre en queue pour retry
       if (smsResult && !smsResult.success) {
@@ -672,6 +734,8 @@ async function routeMessage(opts = {}) {
         const quotaExceeded = smsResult.statusCode === 402
           || /free plan message limit|quota (exceeded|reached)|limit reached/i.test(String(smsResult.error || ''));
         if (quotaExceeded) {
+          // Crédits : la réservation est remboursée (jamais débité pour un envoi refusé).
+          if (charge && charge.ok) await _billing.refundSmsSend(db, savedId, 'QUOTA_EXCEEDED').catch(() => {});
           logger.error('[ROUTING] Provider quota exhausted — message failed without retry', {
             to        : e164Target.replace(/\d{4}$/, '****'),
             messageId : savedId,
@@ -891,6 +955,7 @@ async function routeMessage(opts = {}) {
     messageId     : savedId,
     externalPhone : e164Target,
     smsResult,
+    billing       : charge && charge.ok ? { freeUsed: charge.freeUsed, segments: charge.segments, creditsReserved: charge.creditsReserved } : undefined,
     message       : msg,
   };
 }
