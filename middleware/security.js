@@ -109,7 +109,8 @@ const compressionMiddleware = compression({
 /** Global : 300 req / 15 min par IP */
 const globalLimiter = rateLimit({
   windowMs       : 15 * 60 * 1000,
-  max            : 300,
+  // Knob de charge/staging : GLOBAL_RATE_LIMIT_MAX (défaut 300 — inchangé).
+  max            : Number(process.env.GLOBAL_RATE_LIMIT_MAX || 300),
   standardHeaders: true,
   legacyHeaders  : false,
   skip           : (req) => req.path === '/health' || req.path === '/',
@@ -146,9 +147,11 @@ const leekPayLimiter = rateLimit({
 // ── 5. Slow-down (délai progressif avant blocage) ─────────────
 const globalSlowDown = slowDown({
   windowMs         : 15 * 60 * 1000,
-  delayAfter       : 150,
-  delayMs          : (hits) => (hits - 150) * 200,
-  maxDelayMs       : 5000,
+  // Knobs de charge/staging : GLOBAL_SLOWDOWN_DELAY_AFTER / _MAX_DELAY
+  // (défauts 150 / 5000ms — comportement inchangé hors tests de charge).
+  delayAfter       : Number(process.env.GLOBAL_SLOWDOWN_DELAY_AFTER || 150),
+  delayMs          : (hits) => (hits - Number(process.env.GLOBAL_SLOWDOWN_DELAY_AFTER || 150)) * 200,
+  maxDelayMs       : Number(process.env.GLOBAL_SLOWDOWN_MAX_DELAY || 5000),
   skip             : (req) => req.path === '/health' || req.path === '/',
 });
 
