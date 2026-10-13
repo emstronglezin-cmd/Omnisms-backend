@@ -110,3 +110,20 @@ d'hypothèses**, pas des mesures terrain ; la charge testée en local (§7) n'es
 représentative de Render production ; l'adaptateur Socket.IO et le pool multi-appareils
 seront **derrière des flags désactivés** tant qu'ils ne sont pas validés sur un vrai
 Redis multi-instances et avec le support INfiniReach (multi-device).
+
+## 8. État d'implémentation (13/10/2026) — commits locaux
+
+| Sujet (§2) | Livré | Commit | Test |
+|---|---|---|---|
+| S7 probes/métriques | `/livez`, `/readyz`, `/metrics` (Prometheus `omnisms_*`), validation env au boot (`STRICT_ENV`), `METRICS_TOKEN` | `2c2dcef` | scaling-metrics 11/11 |
+| S1/S5 Redis optionnel | `services/rateStore.js` (fenêtre fixe Redis + fallback mémoire), recharge/crédits async via rateStore, adaptateur Socket.IO Redis **conditionnel** | `81ff04b` | ratestore 8/8 |
+| S3 file | DLQ `sms_dlq`, backoff expo + jitter, priorités (OTP/paiement > messages), worker séparé `npm run worker` (`WORKER_IN_WEB_PROCESS`) | `cd9c33d` | quota-402 + credits-hooks enrichis |
+| S4 mono-appareil | Pool de passerelles `services/gatewayPool.js` : registre `gateway_devices` (heartbeat webhook, capacité jour, cadence), least-loaded, failover, circuit breaker (3 échecs → 5 min), **flag `GATEWAY_POOL_ENABLED`** (défaut off) | `a256fed` | gateway-pool 11/11 |
+| S6 Firestore docs chauds | `services/firestoreUtils.js` : compteurs shardés, batch ≤450, pagination curseur, cache lectures chaudes `USER_CACHE_ENABLED` (défaut off) | `e1e28f1` | firestore-utils 8/8 |
+| S2 Socket.IO mono-process | Adaptateur Redis livré (S1) ; scaling horizontal reste **bloqué sur Redis managé actif** (non testé multi-instances) | `81ff04b` | — |
+| S8 cold start Render | Doc : plan always-on requis pour prod (§5 P0) — décision business | — | — |
+| S10 pas de CI/Docker | CI bloquante (syntaxe + audit + **14 suites**) ; Dockerfile node:20 non-root + HEALTHCHECK ; RUNBOOK_DEPLOY (rollback, backups Firestore = commandes, non planifiées) | `4c32f96` | suites validées en local |
+| API durcissement | SlowDown/limiteur déjà en place ; **découverte charge** : mur 5 s = nos propres défenses (150 req/15 min/IP → +200 ms/hit, cap 5 s) — knobs `GLOBAL_*` pour staging, défauts inchangés | `e17eeda` | loadtest + rapport |
+| Observabilité restante | Métriques HTTP/SMS/queue/appareils livrées ; **alerting externe (Upsun/Better Stack) et error tracking (Sentry) non configurés** | — | — |
+
+Mesures de charge locales (stubs, 1 générateur, CPU partagé) : 200 sockets OK, 385 envois/s (p95 968 ms), 862 webhooks/s (p95 3,3 s au palier 1500/3000), **zéro 5xx** — voir `docs/LOADTEST_LOCAL.md`. Reste non mesuré : Redis réel, Firestore réel, multi-instances.
