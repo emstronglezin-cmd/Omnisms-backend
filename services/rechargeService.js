@@ -32,16 +32,12 @@ function getDb(dbParam) {
 }
 function nowIso() { return new Date().toISOString(); }
 
-/* ── Limite de commandes par numéro (anti-spam : chaque réponse coûte un SMS) ── */
-const _cmdWindow = new Map(); // phone → [timestamps]
-function commandRateOk(phoneE164) {
+/* ── Limite de commandes par numéro (anti-spam : chaque réponse coûte un SMS) ──
+   Store partagé Redis (fenêtre 1 h) — fallback mémoire si Redis indisponible. */
+async function commandRateOk(phoneE164) {
   const max = getLimits().smsCommandsPerHour;
-  const now = Date.now();
-  const arr = (_cmdWindow.get(phoneE164) || []).filter((ts) => now - ts < 3600 * 1000);
-  if (arr.length >= max) { _cmdWindow.set(phoneE164, arr); return false; }
-  arr.push(now);
-  _cmdWindow.set(phoneE164, arr);
-  return true;
+  const res = await require('./rateStore').hit(`omcmds:${phoneE164}`, 3600 * 1000, max);
+  return res.allowed;
 }
 
 /* ── Plafonds journaliers par numéro ──────────────────────────────── */
@@ -282,7 +278,7 @@ async function handleSmsCommand({ db, phoneE164, text }) {
   if (!/^(SOLDE|PACKS|RECHARGE( \d+)?|PAYE [A-Za-z0-9._-]+|AIDE)$/.test(cmd)) {
     return { handled: false }; // pas une commande crédit → traitement normal du message
   }
-  if (!commandRateOk(phoneE164)) {
+  if (!(await commandRateOk(phoneE164))) {
     return { handled: true, reply: 'OmniSMS: trop de commandes. Reessayez dans une heure.' };
   }
 

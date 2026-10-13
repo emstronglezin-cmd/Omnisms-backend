@@ -189,6 +189,9 @@ function initSocketIO(httpServer) {
   //   omnisms-frontend-drab.vercel.app (Socket.IO rejeté, même CORS root cause).
   const vercelPattern = /^https:\/\/omnisms-frontend(-[a-z0-9]+)*\.vercel\.app$/;
 
+  // Adaptateur Redis (multi-instances) — actif UNIQUEMENT si REDIS_URL est
+  // configuré ET si @socket.io/redis-adapter est installé. Sinon : mono-instance
+  // (comportement historique, warn explicite à l'exploitation).
   _io = new Server(httpServer, {
     cors: {
       origin(origin, callback) {
@@ -460,6 +463,22 @@ function initSocketIO(httpServer) {
     });
   });
 
+  // Tentative d'adaptateur Redis (jamais bloquant)
+  try {
+    const redisUrl = (process.env.REDIS_URL || '').trim();
+    if (redisUrl) {
+      const { createAdapter } = require('@socket.io/redis-adapter');
+      const Redis = require('ioredis');
+      const pub = new Redis(redisUrl, { lazyConnect: false, maxRetriesPerRequest: null });
+      const sub = pub.duplicate();
+      _io.adapter(createAdapter(pub, sub));
+      logger.info('[Socket.IO] Redis adapter ACTIF — multi-instances possible.');
+    } else {
+      logger.warn('[Socket.IO] PAS d\'adaptateur Redis — mono-instance uniquement (REDIS_URL absent).');
+    }
+  } catch (adapterErr) {
+    logger.warn('[Socket.IO] Adaptateur Redis indisponible — mono-instance.', { error: adapterErr.message });
+  }
   logger.info('[Socket.IO] Server initialized.');
   return _io;
 }

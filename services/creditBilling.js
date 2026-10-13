@@ -145,13 +145,11 @@ async function refundSmsSend(db, messageId, reason) {
 
 /* ── Réponse « solde insuffisant » (1 segment, limitée dans le temps) ── */
 
-const _insufficientNotify = new Map(); // clé uid → last ts (fallback mémoire)
-function _rateOk(key, cooldownMs) {
-  const now = Date.now();
-  const last = _insufficientNotify.get(key) || 0;
-  if (now - last < cooldownMs) return false;
-  _insufficientNotify.set(key, now);
-  return true;
+// Cooldown partagé Redis (fallback mémoire) — 1 seule réponse « solde insuffisant »
+// par clé et par période, cohérente entre instances et redéploiements.
+async function _rateOk(key, cooldownMs) {
+  const res = await require('./rateStore').hit(`insuff:${key}`, cooldownMs, 1);
+  return res.allowed;
 }
 
 /**
@@ -162,7 +160,7 @@ function _rateOk(key, cooldownMs) {
 async function notifyInsufficientBalance({ db, uid, senderPhoneE164, sendSms }) {
   const cooldownMs = getLimits().insufficientReplyCooldownMin * 60 * 1000;
   const key = senderPhoneE164 || String(uid);
-  if (!_rateOk(`insuff:${key}`, cooldownMs)) return false;
+  if (!(await _rateOk(key, cooldownMs))) return false;
   if (typeof sendSms !== 'function' || !senderPhoneE164) return false;
   const { getGatewayOmNumber, getEffectivePacks } = require('./packsConfig');
   let cheapest = null;
