@@ -317,6 +317,10 @@ function initSocketIO(httpServer) {
     await setUserOnline(uid);
     await registerSession(uid, socket);
 
+    // Politique ROUTE_OFFLINE_HOLD : pousser les messages internes restés
+    // en attente (idempotent — voir deliverPendingMessages).
+    deliverPendingMessages(uid).catch(() => {});
+
     // Notifier les autres de la connexion
     socket.broadcast.emit('user:online', {
       uid,
@@ -588,6 +592,48 @@ function initSocketIO(httpServer) {
 
 /* ── Helpers Firestore ────────────────────────────────────── */
 
+/**
+ * Livraison à la reconnexion — messages internes en attente pour `uid`
+ * (ROUTE_OFFLINE_HOLD) : channel 'app', status 'pending'.
+ *
+ * Idempotence : le message est marqué 'sent' (claim) AVANT l'émission
+ * Socket.IO. Une reconnexion rapide, une nouvelle tentative ou un événement
+ * répété ne peut donc pas délivrer deux fois ; si l'émission échoue, le
+ * client rattrape via l'historique Firestore (aucune perte).
+ */
+async function deliverPendingMessages(uid, { limit = 50 } = {}) {
+  try {
+    const db = require('../config/firebase');
+    if (!db || db._stub) return 0;
+    const snap = await db.collection('messages')
+      .where('receiverId', '==', uid)
+      .where('status', '==', 'pending')
+      .where('channel', '==', 'app')
+      .limit(Math.min(limit, 100))
+      .get();
+    const docs = (snap && snap.docs) || [];
+    let delivered = 0;
+    for (const d of docs) {
+      const data = d.data() || {};
+      const ref = d.ref || db.collection('messages').doc(d.id);
+      await ref.update({
+        status: 'sent',
+        deliveredVia: 'reconnect',
+        updatedAt: new Date().toISOString(),
+      }).catch(() => {}); // déjà réclamé → pas de double émission utile
+      emitToUser(uid, 'message:receive', { ...data, id: d.id, status: 'sent', deliveredVia: 'reconnect' });
+      delivered++;
+    }
+    if (delivered) {
+      logger.info('[Socket] Messages internes livrés à la reconnexion', { uid, count: delivered });
+    }
+    return delivered;
+  } catch (err) {
+    logger.warn('[Socket] deliverPendingMessages failed', { uid, error: err.message });
+    return 0;
+  }
+}
+
 async function persistMessage(msg) {
   try {
     const db = require('../config/firebase');
@@ -665,5 +711,6 @@ module.exports = {
   startPresenceSweep,
   registerSession,
   removeSession,
+  deliverPendingMessages,
   getLastSeen,
 };

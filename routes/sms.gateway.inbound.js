@@ -846,6 +846,21 @@ async function processSmsReceived(webhookBody) {
       // Choisir le fallbackTo : vrai numéro de profil en priorité
       const fallbackTo = recipientPhone || null;
 
+      // Politique ROUTE_OFFLINE_HOLD=true : le propriétaire OmniSMS hors ligne
+      // garde le message EN INTERNE (déjà en Firestore) — pas de copie SMS.
+      // Livraison à la reconnexion (socketService.deliverPendingMessages).
+      // Défaut false → comportement historique (copie SMS à son vrai numéro).
+      const offlineHoldEnabled = String(process.env.ROUTE_OFFLINE_HOLD || 'false').trim().toLowerCase() === 'true';
+      if (offlineHoldEnabled) {
+        logger.info('[INfiniReach] ROUTING — ROUTE_OFFLINE_HOLD=true → pas de copie SMS au propriétaire hors ligne', {
+          resolvedRecipientUid: ownerUid,
+          recipientPresence   : 'offline',
+          routingDecision     : 'omnisms_held',
+          messageId           : savedMsgId || null,
+          hint                : 'Message déjà en Firestore (channel app) — livré à la reconnexion.',
+        });
+      }
+
       logger.info('[INfiniReach] ROUTING — décision', {
         incomingFrom          : fromE164.replace(/\d{4}$/, '****'),
         incomingTo            : recipientE164 ? recipientE164.replace(/\d{4}$/, '****') : null,
@@ -860,7 +875,10 @@ async function processSmsReceived(webhookBody) {
         smsGatewayConfigured  : !!(smsGateway && smsGateway.isConfigured()),
       });
 
-      if (smsGateway && smsGateway.isConfigured()) {
+      if (offlineHoldEnabled) {
+        // Copie SMS désactivée par politique (ROUTE_OFFLINE_HOLD=true) —
+        // le message est déjà en Firestore : livraison à la reconnexion.
+      } else if (smsGateway && smsGateway.isConfigured()) {
         // Notifier le DESTINATAIRE (recipientPhone = vrai numéro profil) qu'il a
         // reçu un message pendant son absence.
         if (fallbackTo) {

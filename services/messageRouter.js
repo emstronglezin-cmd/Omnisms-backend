@@ -262,6 +262,18 @@ async function updateExternalConvLastMessage(db, conversationId, content, provid
  *   error?: string
  * }>}
  */
+/* ── Politique de repli offline (routage) ─────────────────── */
+/**
+ * ROUTE_OFFLINE_HOLD=true : un destinataire OmniSMS résolu mais hors ligne
+ * garde le message EN INTERNE (Firestore, channel 'app', status 'pending'),
+ * livré à sa reconnexion (deliverPendingMessages). Aucune conversion
+ * automatique d'un simple délai de réponse en SMS externe.
+ * Défaut false → comportement historique (fallback SMS vers son numéro réel).
+ */
+function isOfflineHoldEnabled() {
+  return String(process.env.ROUTE_OFFLINE_HOLD || 'false').trim().toLowerCase() === 'true';
+}
+
 async function routeMessage(opts = {}) {
   const {
     senderUid,
@@ -376,6 +388,61 @@ async function routeMessage(opts = {}) {
       recipientOnline: recipientIsOnline,
       targetPhone: targetPhone ? targetPhone.replace(/\d{4}$/, '****') : '(uid direct)',
     });
+  }
+
+  /* ── 2 bis. OmniSMS OFFLINE → attente interne (ROUTE_OFFLINE_HOLD=true) ── */
+  // Le message reste dans la persistance existante et sera poussé à la
+  // reconnexion (socketService.deliverPendingMessages). Jamais de SMS externe
+  // pour un simple délai de réponse : le SMS reste réservé aux destinataires
+  // externes (sans compte) et aux replis explicitement prévus (flag OFF).
+  if (resolvedUid && !recipientIsOnline && isOfflineHoldEnabled()) {
+    const convId = makeConversationId(senderUid, resolvedUid);
+    const heldMsg = {
+      id            : msgId,
+      senderId      : senderUid,
+      receiverId    : resolvedUid,
+      conversationId: convId,
+      content       : content ? content.trim() : null,
+      type,
+      channel       : 'app',
+      audioUrl      : audioUrl || null,
+      duration      : duration || null,
+      status        : 'pending',
+      reactions     : [],
+      transcription : null,
+      transcriptionStatus: type === 'audio' ? 'pending' : null,
+      createdAt     : now,
+      updatedAt     : now,
+    };
+    let savedId = msgId;
+    if (db) {
+      try {
+        const { id: _tempId, ...msgToStore } = heldMsg;
+        const ref = await db.collection('messages').add(msgToStore);
+        savedId = ref.id;
+        heldMsg.id = savedId;
+      } catch (dbErr) {
+        logger.warn('[ROUTING] Firestore save failed (offline hold)', { error: dbErr.message });
+      }
+    }
+    logger.info('[ROUTING] Destinataire OmniSMS hors ligne → message conservé en interne (ROUTE_OFFLINE_HOLD)', {
+      senderUid,
+      resolvedUid,
+      presence      : 'offline',
+      routingDecision: 'omnisms_held',
+      messageId     : savedId,
+      conversationId: convId,
+      type,
+    });
+    return {
+      route         : 'OMNISMS',
+      held          : true,
+      status        : 'pending',
+      messageId     : savedId,
+      resolvedUid,
+      conversationId: convId,
+      message       : heldMsg,
+    };
   }
 
   if (resolvedUid && recipientIsOnline) {
@@ -1270,6 +1337,7 @@ async function markAudioSmsTranscriptionFailed(opts = {}) {
 
 module.exports = {
   routeMessage,
+  isOfflineHoldEnabled,
   makeConversationId,
   makeExternalConvId,
   getOrCreateExternalConv,
