@@ -133,28 +133,105 @@ async function setUserOffline(uid) {
     await redis.hdel('online_users', uid);
     // FIX Session10 : supprimer aussi la clé TTL individuelle
     await redis.del(`online_ttl:${uid}`);
+    // Purger le registre de sessions/appareils (présence fiable)
+    await redis.del(`user_sessions:${uid}`);
     // Sauvegarder la dernière connexion
     await redis.set(`last_seen:${uid}`, new Date().toISOString(), 'EX', 30 * 24 * 3600);
+    // Synchronisation Firestore (best-effort, 1 écriture) : lastSeenAt
+    // lisible par l'app même après expiration des clés Redis.
+    try {
+      const db = require('../config/firebase');
+      if (db && !db._stub) {
+        await db.collection('users').doc(String(uid)).set(
+          { lastSeenAt: new Date().toISOString() },
+          { merge: true }
+        );
+      }
+    } catch (_) { /* Firestore indisponible → Redis reste la source */ }
   } catch (_) {}
 }
 
 async function isUserOnline(uid) {
+  const state = await getPresenceState(uid);
+  return state === 'online';
+}
+
+/**
+ * Présence à TROIS états (présence fiable) :
+ *   - 'online'  : au moins une session Socket.IO réellement vivante — preuve =
+ *                 clé TTL fraîche (connexion/heartbeat client/ sweep serveur)
+ *                 OU room locale active (preuve engine-level : la connexion
+ *                 TCP/WS existe, même si l'app n'envoie pas d'événement
+ *                 applicatif « heartbeat »).
+ *   - 'offline' : aucune preuve de vie.
+ *   - 'unknown' : le magasin de présence (Redis) est en erreur → on ne sait
+ *                 pas (la room locale reste une preuve POSITIVE de vie).
+ * Une session JWT valide ou un accès Internet du téléphone ne suffit JAMAIS.
+ */
+async function getPresenceState(uid) {
   try {
-    // FIX Session10 : double vérification
-    //  1. La clé TTL individuelle (expire au bout de ONLINE_TTL si pas de heartbeat)
-    //  2. Le hash global (fallback si la clé TTL a disparu mais le hash reste)
     const ttlKey = await redis.get(`online_ttl:${uid}`);
-    if (!ttlKey) {
-      // La clé TTL individuelle a expiré → l'utilisateur est offline
-      // Nettoyer aussi le hash global pour cohérence
-      await redis.hdel('online_users', uid).catch(() => {});
-      return false;
+    if (ttlKey) return 'online';
+
+    // TTL absente (jamais renouvelée par le client) : la room locale vivante
+    // est la source de vérité → auto-réparation du TTL (l'utilisateur actif
+    // ne doit PAS basculer hors ligne parce que l'app n'envoie pas heartbeat).
+    const live = countSocketsInUserRoom(uid);
+    if (live !== null && live > 0) {
+      await setUserOnline(uid).catch(() => {});
+      return 'online';
     }
-    const data = await redis.hget('online_users', uid);
-    return !!data;
+    // Room vide → offline ; nettoyer le hash global pour cohérence
+    await redis.hdel('online_users', uid).catch(() => {});
+    return 'offline';
   } catch (_) {
-    return false;
+    // Redis en erreur : état INCONNU, sauf preuve de vie locale
+    const live = countSocketsInUserRoom(uid);
+    return live !== null && live > 0 ? 'online' : 'unknown';
   }
+}
+
+/* ── Registre des sessions/appareils (multi-appareils par compte) ── */
+
+async function registerSession(uid, socket) {
+  try {
+    await redis.hset(`user_sessions:${uid}`, socket.id, JSON.stringify({
+      connectedAt: new Date().toISOString(),
+      authType    : (socket.user && socket.user.authType) || null,
+    }));
+    await redis.expire(`user_sessions:${uid}`, ONLINE_TTL * 2);
+  } catch (_) { /* best-effort */ }
+}
+
+async function removeSession(uid, socketId) {
+  try { await redis.hdel(`user_sessions:${uid}`, socketId); } catch (_) {}
+}
+
+/**
+ * Sweep serveur : renouvelle le TTL de présence et le registre de sessions
+ * pour TOUT socket réellement connecté, toutes les 60 s. La présence ne
+ * dépend donc plus d'un éventuel heartbeat applicatif du client.
+ */
+let _presenceSweepTimer = null;
+function startPresenceSweep() {
+  if (_presenceSweepTimer) return;
+  _presenceSweepTimer = setInterval(() => {
+    try {
+      if (!_io || !_io.sockets || !_io.sockets.sockets) return;
+      const perUid = new Map();
+      for (const s of _io.sockets.sockets.values()) {
+        const u = s.user && s.user.uid;
+        if (!u) continue;
+        if (!perUid.has(u)) perUid.set(u, []);
+        perUid.get(u).push(s);
+      }
+      for (const [u, sockets] of perUid) {
+        setUserOnline(u).catch(() => {});
+        for (const s of sockets) registerSession(u, s).catch(() => {});
+      }
+    } catch (_) { /* jamais bloquant */ }
+  }, 60 * 1000);
+  if (_presenceSweepTimer.unref) _presenceSweepTimer.unref();
 }
 
 async function getLastSeen(uid) {
@@ -236,8 +313,9 @@ function initSocketIO(httpServer) {
     // Joindre la room personnelle
     socket.join(`user:${uid}`);
 
-    // Marquer en ligne
+    // Marquer en ligne + enregistrer la session/appareil
     await setUserOnline(uid);
+    await registerSession(uid, socket);
 
     // Notifier les autres de la connexion
     socket.broadcast.emit('user:online', {
@@ -443,17 +521,40 @@ function initSocketIO(httpServer) {
     socket.on('disconnect', async (reason) => {
       logger.info('[Socket] Client disconnected', { uid, socketId: socket.id, reason });
 
-      // Attendre un peu avant de marquer offline (reconnexion rapide possible)
+      // 1. Retirer SA propre session immédiatement (sa preuve de vie)
+      await removeSession(uid, socket.id);
+
+      // 2. Décision offline PROTÉGÉE (multi-appareils + déconnexions tardives) :
+      //    on ne marque offline que si AUCUN autre socket n'est vivant —
+      //    room locale (synchro) puis fetchSockets (couvre aussi les autres
+      //    instances via l'adaptateur Redis) puis registre de sessions.
       setTimeout(async () => {
-        const rooms = await _io.in(`user:${uid}`).fetchSockets();
-        if (rooms.length === 0) {
-          // Plus aucun socket actif pour cet utilisateur → offline
-          await setUserOffline(uid);
-          _io.emit('user:offline', {
-            uid,
-            lastSeen : new Date().toISOString(),
-          });
-          logger.info('[Socket] User marked offline', { uid });
+        try {
+          let remaining = countSocketsInUserRoom(uid);
+          if (!remaining && _io) {
+            try {
+              const sockets = await _io.in(`user:${uid}`).fetchSockets();
+              remaining = sockets.length;
+            } catch (_) { /* adapter indisponible */ }
+          }
+          if (!remaining) {
+            try {
+              const sessions = await redis.hlen(`user_sessions:${uid}`);
+              if (Number(sessions) > 0) remaining = Number(sessions);
+            } catch (_) {}
+          }
+          if (!remaining) {
+            await setUserOffline(uid);
+            _io.emit('user:offline', {
+              uid,
+              lastSeen : new Date().toISOString(),
+            });
+            logger.info('[Socket] User marked offline', { uid });
+          } else {
+            logger.info('[Socket] Autre session vivante — pas de passage offline', { uid, remaining });
+          }
+        } catch (err) {
+          logger.warn('[Socket] Décision offline impossible — état conservé', { uid, error: err.message });
         }
       }, 3000);
     });
@@ -480,6 +581,8 @@ function initSocketIO(httpServer) {
     logger.warn('[Socket.IO] Adaptateur Redis indisponible — mono-instance.', { error: adapterErr.message });
   }
   logger.info('[Socket.IO] Server initialized.');
+  // Présence fiable : sweep serveur (TTL + sessions), indépendant du client
+  startPresenceSweep();
   return _io;
 }
 
@@ -558,5 +661,9 @@ module.exports = {
   setUserOnline,
   setUserOffline,
   isUserOnline,
+  getPresenceState,
+  startPresenceSweep,
+  registerSession,
+  removeSession,
   getLastSeen,
 };
