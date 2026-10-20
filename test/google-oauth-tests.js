@@ -112,5 +112,32 @@ const google = require('../services/googleOAuth');
   });
   assert.equal(coll('users').size, 2, 'repeated login must not create a duplicate');
 
-  console.log('Google OAuth unit checks: 18 PASS / 0 FAIL');
+  /* ── Retour APK vs PWA (garde-fous) ───────────────────────── */
+  // 1) Défaut = deep link APK (custom scheme)
+  process.env.GOOGLE_FLUTTER_REDIRECT_URI = 'omnisms://auth/google/callback';
+  assert.equal(google.safeAppRedirect('login', 'app'), 'omnisms://auth/google/callback', 'APK default return = custom scheme');
+  // 2) Cause racine historique : variable écrasée par une URL PWA → 503 fail-fast (plus jamais un 302 silencieux vers la PWA)
+  process.env.GOOGLE_FLUTTER_REDIRECT_URI = 'https://omnisms-frontend-drab.vercel.app/auth';
+  assert.throws(() => google.safeAppRedirect('login', 'app'), { code: 'GOOGLE_REDIRECT_MISCONFIGURED' }, 'PWA origin must be rejected for the APK return');
+  process.env.GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI = 'https://omnisms.netlify.app/contacts';
+  assert.throws(() => google.safeAppRedirect('contacts', 'app'), { code: 'GOOGLE_REDIRECT_MISCONFIGURED' }, 'contacts app return also guarded');
+  // 3) https légitime sur un domaine PROPRE (Android App Links) → accepté
+  process.env.GOOGLE_FLUTTER_REDIRECT_URI = 'https://api.omnisms.example.com/app/callback';
+  assert.equal(google.safeAppRedirect('login', 'app'), 'https://api.omnisms.example.com/app/callback');
+  // 4) Variante web : la PWA est la cible LÉGITIME (https requis)
+  delete process.env.GOOGLE_FLUTTER_REDIRECT_URI_WEB;
+  assert.throws(() => google.safeAppRedirect('login', 'web'), { code: 'GOOGLE_WEB_REDIRECT_NOT_CONFIGURED' }, 'web variant still fails fast when unconfigured');
+  process.env.GOOGLE_FLUTTER_REDIRECT_URI_WEB = 'https://omnisms-frontend-drab.vercel.app/auth';
+  assert.equal(google.safeAppRedirect('login', 'web'), 'https://omnisms-frontend-drab.vercel.app/auth', 'PWA flow preserved');
+  // 5) Aucune URL de redirection arbitraire : redirect_uri vient TOUJOURS de la config serveur
+  const authUrl = new URL(google.authorizationUrl('state-x'));
+  assert.equal(authUrl.searchParams.get('redirect_uri'), process.env.GOOGLE_REDIRECT_URI);
+  // 6) State : usage unique + TTL
+  process.env.GOOGLE_FLUTTER_REDIRECT_URI = 'omnisms://auth/google/callback';
+  const st = await google.createState('login', null, 'app');
+  const first = await google.consumeState(st, 'login');
+  assert.ok(first && first.returnTarget === 'app', 'state first consumption returns app variant');
+  assert.equal(await google.consumeState(st, 'login'), null, 'state is single-use (replay rejected)');
+
+  console.log('Google OAuth unit checks: 26 PASS / 0 FAIL');
 })().catch(err => { console.error(err); process.exitCode = 1; });

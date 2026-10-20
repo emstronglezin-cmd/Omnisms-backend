@@ -8,10 +8,13 @@ const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 const { signToken } = require('../middleware/authenticate');
 const { normalizeEmail } = require('./userResolver');
+const { logger } = require('../middleware/logger');
 
 const LOGIN_SCOPES = ['openid', 'email', 'profile'];
 const CONTACTS_SCOPE = 'https://www.googleapis.com/auth/contacts.readonly';
 const DEFAULT_FLUTTER_REDIRECT = 'omnisms://auth/google/callback';
+// Origines PWA hébergées connues du projet (jamais valables comme retour APK)
+const KNOWN_PWA_ORIGIN = /^omnisms(-frontend(-[a-z0-9]+)*)?\.vercel\.app$|^omnisms(-frontend)?\.netlify\.app$|^omnisms\.web\.app$/;
 const STATE_TTL_MS = 10 * 60 * 1000;
 const EXCHANGE_TTL_MS = 2 * 60 * 1000;
 
@@ -62,8 +65,28 @@ function safeAppRedirect(purpose = 'login', variant = 'app') {
   try {
     const parsed = new URL(target);
     if (!['omnisms:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported redirect scheme');
+    // Garde-fou retour APK : la variante « app » ne doit JAMAIS pointer vers une
+    // origine PWA connue. Cause racine historique : GOOGLE_FLUTTER_REDIRECT_URI
+    // écrasé par une URL Vercel/Netlify/Firebase Hosting → le callback 302
+    // aboutissait à la PWA et l'APK ne recevait jamais le code d'échange.
+    // (Un https « universel » reste permis s'il pointe vers un domaine PROPRE,
+    //  ex. Android App Links sur le domaine du projet — pas vers la PWA hébergée.)
+    if (parsed.protocol === 'https:' && KNOWN_PWA_ORIGIN.test(parsed.host)) {
+      logger.warn('[Google OAuth] App redirect configuré sur une origine PWA — retour APK impossible', {
+        event: 'APP_REDIRECT_MISCONFIGURED',
+        host : parsed.host,
+        hint : purpose === 'contacts'
+          ? 'Corriger GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI (attendu : omnisms://auth/google/contacts/callback)'
+          : 'Corriger GOOGLE_FLUTTER_REDIRECT_URI (attendu : omnisms://auth/google/callback)',
+      });
+      throw Object.assign(
+        new Error('App redirect URI points to a known PWA origin; the APK would never receive the callback.'),
+        { code: 'GOOGLE_REDIRECT_MISCONFIGURED' }
+      );
+    }
     return target;
-  } catch (_) {
+  } catch (err) {
+    if (err.code === 'GOOGLE_REDIRECT_MISCONFIGURED') throw err;
     throw Object.assign(new Error('Flutter redirect URI is invalid.'), { code: 'GOOGLE_REDIRECT_MISCONFIGURED' });
   }
 }

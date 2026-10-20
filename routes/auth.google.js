@@ -50,6 +50,7 @@ async function startLogin(req, res) {
   const variant = requestedVariant(req);
   try {
     if (variant === 'web') google.safeAppRedirect('login', 'web'); // fail-fast if the web redirect is not configured
+    else google.safeAppRedirect('login', 'app'); // garde-fou APK : 503 immédiat si le retour « app » pointe vers une PWA (config écrasée)
     const state = await google.createState('login', null, variant);
     return res.redirect(302, google.authorizationUrl(state));
   } catch (err) {
