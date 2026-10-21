@@ -18,13 +18,32 @@ const KNOWN_PWA_ORIGIN = /^omnisms(-frontend(-[a-z0-9]+)*)?\.vercel\.app$|^omnis
 const STATE_TTL_MS = 10 * 60 * 1000;
 const EXCHANGE_TTL_MS = 2 * 60 * 1000;
 
+/* Retour APK (deep link) — priorité aux variables _APK choisies par l'exploitant
+ * sur Render, puis anciens noms historiques, puis défauts (custom scheme).
+ * NB : GOOGLE_FLUTTE_CONTACT_REDIRECT_URI_APK (graphie exacte utilisée sur Render,
+ * probable coquille « FLUTTE ») est supportée telle quelle, ainsi que la graphie
+ * corrigée GOOGLE_FLUTTER_CONTACT_REDIRECT_URI_APK. */
+function appRedirectConfig() {
+  return {
+    login: (process.env.GOOGLE_FLUTTER_REDIRECT_URI_APK
+      || process.env.GOOGLE_FLUTTER_REDIRECT_URI
+      || DEFAULT_FLUTTER_REDIRECT).trim(),
+    contacts: (process.env.GOOGLE_FLUTTE_CONTACT_REDIRECT_URI_APK
+      || process.env.GOOGLE_FLUTTER_CONTACT_REDIRECT_URI_APK
+      || process.env.GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI
+      || 'omnisms://auth/google/contacts/callback').trim(),
+  };
+}
+
 function getConfig() {
+  const app = appRedirectConfig();
   return {
     clientId: (process.env.GOOGLE_CLIENT_ID || '').trim(),
     clientSecret: (process.env.GOOGLE_CLIENT_SECRET || '').trim(),
     redirectUri: (process.env.GOOGLE_REDIRECT_URI || '').trim(),
     contactsRedirectUri: (process.env.GOOGLE_CONTACTS_REDIRECT_URI || '').trim(),
-    flutterRedirectUri: (process.env.GOOGLE_FLUTTER_REDIRECT_URI || DEFAULT_FLUTTER_REDIRECT).trim(),
+    flutterRedirectUri: app.login,
+    contactsFlutterRedirectUri: app.contacts,
   };
 }
 
@@ -60,8 +79,8 @@ function safeAppRedirect(purpose = 'login', variant = 'app') {
     }
   }
   const target = purpose === 'contacts'
-    ? (process.env.GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI || 'omnisms://auth/google/contacts/callback').trim()
-    : getConfig().flutterRedirectUri;
+    ? appRedirectConfig().contacts
+    : appRedirectConfig().login;
   try {
     const parsed = new URL(target);
     if (!['omnisms:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported redirect scheme');

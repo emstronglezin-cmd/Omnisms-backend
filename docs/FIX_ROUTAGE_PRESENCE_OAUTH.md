@@ -50,7 +50,12 @@
 
 ## 6. Configurations à effectuer (valeurs attendues, à ne pas inventer)
 
-1. **Render** : `GOOGLE_FLUTTER_REDIRECT_URI` = `omnisms://auth/google/callback` et `GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI` = `omnisms://auth/google/contacts/callback` (deep links APK — c'est l'écrasement par l'URL Vercel qui causait le retour PWA). Laisser `GOOGLE_FLUTTER_REDIRECT_URI_WEB` / `GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI_WEB` = URLs https de la PWA (parcours PWA préservé).
+1. **Render (variables renseignées par l'exploitant, lues en PRIORITÉ par le code depuis `1db130e`+config APK)** :
+   - `GOOGLE_FLUTTER_REDIRECT_URI_APK` = `omnisms://auth/google/callback`
+   - `GOOGLE_FLUTTE_CONTACT_REDIRECT_URI_APK` = `omnisms://auth/google/contacts/callback` — ⚠️ **coquille probable « FLUTTE »** (sans le 2ᵉ T) dans le nom tel que renseigné ; le code accepte **les deux graphies** (ainsi que `GOOGLE_FLUTTER_CONTACT_REDIRECT_URI_APK`). Recommandation : renommer proprement en `GOOGLE_FLUTTER_CONTACT_REDIRECT_URI_APK` côté Render pour éviter les pièges futurs — le code continue de marcher dans tous les cas.
+   - Repli : anciens noms `GOOGLE_FLUTTER_REDIRECT_URI` / `GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI` (si une _APK est absente). Vérifier que l'ancien `GOOGLE_FLUTTER_REDIRECT_URI` ne contient plus l'URL Vercel (ou l'ignorer : les _APK passent avant).
+   - Laisser `GOOGLE_FLUTTER_REDIRECT_URI_WEB` / `GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI_WEB` = URLs https de la PWA (parcours PWA préservé).
+   - Le garde-fou anti-PWA s'applique aussi aux valeurs _APK (une _APK pointant vers Vercel/Netlify/web.app → 503 `GOOGLE_REDIRECT_MISCONFIGURED`).
 2. **Google Cloud Console** (Client OAuth **Web** existant) : Authorized redirect URIs = les callbacks backend (`/api/auth/google/callback`, `/api/auth/google/contacts/callback`) — **rien d'autre à ajouter** ; le scheme `omnisms://` n'est PAS déclaré côté Google (c'est un retour applicatif géré par le backend).
 3. **Android (APK)** : intent-filter du deep link `omnisms://auth/google/callback` (+ `/auth/google/contacts/callback`) dans l'app Flutter ; si un retour https universel est souhaité plus tard → Android App Links avec `assetlinks.json` sur le domaine **propre** du projet.
 

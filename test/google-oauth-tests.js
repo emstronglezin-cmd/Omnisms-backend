@@ -139,5 +139,25 @@ const google = require('../services/googleOAuth');
   assert.ok(first && first.returnTarget === 'app', 'state first consumption returns app variant');
   assert.equal(await google.consumeState(st, 'login'), null, 'state is single-use (replay rejected)');
 
-  console.log('Google OAuth unit checks: 26 PASS / 0 FAIL');
+  /* ── Variables _APK (choix exploitant, Render) ────────────── */
+  // _APK prioritaire sur l'ancien nom — même si l'ancien pointe encore une PWA
+  process.env.GOOGLE_FLUTTER_REDIRECT_URI = 'https://omnisms-frontend-drab.vercel.app/auth';
+  process.env.GOOGLE_FLUTTER_REDIRECT_URI_APK = 'omnisms://auth/google/callback';
+  assert.equal(google.safeAppRedirect('login', 'app'), 'omnisms://auth/google/callback', '_APK variable wins for login return');
+  delete process.env.GOOGLE_FLUTTER_REDIRECT_URI_APK;
+  // contacts : graphie EXACTE utilisée sur Render (coquille « FLUTTE ») honorée
+  delete process.env.GOOGLE_CONTACTS_FLUTTER_REDIRECT_URI;
+  process.env.GOOGLE_FLUTTE_CONTACT_REDIRECT_URI_APK = 'omnisms://auth/google/contacts/callback';
+  assert.equal(google.safeAppRedirect('contacts', 'app'), 'omnisms://auth/google/contacts/callback', 'Render-typed contacts APK var honored as-is');
+  delete process.env.GOOGLE_FLUTTE_CONTACT_REDIRECT_URI_APK;
+  // graphie corrigée également supportée
+  process.env.GOOGLE_FLUTTER_CONTACT_REDIRECT_URI_APK = 'omnisms://auth/google/contacts/callback';
+  assert.equal(google.safeAppRedirect('contacts', 'app'), 'omnisms://auth/google/contacts/callback', 'corrected contacts spelling also supported');
+  delete process.env.GOOGLE_FLUTTER_CONTACT_REDIRECT_URI_APK;
+  // le garde-fou PWA s'applique aussi à une valeur _APK
+  process.env.GOOGLE_FLUTTER_REDIRECT_URI_APK = 'https://omnisms-frontend-drab.vercel.app/auth';
+  assert.throws(() => google.safeAppRedirect('login', 'app'), { code: 'GOOGLE_REDIRECT_MISCONFIGURED' }, 'guard applies to _APK values');
+  delete process.env.GOOGLE_FLUTTER_REDIRECT_URI_APK;
+
+  console.log('Google OAuth unit checks: 31 PASS / 0 FAIL');
 })().catch(err => { console.error(err); process.exitCode = 1; });
