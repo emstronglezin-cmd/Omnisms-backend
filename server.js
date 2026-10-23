@@ -620,8 +620,14 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
+let _lastRejectionLog = 0;
 process.on('unhandledRejection', (reason) => {
-  logger.error('Unhandled promise rejection', { reason: String(reason) });
+  // Journal borné (1/min) : une erreur persistante (ex: quota Redis) ne doit
+  // pas générer un log par seconde ni masquer les autres lignes utiles.
+  const now = Date.now();
+  if (now - _lastRejectionLog < 60000) return;
+  _lastRejectionLog = now;
+  logger.error('Unhandled promise rejection (log limité 1/min)', { reason: String(reason).slice(0, 300) });
 });
 
 module.exports = app;
