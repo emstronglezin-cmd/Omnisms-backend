@@ -4,8 +4,8 @@
  *
  * Production-ready · Express · Socket.IO · Firebase graceful degradation
  * Payments      : LeekPay.me (Mobile Money + Carte)
- * SMS Outbound  : Infobip POST /api/sms/send
- * SMS Inbound   : Infobip Webhook POST /api/webhooks/infobip/inbound → Firestore + Socket.IO
+ * SMS Outbound  : SMSGate (open source, OFFLINE_SMS_PROVIDER=smsgate) — INfiniReach en pause
+ * SMS Inbound   : Webhook passerelle POST /api/webhooks/sms-gateway/inbound → Firestore + Socket.IO
  * Messages      : GET /api/messages (conversations), GET /api/messages/:id, POST /api/messages/send
  * Transcription : POST /api/transcription (Faster-Whisper async BullMQ)
  * Realtime      : Socket.IO v4 (new_message, message:receive, transcription:update)
@@ -109,8 +109,9 @@ function getPaymentConfigStatus() {
     return { configured: checkLeekPay(), error: e.message };
   }
 }
-function checkInfobip() {
-  return !!(process.env.INFOBIP_API_KEY && process.env.INFOBIP_BASE_URL);
+function checkSmsProvider() {
+  try { const sp = require('./services/smsProvider'); return sp.getProviderStatus().activeProvider !== 'none'; }
+  catch (_) { return false; }
 }
 function checkFirebase() {
   return !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
@@ -151,7 +152,7 @@ if (!paymentConfigLegacy.missing.length) {
 
 app.get('/', (_req, res) => {
   const lpOk      = checkLeekPay();
-  const infobipOk = checkInfobip();
+  const smsOk = checkSmsProvider();
 
   res.status(200).json({
     status   : 'ok',
@@ -159,10 +160,10 @@ app.get('/', (_req, res) => {
     version  : '4.3.0',
     auth     : true,
     payments : lpOk,
-    sms      : infobipOk,
+    sms      : smsOk,
     realtime : true,
     payments : lpOk      ? 'ACTIVE' : 'INACTIVE — set SAASPAY_SECRET_KEY (or legacy LEEKPAY_SECRET_KEY)',
-    infobip  : infobipOk ? 'ACTIVE' : 'INACTIVE — set INFOBIP_API_KEY + INFOBIP_BASE_URL',
+    smsProvider : String(process.env.OFFLINE_SMS_PROVIDER || 'sms_gateway'),
     env      : process.env.NODE_ENV || 'development',
     time     : new Date().toISOString(),
   });
@@ -172,26 +173,16 @@ app.get('/health', (_req, res) => {
   const lpOk         = checkLeekPay();
   const firebaseOk   = checkFirebase();
   const jwtOk        = !!process.env.JWT_SECRET;
-  const infobipOk    = checkInfobip();
+  const smsOk       = checkSmsProvider();
   const redisOk      = checkRedis();
   const transcrCheck = checkTranscription();
 
   let queueStatus = {};
   try { queueStatus = require('./services/queueService').getQueueStatus(); } catch (_) {}
 
-  // Expose full Infobip config details for diagnostics
-  let infobipDetails = {};
-  try {
-    const ibStatus = require('./services/infobip').getStatus();
-    const rawUrl   = process.env.INFOBIP_BASE_URL || '';
-    const hasHttps = rawUrl.match(/^https?:\/\//i);
-    infobipDetails = {
-      ...ibStatus,
-      rawBaseUrl     : rawUrl,
-      hasHttpsPrefix : !!hasHttps,
-      normalizedUrl  : hasHttps ? rawUrl : (rawUrl ? 'https://' + rawUrl : null),
-    };
-  } catch (_) {}
+  // Diagnostic fournisseur SMS (sans secrets)
+  let smsProviderDetails = {};
+  try { smsProviderDetails = require('./services/smsProvider').getProviderStatus(); } catch (_) {}
 
   res.status(200).json({
     status  : 'ok',
@@ -204,14 +195,14 @@ app.get('/health', (_req, res) => {
       jwt           : jwtOk           ? 'ok' : 'MISSING — set JWT_SECRET',
       payments      : lpOk            ? 'ACTIVE'
                                         : `INACTIVE — variables manquantes : ${paymentEnv.getPaymentEnvStatus().missingRequired.join(', ') || 'SAASPAY_SECRET_KEY'}`,
-      infobip       : infobipOk       ? 'ACTIVE' : 'INACTIVE — set INFOBIP_API_KEY + INFOBIP_BASE_URL',
+      smsProvider   : smsOk           ? 'ACTIVE' : 'INACTIVE — voir OFFLINE_SMS_PROVIDER / SMSGATE_* / INFINIREACH_*',
       redis         : redisOk         ? 'CONFIGURED' : 'MISSING — using memory fallback (set REDIS_URL)',
       socketio      : 'ACTIVE',
       transcription : transcrCheck.ok
         ? `ACTIVE via ${transcrCheck.engine}`
         : transcrCheck.detail,
     },
-    infobipDetails,
+    smsProviderDetails,
     queue   : queueStatus,
     routes  : {
       auth          : ['POST /api/auth/register', 'POST /api/auth/login', 'POST /api/auth/google', 'GET /api/auth/google', 'GET /api/auth/google/callback', 'POST /api/auth/google/exchange', 'POST /api/auth/google/contacts/authorize', 'GET /api/auth/google/contacts/callback', 'GET /api/auth/me'],
@@ -219,7 +210,7 @@ app.get('/health', (_req, res) => {
       messages      : [
         'GET  /api/messages                     → liste conversations (paginé)',
         'GET  /api/messages/:conversationId      → historique conversation',
-        'POST /api/messages/send                 → envoyer message (+ SMS Infobip si sendSms=true)',
+        'POST /api/messages/send                 → envoyer message (+ SMS externe si hors ligne/externe)',
         'GET  /api/messages/conversations        → alias',
         'GET  /api/messages/conversation/:uid    → rétrocompat',
         'PUT  /api/messages/:id/read',
@@ -233,10 +224,7 @@ app.get('/health', (_req, res) => {
       audio         : ['POST /api/audio/upload', 'POST /api/audio/transcribe/:id', 'GET /api/audio/stream/:filename', 'GET /api/audio/:id'],
       sms           : [
         'POST /api/sms/send                           → envoi SMS sortant',
-        'POST /api/webhooks/infobip/inbound           → SMS entrants (webhook Infobip)',
-        'GET  /api/webhooks/infobip/inbound/status    → état du webhook',
-        'POST /webhooks/infobip                       → rétrocompat',
-        'GET  /api/sms/infobip/status',
+        'POST /api/webhooks/sms-gateway/inbound       → SMS entrants passerelle',
       ],
       payment       : [
         'POST /api/payment/leekpay',
@@ -294,8 +282,6 @@ const googleAuthRoutes   = require('./routes/auth.google');
 const leekPayRoutes      = require('./routes/payment.leekpay');   // backward compat
 const saasPayRoutes      = require('./routes/payment.saaspay');   // SaaSPay (nouveau)
 const webhookRoutes      = require('./routes/webhook');
-const infobipRoutes        = require('./routes/sms.infobip');
-const infobipInboundRoutes = require('./routes/infobip.inbound');
 const smsGatewayInboundRoutes = require('./routes/sms.gateway.inbound');
 const transcriptionRoutes  = require('./routes/transcription.v2');
 const adminRoutes        = require('./routes/admin');
@@ -342,8 +328,6 @@ app.use('/api/audio', audioV2Routes);
 /* ── Transcription v2 (Faster-Whisper) ──────────────────── */
 app.use('/api/transcription', transcriptionRoutes);
 
-/* ── Infobip webhooks entrants (standby) ────────────────── */
-app.use('/api/webhooks', infobipInboundRoutes);
 
 /* ── SMS Gateway Z Fold2 webhooks entrants (principal) ───── */
 app.use('/api/webhooks', smsGatewayInboundRoutes);
@@ -353,8 +337,6 @@ app.use('/api/payment', leekPayLimiter, saasPayRoutes);
 app.use('/api/payment', leekPayLimiter, leekPayRoutes);  // backward compat — garder pendant transition
 app.use('/api/payment', webhookRoutes);   // retrocompat webhook
 
-/* ── Infobip SMS ─────────────────────────────────────────── */
-app.use('/', infobipRoutes);
 
 /* ── Premium user status (via SaaSPay controller) ────────── */
 const { getUserPremiumStatus } = require('./controllers/saaspayController');
@@ -387,7 +369,7 @@ loadOptional('./routes/contacts', '/');
 /* ── API status ──────────────────────────────────────────── */
 app.get('/api/status', (_req, res) => {
   const lpOk      = checkLeekPay();
-  const infobipOk = checkInfobip();
+  const smsOk = checkSmsProvider();
 
   let queue = {};
   try { queue = require('./services/queueService').getQueueStatus(); } catch (_) {}
@@ -398,7 +380,7 @@ app.get('/api/status', (_req, res) => {
     port     : PORT,
     env      : process.env.NODE_ENV || 'development',
     leekpay  : lpOk      ? 'ACTIVE' : 'INACTIVE',
-    infobip  : infobipOk ? 'ACTIVE' : 'INACTIVE',
+    smsProvider: (() => { try { return require('./services/smsProvider').getProviderStatus().activeProvider; } catch (_) { return 'none'; } })(),
     redis    : process.env.REDIS_URL ? 'CONFIGURED' : 'memory-fallback',
     socketio : 'ACTIVE',
     queue,
@@ -414,7 +396,7 @@ app.get('/api/diag', (_req, res) => {
     'FIREBASE_SERVICE_ACCOUNT_JSON',
     'REDIS_URL',
     'GROQ_API_KEY', 'GROQ_WHISPER_MODEL',
-    'INFOBIP_API_KEY', 'INFOBIP_BASE_URL', 'INFOBIP_SENDER_ID', 'INFOBIP_SENDER',
+    'OFFLINE_SMS_PROVIDER', 'SMSGATE_BASE_URL', 'SMSGATE_USERNAME',
     'SAASPAY_SECRET_KEY', 'SAASPAY_BASE_URL',
     'DEFAULT_PHONE_COUNTRY', 'WHISPER_MODEL', 'WHISPER_LANGUAGE',
   ];
@@ -442,16 +424,8 @@ app.get('/api/diag', (_req, res) => {
   let queueState = {};
   try { queueState = require('./services/queueService').getQueueStatus(); } catch (_) {}
 
-  // Infobip raw config (no secret)
-  const rawInfobipUrl = process.env.INFOBIP_BASE_URL || '';
-  const infobipDiag = {
-    INFOBIP_API_KEY_set   : !!process.env.INFOBIP_API_KEY,
-    INFOBIP_API_KEY_len   : (process.env.INFOBIP_API_KEY || '').length,
-    INFOBIP_BASE_URL_raw  : rawInfobipUrl,
-    INFOBIP_BASE_URL_hasHttps: rawInfobipUrl.match(/^https?:\/\//i) ? true : false,
-    INFOBIP_SENDER_ID_set : !!process.env.INFOBIP_SENDER_ID,
-    INFOBIP_SENDER_set    : !!process.env.INFOBIP_SENDER,
-  };
+  // Fournisseur SMS (aucun secret)
+  const smsDiag = (() => { try { return require('./services/smsProvider').getProviderStatus(); } catch (_) { return {}; } })();
 
   res.json({
     version         : '4.0.0',
@@ -459,45 +433,25 @@ app.get('/api/diag', (_req, res) => {
     env             : envStatus,
     redisRealStatus,
     queue           : queueState,
-    infobipDiag,
+    smsDiag,
     hint: 'This endpoint shows env var presence. Fix any MISSING vars on Render → Environment.',
   });
 });
 
-/* ── Direct Infobip SMS test (admin key required) ─────────── */
+/* ── Direct SMS test (admin key required) — fournisseur actif ── */
 app.post('/api/diag/sms-test', async (req, res) => {
   const adminKey = req.headers['x-admin-key'] || req.body?.adminKey;
   if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
     return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
   }
-
   const to   = req.body?.to   || '+22670000001';
-  const text = req.body?.text || 'OmniSMS v4.0 diagnostic test';
-
-  let infobip;
-  try { infobip = require('./services/infobip'); } catch (e) {
-    return res.status(500).json({ error: 'infobip module load failed', detail: e.message });
-  }
-
-  const rawUrl = process.env.INFOBIP_BASE_URL || '';
-  const diagInfo = {
-    INFOBIP_API_KEY_len  : (process.env.INFOBIP_API_KEY || '').length,
-    INFOBIP_API_KEY_prefix: (process.env.INFOBIP_API_KEY || '').slice(0, 8),
-    INFOBIP_BASE_URL_raw : rawUrl,
-    INFOBIP_BASE_URL_normalized: rawUrl.match(/^https?:\/\//i) ? rawUrl : ('https://' + rawUrl),
-    INFOBIP_SENDER_ID    : process.env.INFOBIP_SENDER_ID || 'OmniSMS',
-    isConfigured         : infobip.isConfigured(),
-  };
-
-  if (!infobip.isConfigured()) {
-    return res.status(503).json({ error: 'Infobip not configured', diagInfo });
-  }
-
+  const text = req.body?.text || 'OmniSMS diagnostic test';
   try {
-    const result = await infobip.sendSMS({ to, text });
-    return res.json({ success: result.success, result, diagInfo });
+    const { sendSMS } = require('./services/smsProvider');
+    const result = await sendSMS(to, text);
+    return res.json({ success: !!result.success, provider: result.provider, result });
   } catch (err) {
-    return res.status(500).json({ error: err.message, diagInfo });
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -584,18 +538,14 @@ server.headersTimeout   = 66000;
 
 server.listen(PORT, '0.0.0.0', () => {
   const lpOk       = checkLeekPay();
-  const infobipOk  = checkInfobip();
+  const smsOk      = checkSmsProvider();
   const firebaseOk = checkFirebase();
   const redisOk    = checkRedis();
   const jwtOk      = !!process.env.JWT_SECRET;
   const groqOk     = !!process.env.GROQ_API_KEY;
 
-  // Detailed Infobip diagnostic at startup
-  const rawInfobipUrl    = process.env.INFOBIP_BASE_URL || '';
-  const infobipKeyLen    = (process.env.INFOBIP_API_KEY || '').length;
-  const infobipKeyPrefix = (process.env.INFOBIP_API_KEY || '').slice(0, 8);
-  const infobipHasHttps  = rawInfobipUrl.match(/^https?:\/\//i);
-  const infobipNormUrl   = infobipHasHttps ? rawInfobipUrl : (rawInfobipUrl ? `https://${rawInfobipUrl}` : 'NOT SET');
+  // Diagnostic fournisseur SMS au démarrage (aucun secret)
+  const smsProviderName = (() => { try { return require('./services/smsProvider').getProviderStatus().activeProvider; } catch (_) { return 'none'; } })();
 
   logger.info('OmniSMS Backend v4.0 started', {
     port    : PORT,
@@ -603,7 +553,7 @@ server.listen(PORT, '0.0.0.0', () => {
     node    : process.version,
     firebase: firebaseOk ? 'OK' : 'MISSING',
     jwt     : jwtOk      ? 'OK' : 'MISSING',
-    infobip : infobipOk  ? `OK (key:${infobipKeyPrefix}..., url:${infobipNormUrl})` : 'MISSING',
+    smsProvider : smsProviderName,
     redis   : redisOk    ? 'CONFIGURED' : 'MISSING (memory fallback)',
     groq    : groqOk     ? 'OK' : 'MISSING',
   });
@@ -618,10 +568,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('💳 SaaSPay    : ' + (lpOk
     ? `✅ ACTIVE — ${getPaymentConfigStatus().baseUrl} (webhook ${getPaymentConfigStatus().webhookUrl})`
     : `⚠️  INACTIVE — variables manquantes : ${paymentEnv.getPaymentEnvStatus().missingRequired.join(', ') || 'SAASPAY_SECRET_KEY'}`));
-  console.log('📡 Infobip    : ' + (infobipOk
-    ? `✅ ACTIVE — key:${infobipKeyPrefix}... url:${infobipNormUrl} hasHttps:${!!infobipHasHttps}`
-    : '❌ INACTIVE — set INFOBIP_API_KEY and INFOBIP_BASE_URL'));
-  console.log('🗄️  Redis      : ' + (redisOk ? `✅ CONFIGURED — ${rawInfobipUrl ? process.env.REDIS_URL?.slice(0,30) + '...' : ''}` : '⚠️  MISSING — using memory fallback (set REDIS_URL on Render)'));
+  console.log('📡 SMS provider: ' + (smsOk
+    ? `✅ ${smsProviderName}`
+    : '⚠️  INACTIF — OFFLINE_SMS_PROVIDER + variables fournisseur requises'));
+  console.log('🗄️  Redis      : ' + (redisOk ? `✅ CONFIGURED — ${process.env.REDIS_URL ? process.env.REDIS_URL.slice(0,30) + '...' : ''}` : '⚠️  MISSING — using memory fallback (set REDIS_URL on Render)'));
   console.log('🤖 Groq       : ' + (groqOk  ? '✅ ACTIVE — Whisper transcription ready' : '❌ MISSING — set GROQ_API_KEY'));
   console.log('🔌 Socket.IO  : ' + (io ? '✅ ACTIVE' : '❌ INACTIVE'));
   console.log('📊 Diag       : GET /api/diag  (env var audit)');

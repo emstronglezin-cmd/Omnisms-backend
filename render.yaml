@@ -121,15 +121,20 @@ services:
       - key: REDIS_URL
         sync: false
 
-      # ── Infobip SMS ─────────────────────────────────────────
-      - key: INFOBIP_API_KEY
+      # ── SMS : SMSGate (open source) — voir docs/SMSGATE_MIGRATION.md ──
+      # Serveur privé recommandé (OTP) ; l'API publique est déconseillée
+      # pour les données sensibles.
+      - key: OFFLINE_SMS_PROVIDER
+        sync: false          # 'smsgate' pour activer SMSGate ; 'sms_gateway' = INfiniReach (en pause)
+
+      - key: SMSGATE_BASE_URL
+        sync: false          # ex. https://api.sms-gate.app (cloud) ou https://ton-serveur:8000 (privé)
+
+      - key: SMSGATE_USERNAME
         sync: false
 
-      - key: INFOBIP_BASE_URL
+      - key: SMSGATE_PASSWORD
         sync: false
-
-      - key: INFOBIP_SENDER_ID
-        value: OmniSMS
 
       # ── Transcription Audio ───────────────────────────────────
       # OPTION 1 (recommandée) : Groq Whisper API — gratuit, ultra-rapide

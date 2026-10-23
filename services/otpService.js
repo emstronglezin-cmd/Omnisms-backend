@@ -8,7 +8,7 @@
  *   - comparaison en temps constant (timingSafeEqual) ;
  *   - consommation transactionnelle quand disponible (anti courses / brute force parallèle) ;
  *   - limites par numéro/heure et par IP/heure (rateStore Redis/mémoire) + cooldown de renvoi ;
- *   - transporteur abstrait : OTP_PROVIDER = auto (Infobip si configuré) | infobip | gateway
+ *   - transporteur abstrait : OTP_PROVIDER = auto (SMSGate si configuré) | smsgate | gateway
  *     (INfiniReach — déconseillé pour l'OTP : dépend du téléphone passerelle, exige
  *     OTP_ALLOW_GATEWAY_TRANSPORT=true) | none (aucun envoi, réponse d'erreur contrôlée —
  *     jamais de faux succès, jamais de simulation) ;
@@ -63,19 +63,21 @@ function _setTransportForTests(transport) {
 function resolveTransport() {
   if (_testTransport) return { name: 'test', send: _testTransport };
   const provider = String(process.env.OTP_PROVIDER || 'auto').trim().toLowerCase();
+  // SMSGate (open source) — recommandé pour l'OTP via SERVEUR PRIVÉ (voir
+  // docs/SMSGATE_MIGRATION.md §1 : l'API publique n'est pas conseillée pour
+  // les données sensibles).
   try {
-    const infobip = require('./infobip');
-    if ((provider === 'auto' || provider === 'infobip') && infobip && infobip.isConfigured()) {
+    const smsgate = require('./smsGateProvider');
+    if ((provider === 'auto' || provider === 'smsgate') && smsgate && smsgate.isConfigured && smsgate.isConfigured()) {
       return {
-        name: 'infobip',
-        send: (phone, text) => infobip.sendSMS({
-          to  : phone,
-          text,
-          from: process.env.INFOBIP_SENDER_ID || 'OmniSMS',
-        }),
+        name: 'smsgate',
+        send: (phone, text) => smsgate.sendSMS({ to: phone, text, ttl: 600 }),
       };
     }
-  } catch (_) { /* infobip indisponible */ }
+  } catch (_) { /* smsGateProvider indisponible */ }
+  if (provider === 'infobip') {
+    logger.warn('[OTP] OTP_PROVIDER=infobip sans effet — Infobip a été retiré du projet');
+  }
   if (provider === 'gateway') {
     // Déconseillé pour l'OTP : dépend du téléphone passerelle (quota 402 actuel,
     // indisponibilité = plus d'inscriptions). Double clé volontaire.

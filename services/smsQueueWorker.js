@@ -10,8 +10,8 @@
  *
  * Transport order :
  *   1. SMS Gateway for Android™ (Z Fold2) si OFFLINE_SMS_PROVIDER=sms_gateway (défaut)
- *   2. Infobip si OFFLINE_SMS_PROVIDER=infobip OU si Gateway non configuré
- *   3. Fallback Infobip si OFFLINE_SMS_FALLBACK_TO_INFOBIP=true
+ *   2. INfiniReach si OFFLINE_SMS_PROVIDER=sms_gateway explicitement (sinon en pause).
+ *   3. Infobip : retiré du projet.
  *
  * If Redis is unavailable → jobs execute inline (queueService fallback).
  *
@@ -46,34 +46,33 @@ function getSmsGateway() {
   try { return require('./smsGateway'); } catch (_) { return null; }
 }
 
-function getInfobip() {
-  try { return require('./infobip'); } catch (_) { return null; }
-}
-
 /* ── Transport selector ─────────────────────────────────────── */
 /**
- * Sélectionne le bon transport pour le retry SMS.
- * Même logique que messageRouter.js : Gateway d'abord, Infobip en standby.
+ * Sélectionne le transport pour le retry SMS.
+ * MIGRATION SMSGate : SMSGate prioritaire quand OFFLINE_SMS_PROVIDER=smsgate ;
+ * INfiniReach ('sms_gateway') actif uniquement s'il est explicitement sélectionné.
+ * Infobip : retiré du projet (plus de fallback).
  *
  * @returns {{ provider: string, send: Function }|null}
  */
 function selectTransport() {
   const smsGateway = getSmsGateway();
-  const infobip    = getInfobip();
 
-  // SMS Gateway en premier si configuré et actif
+  try {
+    const smsgate = require('./smsGateProvider');
+    if (smsgate && smsgate.isEnabled && smsgate.isEnabled()) {
+      return {
+        provider: 'smsgate',
+        send    : (opts) => smsgate.sendSMS(opts),
+      };
+    }
+  } catch (_) { /* provider absent */ }
+
+  // INfiniReach si (et seulement si) explicitement sélectionné
   if (smsGateway && smsGateway.isSmsGatewayProvider() && smsGateway.isConfigured()) {
     return {
       provider: 'sms_gateway',
       send    : (opts) => smsGateway.sendSMS(opts),
-    };
-  }
-
-  // Infobip en standby si configuré
-  if (infobip && infobip.isConfigured()) {
-    return {
-      provider: 'infobip',
-      send    : ({ to, text }) => infobip.sendSMS({ to, text }),
     };
   }
 
@@ -139,29 +138,8 @@ async function processSmsJob(job) {
     throw err; // BullMQ will retry
   }
 
-  // Si le transport principal (Gateway) échoue ET fallback Infobip activé
-  // ⚠️  Pendant la phase de test INfiniReach : mettre OFFLINE_SMS_FALLBACK_TO_INFOBIP=false
-  //     sur Render pour voir clairement les erreurs INfiniReach sans masquage Infobip.
-  //     Remettre à true en production pour la résilience.
-  if (!result.success && transport.provider === 'sms_gateway') {
-    const smsGateway = getSmsGateway();
-    const infobip    = getInfobip();
-    if (smsGateway && smsGateway.isInfobipFallbackEnabled() && infobip && infobip.isConfigured()) {
-      logger.warn('[SmsWorker] Gateway failed — tentative Infobip fallback', {
-        jobId: job.id,
-        error: result.error,
-      });
-      try {
-        const fallback = await infobip.sendSMS({ to, text });
-        if (fallback.success) {
-          result = { ...fallback, provider: 'infobip_fallback' };
-          logger.info('[SmsWorker] Infobip fallback réussi', { jobId: job.id });
-        }
-      } catch (fbErr) {
-        logger.warn('[SmsWorker] Infobip fallback threw', { error: fbErr.message });
-      }
-    }
-  }
+  // Aucun fallback fournisseur : INfiniReach en pause / SMSGate en échec = erreur
+  // visible et retry BullMQ standard (jamais de bascule silencieuse — règle projet).
 
   const db = getDb();
 

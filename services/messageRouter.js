@@ -592,13 +592,25 @@ async function routeMessage(opts = {}) {
     e164Target = normalizePhone(targetPhone) || (targetPhone || '').replace(/\s/g, '');
   }
 
-  // Déterminer le transport Offline actif
+  // Déterminer le transport Offline actif.
+  // MIGRATION SMSGate : OFFLINE_SMS_PROVIDER=smsgate → SMSGateProvider (prioritaire).
+  // INfiniReach ('sms_gateway') : MIS EN PAUSE — actif uniquement si sélectionné
+  // explicitement. Infobip : RETIRÉ du projet (plus aucun transport, plus de fallback).
   let smsGateway = null;
-  let infobip    = null;
+  let smsgate    = null;
   let transport  = 'none';
 
   try { smsGateway = require('./smsGateway'); } catch (_) {}
-  try { infobip    = require('./infobip');    } catch (_) {}
+  try { smsgate    = require('./smsGateProvider'); } catch (_) {}
+  const smsgateEnabled = !!(smsgate && smsgate.isEnabled && smsgate.isEnabled());
+  const infiniReachSelected = !!(smsGateway && smsGateway.isSmsGatewayProvider && smsGateway.isSmsGatewayProvider());
+  if (smsgateEnabled) transport = 'smsgate';
+  else if (infiniReachSelected) {
+    if (smsGateway.isConfigured && smsGateway.isConfigured()) transport = 'sms_gateway';
+    else logger.warn('[ROUTING] INfiniReach sélectionné mais non configuré — aucun transport SMS');
+  } else if (infiniReachSelected === false && (smsGateway && smsGateway.getActiveProvider ? smsGateway.getActiveProvider() : '') === 'sms_gateway') {
+    logger.warn('[ROUTING] INfiniReach EN PAUSE — OFFLINE_SMS_PROVIDER=smsgate attendu pour SMSGate');
+  }
 
   // SESSION 13 — destinataire résolu SANS numéro de téléphone (ex : compte
   // créé via Google, username résolu dont le profil n'a pas de phone).
@@ -613,19 +625,14 @@ async function routeMessage(opts = {}) {
     });
   }
 
-  const useGateway = smsGateway && smsGateway.isSmsGatewayProvider() && smsGateway.isConfigured();
-  const useInfobip = infobip    && infobip.isConfigured();
+  const useGateway = !smsgateEnabled && infiniReachSelected && smsGateway && smsGateway.isConfigured && smsGateway.isConfigured();
 
   if (!e164Target) {
     transport = 'none'; // ne jamais appeler un provider sans destination
+  } else if (smsgateEnabled) {
+    transport = 'smsgate';
   } else if (useGateway) {
     transport = 'sms_gateway';
-  } else if (useInfobip) {
-    transport = 'infobip';
-    logger.info('[ROUTING] SMS Gateway non configuré — utilisation Infobip (standby)', {
-      senderUid,
-      targetPhone: e164Target.replace(/\d{4}$/, '****'),
-    });
   } else {
     logger.warn('[ROUTING] Aucun transport SMS configuré — message externe non délivré', {
       senderUid,
@@ -711,7 +718,8 @@ async function routeMessage(opts = {}) {
       }
       // Réponse explicite à l'expéditeur (limitée dans le temps — anti-spam)
       const sendReply = (transport === 'sms_gateway' && smsGateway) ? (o) => smsGateway.sendSMS(o)
-        : (useInfobip && infobip ? (o) => infobip.sendSMS(o) : null);
+        : (transport === 'smsgate' && smsgate) ? (o) => smsgate.sendSMS(o)
+        : null;
       await _billing.notifyInsufficientBalance({ db, uid: senderUid, senderPhoneE164: senderE164, sendSms: sendReply });
       return {
         route         : 'SMS_EXTERNE',
@@ -741,35 +749,15 @@ async function routeMessage(opts = {}) {
           ttl      : 3600,
         });
 
-        // Si Gateway échoue ET fallback Infobip activé → tenter Infobip
-        // ⚠️  Pendant la phase de test INfiniReach : mettre OFFLINE_SMS_FALLBACK_TO_INFOBIP=false
-        //     sur Render pour voir clairement les erreurs INfiniReach sans masquage Infobip.
-        if (!smsResult.success && smsGateway.isInfobipFallbackEnabled() && useInfobip) {
-          logger.warn('[ROUTING] SMS Gateway failed — tentative Infobip (fallback)', {
-            to: e164Target.replace(/\d{4}$/, '****'),
-            error: smsResult.error,
-          });
-          const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
-          const fallbackResult = await infobip.sendSMS({
-            to       : e164Target,
-            text     : smsText,
-            notifyUrl: deliveryUrl,
-          });
-          if (fallbackResult.success) {
-            smsResult = { ...fallbackResult, provider: 'infobip_fallback' };
-            logger.info('[ROUTING] Infobip fallback réussi', {
-              to: e164Target.replace(/\d{4}$/, '****'),
-            });
-          }
-        }
-
-      } else if (transport === 'infobip') {
-        // ── Transport standby : Infobip ──────────────────────
-        const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
-        smsResult = await infobip.sendSMS({
+        // Aucun fallback automatique : INfiniReach en pause/échec = erreur visible
+        // (pas de bascule silencieuse de fournisseur — règle projet).
+      } else if (transport === 'smsgate') {
+        // ── Transport SMSGate (open source) ──────────────────
+        smsResult = await smsgate.sendSMS({
           to       : e164Target,
           text     : smsText,
-          notifyUrl: deliveryUrl,
+          messageId: savedId !== msgId ? savedId : null,
+          ttl      : 3600,
         });
       }
 

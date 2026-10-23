@@ -55,8 +55,9 @@
  *   INFINIREACH_ENABLED    (optionnel, défaut: true)
  *
  *   Sélection transport :
- *   OFFLINE_SMS_PROVIDER           : 'sms_gateway' (défaut) | 'infobip'
- *   OFFLINE_SMS_FALLBACK_TO_INFOBIP: 'true' pour fallback Infobip sur échec
+ *   OFFLINE_SMS_PROVIDER           : 'sms_gateway' (INfiniReach, défaut historique)
+ *                                    | 'smsgate' (SMSGate open source — recommandé)
+ *   Infobip : retiré du projet (aucun fallback).
  *
  * ── Compatibilité avec l'architecture existante ───────────────────────────
  *
@@ -118,10 +119,11 @@ function isSmsGatewayProvider() {
 }
 
 /**
- * Retourne true si le fallback Infobip est activé en cas d'erreur.
+ * DEPRÉCIÉ — Infobip a été retiré du projet. Conservé pour compatibilité
+ * d'appel : retourne toujours false (aucun fallback automatique, règle projet).
  */
 function isInfobipFallbackEnabled() {
-  return process.env.OFFLINE_SMS_FALLBACK_TO_INFOBIP === 'true';
+  return false;
 }
 
 /* ── Diagnostic de démarrage ────────────────────────────────── */
@@ -145,8 +147,8 @@ function logStartupDiagnostic() {
   logger.info(`[InfiniReach] INFINIREACH_WEBHOOK_SECRET : ${webhookSecret ? 'CONFIGURED' : 'non défini (mode permissif)'}`);
   logger.info('[Offline SMS] ──────────────────────────────────────────────────────');
   logger.info(`[Offline SMS] OFFLINE_SMS_PROVIDER           : ${provider} (${isGw ? 'INfiniReach' : 'autre'})`);
-  logger.info(`[Offline SMS] OFFLINE_SMS_FALLBACK_TO_INFOBIP: ${isInfobipFallbackEnabled() ? 'true (fallback Infobip actif)' : 'false (Infobip désactivé pendant test INfiniReach)'}`);
-  logger.info(`[Offline SMS] Transport résolu : ${isGw ? 'INfiniReach Z Fold2' : 'Infobip standby ou aucun'}`);
+  logger.info(`[Offline SMS] Infobip : retiré du projet (aucun fallback)`);
+  logger.info(`[Offline SMS] Transport résolu : ${isGw ? 'INfiniReach Z Fold2 (défaut historique)' : 'SMSGate ou aucun'}`);
   logger.info(`[Offline SMS] isConfigured()   : ${cfg ? 'YES ✅' : 'NO ❌ — vérifier INFINIREACH_API_KEY + INFINIREACH_FROM_NUMBER'}`);
   logger.info('[InfiniReach] ──────────────────────────────────────────────────────');
 
@@ -531,7 +533,7 @@ function getStatus() {
     hasFromNumber   : !!fromNumber,
     fromNumber      : fromNumber ? fromNumber.replace(/\d{4}$/, '****') : null,
     hasWebhookSecret: !!webhookSecret,
-    infobipFallback : isInfobipFallbackEnabled(),
+    infobipFallback : false, // retiré du projet
   };
 }
 

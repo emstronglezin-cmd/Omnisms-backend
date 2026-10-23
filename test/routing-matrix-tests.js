@@ -490,9 +490,12 @@ test('9.h Aucun "to: fromE164" dans l\'inbound (Bug 1 Session 7 corrigé)', () =
   );
 });
 
-test('9.i Infobip non modifié (Infobip non supprimé)', () => {
+test('9.i Infobip retiré du projet (migration SMSGate, décision opérateur)', () => {
   const infobipFile = path.join(__dirname, '..', 'services', 'infobip.js');
-  assert(fs.existsSync(infobipFile), 'services/infobip.js doit exister (Infobip non supprimé)');
+  assert(!fs.existsSync(infobipFile), 'services/infobip.js doit être supprimé (Infobip retiré)');
+  const routerSrc = fs.readFileSync(path.join(__dirname, '..', 'services', 'messageRouter.js'), 'utf8');
+  assert(!/require\(['"]\.\.?\/infobip['"]\)/.test(routerSrc), 'messageRouter ne doit plus requérir Infobip');
+  assert(!/OFFLINE_SMS_FALLBACK_TO_INFOBIP\s*===/.test(routerSrc), 'plus de fallback Infobip dans messageRouter');
 });
 
 test('9.j InfiniReach non modifié (smsGateway non supprimé)', () => {

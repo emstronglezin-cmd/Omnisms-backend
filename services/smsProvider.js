@@ -1,58 +1,45 @@
 'use strict';
 /**
- * OmniSMS — SMS Provider Status
- *
- * Active provider: Infobip only.
- * All legacy providers have been removed — Infobip is the sole active provider.
- *
- * For outbound SMS use: require('./infobip').sendSMS(...)
- * For status checks:    getProviderStatus()
+ * OmniSMS — SMS Provider Status (neutre).
+ * Fournisseurs possibles : smsgate (SMSGate open source) | sms_gateway (INfiniReach, en pause
+ * sauf sélection explicite). Infobip : retiré du projet.
+ * Pour l'envoi : passer par services/smsGateway.js (point d'entrée unique) ou
+ * services/smsGateProvider.js (SMSGate direct).
  */
 
-const { logger } = require('../middleware/logger');
-
-/**
- * Returns the active SMS provider status.
- * Kept for backward-compat with server.js health checks.
- */
 function getProviderStatus() {
-  const infobipOk = !!(process.env.INFOBIP_API_KEY && process.env.INFOBIP_BASE_URL);
+  let smsgate = false;
+  try { const p = require('./smsGateProvider'); smsgate = !!(p.isConfigured && p.isConfigured()); } catch (_) {}
+  const infiniReach = !!(process.env.INFINIREACH_API_KEY && process.env.INFINIREACH_FROM_NUMBER
+    && process.env.INFINIREACH_ENABLED !== 'false');
+  const selected = String(process.env.OFFLINE_SMS_PROVIDER || 'sms_gateway').toLowerCase().trim();
+  const activeProvider = selected === 'smsgate' && smsgate ? 'smsgate'
+    : selected === 'sms_gateway' && infiniReach ? 'sms_gateway'
+    : 'none';
   return {
-    activeProvider: infobipOk ? 'infobip' : 'none',
-    infobip: {
-      configured: infobipOk,
-      baseUrl   : process.env.INFOBIP_BASE_URL || null,
-      senderId  : process.env.INFOBIP_SENDER_ID || 'OmniSMS',
-    },
+    activeProvider,
+    selected,
+    smsgate: { configured: smsgate },
+    sms_gateway: { configured: infiniReach, paused: selected !== 'sms_gateway' },
   };
 }
 
-/**
- * Send an SMS via the active provider (Infobip).
- * Thin wrapper so existing callers don't break.
- */
 async function sendSMS(to, message) {
-  const infobip = require('./infobip');
-
-  if (!infobip.isConfigured()) {
-    logger.warn('[smsProvider] Infobip not configured — cannot send SMS', { to });
-    return {
-      success : false,
-      provider: 'infobip',
-      error   : 'INFOBIP_API_KEY and INFOBIP_BASE_URL must be set in Render environment variables.',
-    };
-  }
-
-  const result = await infobip.sendSMS({ to, text: message });
-  return {
-    success : result.success,
-    provider: 'infobip',
-    result  : result,
-    error   : result.success ? null : result.error,
-  };
+  try {
+    const p = require('./smsGateProvider');
+    if (p.isEnabled && p.isEnabled()) {
+      const r = await p.sendSMS({ to, text: message });
+      return { success: !!r.success, provider: 'smsgate', result: r, error: r.success ? null : r.error };
+    }
+  } catch (_) {}
+  try {
+    const g = require('./smsGateway');
+    if (g.isSmsGatewayProvider() && g.isConfigured()) {
+      const r = await g.sendSMS({ to, text: message });
+      return { success: !!r.success, provider: 'sms_gateway', result: r, error: r.success ? null : r.error };
+    }
+  } catch (_) {}
+  return { success: false, provider: 'none', error: 'Aucun fournisseur SMS actif (voir OFFLINE_SMS_PROVIDER).' };
 }
 
-module.exports = {
-  sendSMS,
-  getProviderStatus,
-};
+module.exports = { sendSMS, getProviderStatus };
