@@ -47,3 +47,69 @@
 ## 5. Réversibilité
 
 Retour à l'ancien monde = **une variable** : `OFFLINE_SMS_PROVIDER=sms_gateway` (INfiniReach redevient actif s'il est configuré) — aucun code à redéployer. `SMSGATE_*` retirées = SMSGate hors service. Jamais d'envoi simultané par deux fournisseurs.
+
+---
+
+## 6. Livraison — fichiers modifiés (commits `8bcc931`, `18aeb03`, `ed?…`)
+
+| Fichier | Rôle |
+|---|---|
+| `services/smsGateProvider.js` (**nouveau**) | Fournisseur SMSGate : JWT (token+refresh avec rotation, scopes minimaux), envoi `POST /messages`, statuts `GET /messages/{id}` (Pending/Sent/Delivered/Failed), timeout configurable, 429 géré, anti-doublon sur résultats ambigus, zéro secret dans les logs |
+| `services/smsGateway.js` | Délégation à SMSGate quand `OFFLINE_SMS_PROVIDER=smsgate` (point d'entrée unique : routeur, webhook entrant, OTP) ; `isInfobipFallbackEnabled()` → false (déprécié) ; INfiniReach intact mais **jamais appelé** dans ce mode |
+| `services/messageRouter.js` | Sélection : smsgate > sms_gateway (si explicitement choisi) > none ; fallbacks Infobip supprimés ; branche smsgate d'envoi direct |
+| `services/smsQueueWorker.js` | `selectTransport()` : smsgate prioritaire ; plus aucun fallback fournisseur |
+| `services/otpService.js` | `OTP_PROVIDER=auto|smsgate` → SMSGate ; valeur `infobip` → avertissement sans effet |
+| `services/smsProvider.js` | Réécrit neutre (statut/envoi par fournisseur actif) |
+| `server.js` | Infobip retiré (montages, `/health`, diag, carte des routes) ; `smsProvider` rapporté à la place |
+| **Supprimés** | `services/infobip.js`, `routes/infobip.inbound.js`, `routes/sms.infobip.js` |
+| `render.yaml`, `.env.example` | `INFOBIP_*` retirés ; `SMSGATE_*` + `OFFLINE_SMS_PROVIDER` documentés (sync:false, aucune valeur) |
+| `test/smsgate-provider-tests.js` (**nouveau**) | 18 checks contre serveur SMSGate simulé local |
+| `test/routing-matrix-tests.js` | Test 9.i inversé : Infobip doit être ABSENT |
+
+## 7. Variables d'environnement exactes (Render)
+
+| Variable | Valeur | Obligatoire |
+|---|---|---|
+| `OFFLINE_SMS_PROVIDER` | `smsgate` | ✅ (sinon INfiniReach historique) |
+| `SMSGATE_BASE_URL` | `https://api.sms-gate.app` (cloud) ou l'URL de ton serveur privé | ✅ |
+| `SMSGATE_USERNAME` | identifiant du compte/panel SMSGate | ✅ |
+| `SMSGATE_PASSWORD` | mot de passe (**secret Render**, jamais ailleurs) | ✅ |
+| `SMSGATE_DEVICE_ID` | id d'un appareil précis | ❌ (omis = n'importe quel appareil en ligne) |
+| `SMSGATE_REQUEST_TIMEOUT_MS` | `10000` | ❌ |
+| `SMSGATE_AUTH_MODE` | `jwt` (défaut) ou `basic` | ❌ |
+| `SMSGATE_API_PREFIX` | `/3rdparty/v1` (défaut ; `''` uniquement si serveur local de l'app) | ❌ |
+| Retrait Infobip | supprimer `INFOBIP_API_KEY`, `INFOBIP_BASE_URL`, `INFOBIP_SENDER_ID`, `OFFLINE_SMS_FALLBACK_TO_INFOBIP` de Render | recommandé |
+
+## 8. Étapes manuelles SMSGate (à faire de ton côté)
+
+1. **Installer l'app** « SMS Gateway for Android » sur le téléphone Android dédié, l'ouvrir, accepter SMS/téléphone.
+2. **Choisir le mode** : (a) **recommandé OTP** = serveur privé auto-hébergé (dépôt `android-sms-gateway/server`, Docker : `docker run -p 8000:8000 ...`, créer le compte dans le web panel, HTTPS obligatoire devant) → `SMSGATE_BASE_URL` = ton instance ; (b) cloud public `https://api.sms-gate.app` → créer un compte (⚠️ les SMS OTP transiteraient par l'infrastructure tierce — acceptable seulement après ta décision explicite).
+3. Noter **identifiant/mot de passe** → variables Render.
+4. Récupérer l'**ID de l'appareil** (web panel ou `GET /3rdparty/v1/devices`) si tu veux l'épingler → `SMSGATE_DEVICE_ID`.
+5. Désactiver la batterie optimisée pour l'app sur Android (fiabilité).
+
+## 9. Test sur ton vrai téléphone (avant toute activation prod)
+
+1. Variables SMSGATE remplies + `OFFLINE_SMS_PROVIDER=smsgate` sur le service **staging** (ou local avec ton instance).
+2. `POST /api/diag/sms-test` (header `x-admin-key`, body `{"to":"+226XXXXXXXX"}`) → le SMS doit arriver sur un vrai numéro → vérifier l'accusé dans SMSGate (état Delivered).
+3. Inscription OTP de test si `PHONE_VERIFICATION_REQUIRED=true` → recevoir le code.
+4. Message externe via l'app (destinataire sans OmniSMS) → reçu en SMS.
+⚠️ **Tant que ce test réel n'est pas fait, la migration ne peut pas être déclarée fonctionnelle en production.**
+
+## 10. Déploiement progressif
+
+1. Staging d'abord (`OFFLINE_SMS_PROVIDER=smsgate`) → §9 OK.
+2. Prod : remplir `SMSGATE_*` **sans** changer `OFFLINE_SMS_PROVIDER` → déployer (aucun changement de comportement, provider inactif).
+3. Basculer `OFFLINE_SMS_PROVIDER=smsgate` → surveiller 24 h : `[SMSGate]` dans les logs, `/health` → `checks.smsProvider`, taux de `pending`/`failed`.
+4. Supprimer ensuite les variables `INFOBIP_*` de Render.
+
+## 11. Retour arrière (< 2 min, sans déploiement)
+
+Render → `OFFLINE_SMS_PROVIDER=sms_gateway` (+ `INFINIREACH_*` valides) → le service redéploie/reboot → INfiniReach redevient le transport. SMSGate peut être neutralisé en vidant `SMSGATE_BASE_URL`. Aucun changement de code nécessaire.
+
+## 12. Résultats réels des tests (locaux, serveur SMSGate simulé, aucun SMS réel)
+
+- `test/smsgate-provider-tests.js` : **18 PASS** (auth JWT + Bearer/Basic, id tableau géré, 4 états, numéro invalide rejeté localement, 500/timeout = ambigu, **retry sans doublon vérifié**, 429, délégation smsGateway, OTP branché).
+- Régression : **20 suites vertes** (routage, quota-402, crédits, OTP 17+25, OAuth 31, présence 16, offline-hold 11, account-deletion 16, etc.).
+- Boot réel vérifié : `/health` 200 avec `smsProvider` actif/inactif correct.
+- **Non testé (impossible en sandbox)** : SMS réel vers un vrai numéro, serveur SMSGate réel (cloud ou privé), DLR réels de bout en bout, multi-appareils. À faire via §9 avant production.
