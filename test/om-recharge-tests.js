@@ -95,7 +95,9 @@ const replies = [];
   const intents = [...db._store.get('payment_intents').values()];
   check('intention pending créée (montant attendu, payeur, expiration 30 min)', intents.length === 1
     && intents[0].status === 'pending' && intents[0].amountFcfa === 600 && intents[0].phone === '+22670000001'
-    && new Date(intents[0].expiresAt) - new Date(intents[0].createdAt) === 30 * 60 * 1000, intents[0] && intents[0].status);
+    // Tolérance 5 ms : createdAt et expiresAt sont deux lectures d'horloge
+    // distinctes (une frontière de ms peut s'intercaler) — le flocon était ici.
+    && Math.abs(new Date(intents[0].expiresAt) - new Date(intents[0].createdAt) - 30 * 60 * 1000) <= 5, intents[0] && intents[0].status);
 
   // Le même SMS Orange Money traité 2 fois (replay webhook) → 1 seul crédit
   const omSms = { senderId: 'ORANGE MONEY', body: 'Vous avez recu 600 FCFA du +226 70 00 00 01 le 11/10/2026. ID transaction: MP261011.1500.XZZ777.' };

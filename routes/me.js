@@ -41,6 +41,11 @@ router.get('/', auth, async (req, res) => {
     }));
   } catch (err) {
     logger.error('Erreur GET /me', { error: err.message });
+    if (/entity value too large|exceeds maximum allowed|RESOURCE_EXHAUSTED|too large/i.test(err.message)) {
+      // Firestore : document > 1 Mo (avatar data URI + contacts_synced…).
+      // Échec HONNÊTE : la photo n'est PAS persistée — le client doit réduire.
+      return res.status(413).json({ error: "Photo trop grande pour le profil (limite Firestore 1 Mo, contacts inclus). Réduisez la taille de l'image.", code: 'AVATAR_DOC_TOO_LARGE' });
+    }
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
@@ -122,6 +127,11 @@ router.put('/profile', auth, async (req, res) => {
     });
   } catch (err) {
     logger.error('Erreur PUT /me/profile', { error: err.message });
+    if (/entity value too large|exceeds maximum allowed|RESOURCE_EXHAUSTED|too large/i.test(err.message)) {
+      // Firestore : document > 1 Mo (avatar data URI + contacts_synced…).
+      // Échec HONNÊTE : la photo n'est PAS persistée — le client doit réduire.
+      return res.status(413).json({ error: "Photo trop grande pour le profil (limite Firestore 1 Mo, contacts inclus). Réduisez la taille de l'image.", code: 'AVATAR_DOC_TOO_LARGE' });
+    }
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
@@ -154,6 +164,11 @@ router.delete('/', auth, async (req, res) => {
     });
   } catch (err) {
     logger.error('Erreur DELETE /me', { error: err.message });
+    if (/entity value too large|exceeds maximum allowed|RESOURCE_EXHAUSTED|too large/i.test(err.message)) {
+      // Firestore : document > 1 Mo (avatar data URI + contacts_synced…).
+      // Échec HONNÊTE : la photo n'est PAS persistée — le client doit réduire.
+      return res.status(413).json({ error: "Photo trop grande pour le profil (limite Firestore 1 Mo, contacts inclus). Réduisez la taille de l'image.", code: 'AVATAR_DOC_TOO_LARGE' });
+    }
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });
@@ -270,6 +285,11 @@ router.post('/avatar', auth, (req, res, next) => {
 
   } catch (err) {
     logger.error('Erreur POST /me/avatar', { error: err.message });
+    if (/entity value too large|exceeds maximum allowed|RESOURCE_EXHAUSTED|too large/i.test(err.message)) {
+      // Firestore : document > 1 Mo (avatar data URI + contacts_synced…).
+      // Échec HONNÊTE : la photo n'est PAS persistée — le client doit réduire.
+      return res.status(413).json({ error: "Photo trop grande pour le profil (limite Firestore 1 Mo, contacts inclus). Réduisez la taille de l'image.", code: 'AVATAR_DOC_TOO_LARGE' });
+    }
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
   }
 });

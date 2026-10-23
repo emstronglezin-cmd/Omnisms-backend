@@ -11,6 +11,7 @@ const router       = express.Router();
 const db           = require('../config/firebase');
 const authenticate = require('../middleware/authenticate');
 const { logger }   = require('../middleware/logger');
+const { withAvatarFields } = require('../services/profileSerializer');
 const {
   resolveUserByPhone,
   resolveUserByUsername,
@@ -54,7 +55,7 @@ router.get('/', authenticate, async (req, res) => {
 
     // Sort in-memory (avoids composite index requirement)
     const groups = snap.docs
-      .map(d => ({ id: d.id, ...d.data() }))
+      .map(d => withAvatarFields({ id: d.id, ...d.data() }, d.data().image || d.data().avatar))
       .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 
     return res.status(200).json(groups);
@@ -77,7 +78,7 @@ router.get('/:id', authenticate, async (req, res) => {
     if (!(data.members || []).includes(req.user.uid) && data.ownerId !== req.user.uid) {
       return res.status(403).json({ error: 'Accès refusé.', code: 'FORBIDDEN' });
     }
-    return res.status(200).json({ id: snap.id, ...data });
+    return res.status(200).json(withAvatarFields({ id: snap.id, ...data }, data.image || data.avatar));
   } catch (err) {
     logger.error('Erreur récupération groupe', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
@@ -200,13 +201,13 @@ router.post('/:id/members', authenticate, async (req, res) => {
       failed  : failed.length,
     });
 
-    return res.status(200).json({
+    return res.status(200).json(withAvatarFields({
       id     : updated.id,
       ...updatedData,
       addedCount : resolved.length,
       failedCount: failed.length,
       failed,
-    });
+    }, updatedData.image || updatedData.avatar));
   } catch (err) {
     logger.error('Erreur ajout membres', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
@@ -233,7 +234,7 @@ router.delete('/:id/members/:memberId', authenticate, async (req, res) => {
     await ref.update({ members, updatedAt: new Date().toISOString() });
 
     const updated = await ref.get();
-    return res.status(200).json({ id: updated.id, ...updated.data() });
+    return res.status(200).json(withAvatarFields({ id: updated.id, ...updated.data() }, updated.data().image || updated.data().avatar));
   } catch (err) {
     logger.error('Erreur suppression membre', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
@@ -307,7 +308,7 @@ router.put('/:id', authenticate, async (req, res) => {
     const updated = await ref.get();
 
     logger.info('Groupe mis à jour', { groupId: id, owner: req.user.uid });
-    return res.status(200).json({ id: updated.id, ...updated.data() });
+    return res.status(200).json(withAvatarFields({ id: updated.id, ...updated.data() }, updated.data().image || updated.data().avatar));
   } catch (err) {
     logger.error('Erreur mise à jour groupe', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
@@ -387,7 +388,7 @@ router.post('/:id/avatar', authenticate, (req, res, next) => {
     // Stocker base64 dans Firestore (persistant après redeploy Render)
     await ref.update({ image: imageBase64, updatedAt: new Date().toISOString() });
     logger.info('[Groups] Group avatar updated (base64 in Firestore)', { groupId: id });
-    return res.status(200).json({ success: true, imageUrl: imageBase64 });
+    return res.status(200).json({ success: true, imageUrl: imageBase64, avatarUrl: imageBase64, photoUrl: imageBase64 });
   } catch (err) {
     logger.error('Erreur upload image groupe', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
@@ -430,6 +431,8 @@ router.get('/:id/members', authenticate, async (req, res) => {
               name    : u.name     || u.username || uid,
               username: u.username || null,
               avatar  : u.avatar   || null,
+              avatarUrl: u.avatar  || null,
+              photoUrl : u.avatar  || null,
               phone   : u.phone    || null,
               isOwner : uid === data.ownerId,
             });

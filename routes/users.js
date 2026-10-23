@@ -11,6 +11,7 @@ const router       = express.Router();
 const db           = require('../config/firebase');
 const authenticate = require('../middleware/authenticate');
 const { logger }   = require('../middleware/logger');
+const { withAvatarFields } = require('../services/profileSerializer');
 
 // ── POST /users/link — associer phone / publicId ─────────────
 router.post('/link', authenticate, async (req, res) => {
@@ -38,7 +39,7 @@ router.post('/link', authenticate, async (req, res) => {
         updatedAt: now,
       };
       await ref.set(newUser);
-      return res.status(201).json({ id: req.user.uid, ...newUser });
+      return res.status(201).json(withAvatarFields({ id: req.user.uid, ...newUser }));
     }
 
     const updates = { lastSeen: now, updatedAt: now, channel: 'online' };
@@ -48,7 +49,7 @@ router.post('/link', authenticate, async (req, res) => {
     await ref.update(updates);
 
     const updated = await ref.get();
-    return res.status(200).json({ id: updated.id, ...updated.data() });
+    return res.status(200).json(withAvatarFields({ id: updated.id, ...updated.data() }));
   } catch (err) {
     logger.error('Erreur /users/link', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
@@ -72,7 +73,7 @@ router.get('/:userId', authenticate, async (req, res) => {
     }
 
     const { password: _pw, ...safeUser } = snap.data();
-    return res.status(200).json({ id: snap.id, ...safeUser });
+    return res.status(200).json(withAvatarFields({ id: snap.id, ...safeUser }));
   } catch (err) {
     logger.error('Erreur GET /users/:userId', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
