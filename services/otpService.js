@@ -1,29 +1,30 @@
 'use strict';
 /**
- * OmniSMS — Service OTP (One-Time Password)
+ * OmniSMS — Service OTP (One-Time Password) — vérification du numéro à l'inscription.
  *
- * Génère, stocke et valide des codes OTP à 6 chiffres.
- * Transport : Infobip SMS (déjà intégré dans le projet).
- * Stockage  : Firestore collection `otp_codes` avec TTL de 10 minutes.
- *
- * Endpoints exposés via routes/otp.js :
- *   POST /api/auth/send-otp    → Envoyer un OTP au numéro
- *   POST /api/auth/verify-otp  → Valider un OTP et activer le compte
+ * Réutilise le parcours historique (routes/otp.js : send-otp / verify-otp) en corrigeant
+ * les failles d'audit :
+ *   - le code n'est JAMAIS stocké en clair (HMAC-SHA256) ni journalisé ;
+ *   - comparaison en temps constant (timingSafeEqual) ;
+ *   - consommation transactionnelle quand disponible (anti courses / brute force parallèle) ;
+ *   - limites par numéro/heure et par IP/heure (rateStore Redis/mémoire) + cooldown de renvoi ;
+ *   - transporteur abstrait : OTP_PROVIDER = auto (Infobip si configuré) | infobip | gateway
+ *     (INfiniReach — déconseillé pour l'OTP : dépend du téléphone passerelle, exige
+ *     OTP_ALLOW_GATEWAY_TRANSPORT=true) | none (aucun envoi, réponse d'erreur contrôlée —
+ *     jamais de faux succès, jamais de simulation) ;
+ *   - injection de transporteur pour les TESTS UNIQUEMENT (_setTransportForTests —
+ *     refusée si NODE_ENV=production) : aucun code fixe accepté en production.
  *
  * Sécurité :
- *   - Code à 6 chiffres aléatoire
- *   - TTL 10 minutes
- *   - Max 3 tentatives par code
- *   - Cooldown 60s entre envois successifs
- *   - Document supprimé après vérification réussie
+ *   - durée configurable OTP_CODE_TTL_MINUTES (défaut 5) ;
+ *   - max essais OTP_MAX_VERIFY_ATTEMPTS (défaut 5) puis invalidation ;
+ *   - invalidation de tout code précédent à chaque nouvelle demande (délai minimal de renvoi) ;
+ *   - réponses neutres (pas d'énumération de comptes) ;
+ *   - journalisation SANS code, jeton ni secret.
  */
 
 const crypto = require('crypto');
 const { logger } = require('../middleware/logger');
-
-/* ── Infobip (requis pour envoyer les OTP) ─────────────────── */
-let infobip = null;
-try { infobip = require('./infobip'); } catch (_) {}
 
 /* ── Firestore helper ──────────────────────────────────────── */
 function getDb() {
@@ -34,132 +35,201 @@ function getDb() {
   } catch (_) { return null; }
 }
 
-/* ── Constantes ────────────────────────────────────────────── */
-const OTP_TTL_MS      = 10 * 60 * 1000;  // 10 minutes
-const OTP_COOLDOWN_MS = 60 * 1000;        // 60 secondes entre envois
-const OTP_MAX_TRIES   = 3;                // Max tentatives de vérification
-const OTP_LENGTH      = 6;               // Longueur du code
+/* ── Config (validée avec défauts sûrs) ────────────────────── */
+const num = (v, def, min, max) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(Math.max(n, min), max) : def;
+};
+const OTP_TTL_MS      = num(process.env.OTP_CODE_TTL_MINUTES, 5, 1, 30) * 60 * 1000;
+const OTP_COOLDOWN_MS = num(process.env.OTP_RESEND_COOLDOWN_SECONDS, 60, 15, 600) * 1000;
+const OTP_MAX_TRIES   = num(process.env.OTP_MAX_VERIFY_ATTEMPTS, 5, 1, 10);
+const OTP_PER_PHONE_H = num(process.env.OTP_MAX_PER_PHONE_PER_HOUR, 5, 1, 60);
+const OTP_PER_IP_H    = num(process.env.OTP_MAX_PER_IP_PER_HOUR, 20, 1, 500);
+const OTP_LENGTH      = 6;
 
-/* ── Générer un code OTP ───────────────────────────────────── */
-/**
- * Générer un code OTP à 6 chiffres cryptographiquement sécurisé.
- * @returns {string} code OTP (ex: "482931")
- */
+const hmac = (value) =>
+  crypto.createHmac('sha256', String(process.env.JWT_SECRET || 'omnisms-otp')).update(String(value)).digest('hex');
+
+/* ── Transporteur (fournisseur d'envoi) ────────────────────── */
+let _testTransport = null; // injection tests uniquement
+
+function _setTransportForTests(transport) {
+  if (String(process.env.NODE_ENV).toLowerCase() === 'production') {
+    throw new Error('_setTransportForTests interdit en production.');
+  }
+  _testTransport = transport || null;
+}
+
+function resolveTransport() {
+  if (_testTransport) return { name: 'test', send: _testTransport };
+  const provider = String(process.env.OTP_PROVIDER || 'auto').trim().toLowerCase();
+  try {
+    const infobip = require('./infobip');
+    if ((provider === 'auto' || provider === 'infobip') && infobip && infobip.isConfigured()) {
+      return {
+        name: 'infobip',
+        send: (phone, text) => infobip.sendSMS({
+          to  : phone,
+          text,
+          from: process.env.INFOBIP_SENDER_ID || 'OmniSMS',
+        }),
+      };
+    }
+  } catch (_) { /* infobip indisponible */ }
+  if (provider === 'gateway') {
+    // Déconseillé pour l'OTP : dépend du téléphone passerelle (quota 402 actuel,
+    // indisponibilité = plus d'inscriptions). Double clé volontaire.
+    if (String(process.env.OTP_ALLOW_GATEWAY_TRANSPORT || '').toLowerCase() !== 'true') {
+      return null;
+    }
+    try {
+      const smsGateway = require('./smsGateway');
+      if (smsGateway && smsGateway.isConfigured()) {
+        return {
+          name: 'gateway',
+          send: (phone, text) => smsGateway.sendSMS({ to: phone, text, ttl: 600 }),
+        };
+      }
+    } catch (_) { /* smsGateway indisponible */ }
+  }
+  return null;
+}
+
+/* ── Générer un code OTP (6 chiffres, sans biais) ──────────── */
 function generateOtpCode() {
-  const min = Math.pow(10, OTP_LENGTH - 1);        // 100000
-  const max = Math.pow(10, OTP_LENGTH) - 1;        // 999999
+  const min = Math.pow(10, OTP_LENGTH - 1);
+  const max = Math.pow(10, OTP_LENGTH) - 1;
   const range = max - min + 1;
-  const bytes = crypto.randomBytes(4);
-  const num   = bytes.readUInt32BE(0);
-  return String(min + (num % range));
+  // Rejection sampling : élimine le biais du modulo
+  const limit = Math.floor(0x100000000 / range) * range;
+  let num2 = 0;
+  do {
+    num2 = crypto.randomBytes(4).readUInt32BE(0);
+  } while (num2 >= limit);
+  return String(min + (num2 % range));
+}
+
+/* ── Texte SMS (1 segment si possible) ─────────────────────── */
+function buildSmsText(code) {
+  const minutes = Math.round(OTP_TTL_MS / 60000);
+  return `Votre code OmniSMS : ${code}\nValable ${minutes} min. Ne le partagez pas.`;
 }
 
 /* ── Envoyer un OTP ─────────────────────────────────────────── */
 /**
- * Générer un OTP, le stocker dans Firestore et l'envoyer par SMS.
- *
- * @param {string} phone - Numéro E.164 (+22670123456)
- * @param {string} [userId] - UID Firestore si connu (post-register)
- * @returns {Promise<{ success: boolean, message: string, cooldown?: number }>}
+ * @param {string} phone - Numéro E.164
+ * @param {object} [opts] { userId, ip }
+ * @returns {Promise<{ success: boolean, message: string, code?: string, cooldown?: number }>}
  */
-async function sendOtp(phone, userId = null) {
+async function sendOtp(phone, opts = {}) {
+  const userId = opts.userId || null;
+  const ip = opts.ip || null;
   if (!phone) {
     return { success: false, message: 'Numéro de téléphone requis.' };
   }
 
   const db = getDb();
+  const docId = `h:${hmac(phone)}`;
+  const rateStore = require('./rateStore');
 
-  // 1. Vérifier le cooldown (éviter le spam)
+  // 0. Limites par numéro et par IP (fenêtre 1 h) — anti spam / énumération
+  try {
+    const phoneLimit = await rateStore.hit(`rate:otp:phone:${hmac(phone)}`, 3600 * 1000, OTP_PER_PHONE_H);
+    if (phoneLimit && phoneLimit.allowed === false) {
+      return { success: false, message: 'Trop de demandes pour ce numéro. Réessayez plus tard.', code: 'OTP_RATE_LIMITED' };
+    }
+    if (ip) {
+      const ipLimit = await rateStore.hit(`rate:otp:ip:${hmac(ip)}`, 3600 * 1000, OTP_PER_IP_H);
+      if (ipLimit && ipLimit.allowed === false) {
+        return { success: false, message: 'Trop de demandes. Réessayez plus tard.', code: 'OTP_RATE_LIMITED' };
+      }
+    }
+  } catch (_) { /* rateStore indisponible : le cooldown doc ci-dessous reste */ }
+
+  // 1. Cooldown de renvoi (délai minimal) — remplace et invalide l'ancien code
   if (db) {
     try {
-      const existing = await db.collection('otp_codes').doc(phone).get();
+      const existing = await db.collection('otp_codes').doc(docId).get();
       if (existing.exists) {
         const data = existing.data();
-        const sentAt = new Date(data.sentAt).getTime();
-        const elapsed = Date.now() - sentAt;
+        const elapsed = Date.now() - new Date(data.sentAt).getTime();
         if (elapsed < OTP_COOLDOWN_MS) {
           const remaining = Math.ceil((OTP_COOLDOWN_MS - elapsed) / 1000);
           return {
             success  : false,
-            message  : `Attendez ${remaining} secondes avant de renvoyer un OTP.`,
+            message  : `Attendez ${remaining} secondes avant de demander un nouveau code.`,
             cooldown : remaining,
             code     : 'OTP_COOLDOWN',
           };
         }
       }
     } catch (e) {
-      logger.warn('[OTP] Impossible de vérifier cooldown', { error: e.message });
+      logger.warn('[OTP] Cooldown non vérifiable', { error: e.message });
     }
   }
 
-  // 2. Générer le code
-  const code    = generateOtpCode();
-  const sentAt  = new Date().toISOString();
-  const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
-
-  // 3. Stocker dans Firestore (doc ID = numéro normalisé)
-  if (db) {
-    try {
-      await db.collection('otp_codes').doc(phone).set({
-        phone,
-        userId    : userId || null,
-        code,       // En production, hashé ; ici en clair pour simplicité Firestore TTL
-        sentAt,
-        expiresAt,
-        tries     : 0,
-        verified  : false,
-      });
-    } catch (e) {
-      logger.error('[OTP] Impossible de stocker OTP Firestore', { error: e.message });
-      return { success: false, message: 'Erreur serveur — impossible de créer l\'OTP.' };
-    }
-  }
-
-  // 4. Envoyer par SMS via Infobip
-  if (!infobip || !infobip.isConfigured()) {
-    // Mode dev/test : log le code (NE PAS faire en production)
-    logger.warn('[OTP] Infobip non configuré — code OTP (TEST SEULEMENT)', { phone, code });
+  // 2. Résoudre le transporteur — JAMAIS de faux succès
+  const transport = resolveTransport();
+  if (!transport) {
+    logger.warn('[OTP] Aucun transporteur OTP disponible (OTP_PROVIDER/Infobip non configuré)');
     return {
-      success : true,
-      message : 'OTP généré (Infobip non configuré — vérifiez les logs serveur).',
-      devCode : process.env.NODE_ENV !== 'production' ? code : undefined,
+      success : false,
+      message : 'Le service de vérification est momentanément indisponible. Réessayez plus tard.',
+      code    : 'OTP_PROVIDER_UNAVAILABLE',
     };
   }
 
-  try {
-    const smsResult = await infobip.sendSMS({
-      to  : phone,
-      text: `Votre code OmniSMS : ${code}\nValable 10 minutes. Ne le partagez pas.`,
-      from: process.env.INFOBIP_SENDER_ID || 'OmniSMS',
-    });
+  // 3. Générer puis stocker l'EMPREINTE du code (jamais le code)
+  const code = generateOtpCode();
+  const sentAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
+  if (db) {
+    try {
+      await db.collection('otp_codes').doc(docId).set({
+        phoneHmac : hmac(phone),
+        codeHmac  : hmac(`${phone}:${code}`),
+        userId    : userId || null,
+        purpose   : 'registration',
+        sentAt,
+        expiresAt,
+        tries        : 0,
+        maxTries     : OTP_MAX_TRIES,
+        verified     : false,
+        consumed     : false,
+      });
+    } catch (e) {
+      logger.error('[OTP] Impossible de stocker l\'OTP', { error: e.message });
+      return { success: false, message: 'Erreur serveur — impossible de créer l\'OTP.', code: 'OTP_STORE_FAILED' };
+    }
+  }
 
-    if (smsResult.success) {
-      logger.info('[OTP] SMS OTP envoyé', { phone, messageId: smsResult.messageId });
+  // 4. Envoyer
+  try {
+    const smsResult = await transport.send(phone, buildSmsText(code));
+    if (smsResult && smsResult.success) {
+      // Journal SANS code : identifiant fournisseur + destination masquée
+      logger.info('[OTP] SMS OTP envoyé', { phone: phone.replace(/\d{4}$/, '****'), transport: transport.name, messageId: smsResult.messageId || null });
       return {
         success : true,
-        message : `Code envoyé au ${phone}. Valable 10 minutes.`,
-      };
-    } else {
-      logger.error('[OTP] Échec envoi SMS OTP', { phone, error: smsResult.error });
-      return {
-        success : false,
-        message : 'Impossible d\'envoyer le SMS. Réessayez.',
-        code    : 'SMS_SEND_FAILED',
+        message : `Code envoyé au ${phone.replace(/\d{4}$/, '****')}. Valable ${Math.round(OTP_TTL_MS / 60000)} minutes.`,
       };
     }
+    logger.warn('[OTP] Échec envoi SMS OTP (fournisseur)', { phone: phone.replace(/\d{4}$/, '****'), transport: transport.name, error: (smsResult && smsResult.error) || 'unknown' });
+    return { success: false, message: 'Impossible d\'envoyer le SMS. Réessayez.', code: 'SMS_SEND_FAILED' };
   } catch (smsErr) {
-    logger.error('[OTP] Erreur SMS OTP', { phone, error: smsErr.message });
+    logger.error('[OTP] Erreur transporteur OTP', { transport: transport.name, error: smsErr.message });
     return { success: false, message: 'Erreur lors de l\'envoi du SMS.', code: 'SMS_ERROR' };
   }
 }
 
 /* ── Vérifier un OTP ─────────────────────────────────────────── */
 /**
- * Vérifier un code OTP et activer le compte si valide.
+ * Vérifie le code et (sur succès) consomme l'OTP. L'activation du compte
+ * (users.phoneVerified / verificationRequired) est faite par l'appelant
+ * (routes/otp.js) après un résultat positif — seul le backend peut marquer
+ * « vérifié », jamais une réponse frontend.
  *
- * @param {string} phone - Numéro E.164
- * @param {string} code  - Code saisi par l'utilisateur
- * @returns {Promise<{ success: boolean, message: string, userId?: string, token?: string }>}
+ * @returns {Promise<{ success: boolean, message: string, code?: string, triesRemaining?: number }>}
  */
 async function verifyOtp(phone, code) {
   if (!phone || !code) {
@@ -168,113 +238,97 @@ async function verifyOtp(phone, code) {
 
   const db = getDb();
   if (!db) {
-    return { success: false, message: 'Base de données indisponible.' };
+    return { success: false, message: 'Base de données indisponible.', code: 'OTP_DB_UNAVAILABLE' };
   }
 
+  const docId = `h:${hmac(phone)}`;
+  const ref = db.collection('otp_codes').doc(docId);
+  const nowIso = new Date().toISOString();
+
   try {
-    const snap = await db.collection('otp_codes').doc(phone).get();
-
-    if (!snap.exists) {
-      return {
-        success : false,
-        message : 'Aucun OTP en attente pour ce numéro. Demandez un nouveau code.',
-        code    : 'OTP_NOT_FOUND',
-      };
-    }
-
-    const data = snap.data();
-
-    // Vérifier expiration
-    if (new Date(data.expiresAt) < new Date()) {
-      await db.collection('otp_codes').doc(phone).delete();
-      return {
-        success : false,
-        message : 'Code OTP expiré. Demandez un nouveau code.',
-        code    : 'OTP_EXPIRED',
-      };
-    }
-
-    // Vérifier nombre de tentatives
-    if ((data.tries || 0) >= OTP_MAX_TRIES) {
-      await db.collection('otp_codes').doc(phone).delete();
-      return {
-        success : false,
-        message : 'Trop de tentatives. Demandez un nouveau code OTP.',
-        code    : 'OTP_MAX_TRIES',
-      };
-    }
-
-    // Incrémenter le compteur de tentatives
-    await db.collection('otp_codes').doc(phone).update({
-      tries: (data.tries || 0) + 1,
-    });
-
-    // Vérifier le code
-    if (data.code !== String(code).trim()) {
-      return {
-        success       : false,
-        message       : 'Code OTP incorrect.',
-        code          : 'OTP_INVALID',
-        triesRemaining: OTP_MAX_TRIES - ((data.tries || 0) + 1),
-      };
-    }
-
-    // Code correct — activer le compte
-    const userId = data.userId;
-
-    // Marquer le numéro comme vérifié dans la collection users
-    let activatedUser = null;
-    if (userId) {
-      try {
-        await db.collection('users').doc(userId).update({
-          phoneVerified: true,
-          updatedAt    : new Date().toISOString(),
-        });
-
-        const userSnap = await db.collection('users').doc(userId).get();
-        if (userSnap.exists) {
-          activatedUser = { id: userId, ...userSnap.data() };
-          delete activatedUser.password; // Ne pas exposer le hash
+    // Consommation transactionnelle si disponible (anti validations simultanées) ;
+    // sinon lecture/écriture séquentielle (mono-instance).
+    const outcome = await (db.runTransaction
+      ? db.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists) return { code: 'OTP_NOT_FOUND' };
+        const data = snap.data();
+        const check = precheck(data);
+        if (check) {
+          if (check.code === 'OTP_EXPIRED' || check.code === 'OTP_MAX_TRIES') {
+            tx.delete(ref);
+          }
+          return check;
         }
-      } catch (e) {
-        logger.error('[OTP] Impossible d\'activer le compte', { userId, error: e.message });
-      }
-    } else {
-      // Chercher l'utilisateur par numéro de téléphone
-      try {
-        const userSnap = await db.collection('users').where('phone', '==', phone).limit(1).get();
-        if (!userSnap.empty) {
-          const userDoc = userSnap.docs[0];
-          await userDoc.ref.update({
-            phoneVerified: true,
-            updatedAt    : new Date().toISOString(),
-          });
-          const userData = userDoc.data();
-          activatedUser = { id: userDoc.id, ...userData };
-          delete activatedUser.password;
+        const codeOk = timingSafeEqualCode(phone, code, data.codeHmac);
+        tx.update(ref, codeOk
+          ? { consumed: true, verified: true, consumedAt: nowIso }
+          : { tries: (data.tries || 0) + 1, lastAttemptAt: nowIso });
+        return codeOk ? { ok: true, data } : { code: 'OTP_INVALID', triesRemaining: data.maxTries - ((data.tries || 0) + 1), data };
+      })
+      : (async () => {
+        const snap = await ref.get();
+        if (!snap.exists) return { code: 'OTP_NOT_FOUND' };
+        const data = snap.data();
+        const check = precheck(data);
+        if (check) {
+          if (check.code === 'OTP_EXPIRED' || check.code === 'OTP_MAX_TRIES') await ref.delete();
+          return check;
         }
-      } catch (e) {
-        logger.error('[OTP] Impossible de trouver l\'utilisateur par téléphone', { phone, error: e.message });
-      }
+        const codeOk = timingSafeEqualCode(phone, code, data.codeHmac);
+        await ref.update(codeOk
+          ? { consumed: true, verified: true, consumedAt: nowIso }
+          : { tries: (data.tries || 0) + 1, lastAttemptAt: nowIso });
+        return codeOk ? { ok: true, data } : { code: 'OTP_INVALID', triesRemaining: data.maxTries - ((data.tries || 0) + 1), data };
+      })());
+
+    if (outcome.ok) {
+      logger.info('[OTP] Code vérifié (consommé)', { phone: phone.replace(/\d{4}$/, '****'), userId: outcome.data.userId || null });
+      return { success: true, message: 'Numéro vérifié.', userId: outcome.data.userId || null };
     }
-
-    // Supprimer l'OTP après vérification réussie
-    await db.collection('otp_codes').doc(phone).delete();
-
-    logger.info('[OTP] Vérification réussie, compte activé', { phone, userId: activatedUser?.id });
-
-    return {
-      success      : true,
-      message      : 'Numéro vérifié. Votre compte est activé.',
-      userId       : activatedUser?.id || null,
-      user         : activatedUser,
-      phoneVerified: true,
+    if (outcome.code === 'OTP_INVALID') {
+      return {
+        success: false,
+        message: 'Code OTP incorrect.',
+        code: 'OTP_INVALID',
+        triesRemaining: Math.max(0, outcome.triesRemaining),
+      };
+    }
+    const messages = {
+      OTP_NOT_FOUND : 'Aucun code en attente pour ce numéro. Demandez un nouveau code.',
+      OTP_EXPIRED   : 'Code expiré. Demandez un nouveau code.',
+      OTP_MAX_TRIES : 'Trop de tentatives. Demandez un nouveau code.',
+      OTP_CONSUMED  : 'Code déjà utilisé. Demandez un nouveau code.',
     };
+    return { success: false, message: messages[outcome.code] || 'Code invalide.', code: outcome.code };
 
+    /* -- sous-fonctions -- */
+    function precheck(data) {
+      if (data.consumed) return { code: 'OTP_CONSUMED' };
+      if (new Date(data.expiresAt) < new Date()) return { code: 'OTP_EXPIRED' };
+      if ((data.tries || 0) >= (data.maxTries || OTP_MAX_TRIES)) return { code: 'OTP_MAX_TRIES' };
+      return null;
+    }
   } catch (err) {
-    logger.error('[OTP] Erreur vérification OTP', { phone, error: err.message });
-    return { success: false, message: 'Erreur serveur lors de la vérification OTP.' };
+    logger.error('[OTP] Erreur vérification OTP', { error: err.message });
+    return { success: false, message: 'Erreur serveur lors de la vérification OTP.', code: 'OTP_VERIFY_ERROR' };
   }
 }
 
-module.exports = { sendOtp, verifyOtp, generateOtpCode };
+function timingSafeEqualCode(phone, provided, storedHmac) {
+  try {
+    const a = Buffer.from(hmac(`${phone}:${String(provided).trim()}`), 'hex');
+    const b = Buffer.from(String(storedHmac || ''), 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (_) {
+    return false;
+  }
+}
+
+module.exports = {
+  sendOtp,
+  verifyOtp,
+  generateOtpCode,
+  _setTransportForTests,
+  _config: () => ({ OTP_TTL_MS, OTP_COOLDOWN_MS, OTP_MAX_TRIES, OTP_PER_PHONE_H, OTP_PER_IP_H }),
+};
