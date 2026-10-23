@@ -278,6 +278,25 @@ async function sendSMS({ to, text, messageId = null } = {}) {
     throw new Error('[INfiniReach] sendSMS: "to" et "text" sont requis');
   }
 
+  // ── SMSGate (open source) — fournisseur sélectionné ─────────────
+  // OFFLINE_SMS_PROVIDER=smsgate + SMSGATE_* configurés → délégation totale
+  // à SMSGateProvider. INfiniReach reste disponible en repli de CONFIGURATION
+  // (jamais appelé ici). Une seule chaîne à la fois : jamais de double envoi.
+  try {
+    const smsgate = require('./smsGateProvider');
+    if (smsgate.isEnabled()) {
+      const started = Date.now();
+      const r = await smsgate.sendSMS({ to, text, messageId });
+      try {
+        const { metricsService } = require('./metrics');
+        metricsService.smsSend('smsgate', !!r.success, Date.now() - started);
+      } catch (_) {}
+      return r;
+    }
+  } catch (sgErr) {
+    logger.warn('[SMSGate] Délégation impossible → chemin historique', { error: sgErr.message });
+  }
+
   // ── Pool de passerelles (GATEWAY_POOL_ENABLED=true, multi-appareils) ──
   // Délègue la sélection d'appareil (least-loaded, failover, breaker).
   // Désactivé par défaut : comportement mono-appareil historique.
