@@ -262,6 +262,7 @@ async function findOrCreateOmniUser(profile) {
         updatedAt: now,
       }, { merge: true });
     } else {
+      const phoneVerificationOn = String(process.env.PHONE_VERIFICATION_REQUIRED || 'false').trim().toLowerCase() === 'true';
       matchedUser = {
         name: profile.name,
         email: profile.email,
@@ -273,6 +274,13 @@ async function findOrCreateOmniUser(profile) {
         provider: 'google',
         isSubscribed: false,
         credits: 0,
+        // Politique PHONE_VERIFICATION_REQUIRED : un NOUVEAU compte Google n'est
+        // pas une preuve de possession du numéro → en attente de vérification.
+        // (L'email Google ne prouve jamais le téléphone ; les comptes EXISTANTS
+        // ne sont jamais re-bloqués — ce bloc ne s'exécute qu'à la création.)
+        phoneVerified: !phoneVerificationOn,
+        verificationRequired: phoneVerificationOn,
+        status: phoneVerificationOn ? 'pending_verification' : 'active',
         createdAt: now,
         updatedAt: now,
         lastLoginAt: now,
@@ -333,7 +341,12 @@ async function redeemLoginExchange(code) {
   const snap = await db.collection('users').doc(userId).get();
   if (!snap.exists) return null;
   const data = snap.data();
-  const token = signToken({ uid: userId, email: data.email || data.phone, name: data.name });
+  const token = signToken({
+    uid  : userId,
+    email: data.email || data.phone,
+    name : data.name,
+    verificationRequired: data.verificationRequired === true && data.phoneVerified !== true,
+  });
   return { token, user: publicUser(userId, data) };
 }
 

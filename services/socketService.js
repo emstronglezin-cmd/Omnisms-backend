@@ -101,6 +101,8 @@ async function authenticateSocket(socket) {
       email   : decoded.email || null,
       phone   : decoded.phone || null,
       authType: 'jwt',
+      // Compte en attente de vérification du numéro (claim des tokens pending)
+      verificationRequired: decoded.verificationRequired === true,
     };
   } catch (jwtErr) {
     if (jwtErr.name === 'TokenExpiredError') throw new Error('Session expirée.');
@@ -340,6 +342,14 @@ function initSocketIO(httpServer) {
         if (!receiverId || (!content && type === 'text')) {
           if (typeof ack === 'function') {
             ack({ error: 'receiverId et content sont requis.' });
+          }
+          return;
+        }
+
+        // Compte en attente de vérification du numéro → envoi interdit (403 équivalent)
+        if (socket.user && socket.user.verificationRequired === true) {
+          if (typeof ack === 'function') {
+            ack({ error: 'Vérifie ton numéro de téléphone avant d\'envoyer des messages.', code: 'PHONE_VERIFICATION_REQUIRED' });
           }
           return;
         }

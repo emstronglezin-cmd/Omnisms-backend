@@ -120,7 +120,8 @@ const globalLimiter = rateLimit({
 /** Auth : 30 tentatives / 15 min par IP (brute-force login) */
 const authLimiter = rateLimit({
   windowMs       : 15 * 60 * 1000,
-  max            : 30,
+  // Knob de charge/staging : AUTH_RATE_LIMIT_MAX (défaut 30 — inchangé).
+  max            : Number(process.env.AUTH_RATE_LIMIT_MAX || 30),
   standardHeaders: true,
   legacyHeaders  : false,
   message        : { error: 'Trop de tentatives. Réessayez dans 15 minutes.', code: 'AUTH_RATE_LIMIT' },

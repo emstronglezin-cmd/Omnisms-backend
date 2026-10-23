@@ -326,13 +326,15 @@ function loadOptional(routePath, mount) {
 /* ── Auth ────────────────────────────────────────────────── */
 app.use('/api/auth', authLimiter, requireJson, googleAuthRoutes);
 app.use('/api/auth', authLimiter, requireJson, authRoutes);
+app.use('/api/auth', authLimiter, requireJson, require('./routes/otp'));  // Vérification du numéro (send/verify/status/change)
 app.use('/auth',     authLimiter, requireJson, authRoutes);  // retrocompat
 
 /* ── Contacts v2 ─────────────────────────────────────────── */
 app.use('/api/contacts', contactsV2Routes);
 
 /* ── Messages v2 ─────────────────────────────────────────── */
-app.use('/api/messages', messagesV2Routes);
+const requirePhoneVerified = require('./middleware/requirePhoneVerified');
+app.use('/api/messages', requirePhoneVerified, messagesV2Routes);  // comptes en attente : envoi bloqué (403)
 
 /* ── Audio v2 ────────────────────────────────────────────── */
 app.use('/api/audio', audioV2Routes);

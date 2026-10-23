@@ -22,6 +22,23 @@ const { signToken } = require('../middleware/authenticate');
 const { logger }   = require('../middleware/logger');
 const { normalizePhone } = require('../services/phoneNormalizer');
 
+/* ── Vérification du numéro à l'inscription (politique) ─────────────
+ * PHONE_VERIFICATION_REQUIRED=true → les NOUVEAUX comptes restent en
+ * attente tant que le code OTP n'est pas validé. Défaut false →
+ * comportement historique (aucun changement pour l'existant).
+ * Les comptes déjà créés (avec ou sans le champ) ne sont JAMAIS
+ * re-bloqués : le blocage repose sur le claim JWT des tokens émis
+ * aux comptes pending uniquement.
+ */
+function phoneVerificationOn() {
+  return String(process.env.PHONE_VERIFICATION_REQUIRED || 'false').trim().toLowerCase() === 'true';
+}
+
+/** Jeton TEMPORAIRE limité au parcours de vérification (15 min, aucune opération privilégiée). */
+function signPendingVerificationToken(uid, phone) {
+  return signToken({ uid, phone: phone || null, purpose: 'phone_verification', verificationRequired: true }, '15m');
+}
+
 const SALT_ROUNDS = 12;
 
 // ─────────────────────────────────────────────────────────────
@@ -155,7 +172,11 @@ router.post(
         phoneRaw      : rawPhone !== e164Phone ? rawPhone : null,
         email         : normalizedEmail,
         password      : hashedPassword,
-        phoneVerified : true,    // Activé directement — pas d'OTP requis
+        // Politique de vérification : flag OFF → vérifié directement (historique).
+        // flag ON → en attente de validation du code OTP (status pending).
+        phoneVerified : phoneVerificationOn() ? false : true,
+        verificationRequired: phoneVerificationOn(),
+        status        : phoneVerificationOn() ? 'pending_verification' : 'active',
         isSubscribed  : false,
         credits       : 0,
         provider      : 'phone',
@@ -276,7 +297,29 @@ router.post(
         }
       });
 
-      // Générer le JWT immédiatement — pas d'OTP
+      // flag ON → PAS de session complète : jeton temporaire limité à la
+      // vérification du numéro (le client enchaîne sur /api/auth/send-otp).
+      if (phoneVerificationOn()) {
+        return res.status(201).json({
+          message: 'Compte créé. Vérifie ton numéro de téléphone pour activer ton compte.',
+          userId,
+          phone  : e164Phone,
+          requiresVerification: true,
+          pendingToken: signPendingVerificationToken(userId, e164Phone),
+          user: {
+            id           : userId,
+            name         : userData.name,
+            username     : normalizedUsername,
+            phone        : e164Phone,
+            email        : normalizedEmail,
+            phoneVerified: false,
+            isSubscribed : false,
+            credits      : 0,
+          },
+        });
+      }
+
+      // Comportement historique (flag OFF) — JWT complet immédiat
       const token = signToken({
         uid  : userId,
         email: normalizedEmail || e164Phone,
@@ -413,6 +456,25 @@ router.post(
       await db.collection('users').doc(user.id).update({
         lastLoginAt: new Date().toISOString(),
       });
+
+      // Compte en attente de vérification (créé sous flag ON) → PAS de session
+      // complète : le client reprend le parcours OTP (send-otp → verify-otp).
+      // Les comptes historiques (sans le champ) ne passent JAMAIS ici.
+      if (phoneVerificationOn() && user.verificationRequired === true && user.phoneVerified !== true) {
+        return res.status(200).json({
+          message: 'Vérifie ton numéro de téléphone pour activer ton compte.',
+          requiresVerification: true,
+          pendingToken: signPendingVerificationToken(user.id, user.phone || null),
+          phone: user.phone ? String(user.phone).replace(/d{4}$/, '****') : null,
+          needsPhone: !user.phone,
+          user: {
+            id           : user.id,
+            name         : user.name,
+            phone        : user.phone || null,
+            phoneVerified: false,
+          },
+        });
+      }
 
       logger.info('Login réussi', { uid: user.id });
 
