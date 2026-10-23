@@ -304,6 +304,8 @@ function publicUser(id, data) {
     email: data.email || null,
     phone: data.phone || null,
     avatar: data.avatar || null,
+    avatarUrl: data.avatar || null,
+    photoUrl: data.avatar || null,
     phoneVerified: data.phoneVerified !== false,
     isSubscribed: data.isSubscribed === true,
     credits: Number(data.credits) || 0,

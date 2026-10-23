@@ -134,6 +134,8 @@ router.post(
                 phone           : data.phone,
                 name            : contact?.name || data.name || '',
                 avatar          : data.avatar   || null,
+                avatarUrl       : data.avatar   || null,
+                photoUrl        : data.avatar   || null,
                 isOnOmniSms     : true,
                 userId          : doc.id,        // UID Firestore réel
                 registeredUserId: doc.id,        // Alias frontend
@@ -154,6 +156,8 @@ router.post(
           phone           : c.normalized,
           name            : c.name || '',
           avatar          : null,
+          avatarUrl       : null,
+          photoUrl        : null,
           isOnOmniSms     : false,
           userId          : null,
           registeredUserId: null,
@@ -172,6 +176,8 @@ router.post(
               userId           : c.userId           || null,
               registeredUserId : c.registeredUserId || null,
               avatar           : c.avatar           || null,
+              avatarUrl        : c.avatar           || null,
+              photoUrl         : c.avatar           || null,
             })),
             contacts_synced_at: new Date().toISOString(),
           }, { merge: true });
@@ -264,6 +270,8 @@ router.post(
             contact.userId           = resolved.uid;
             contact.registeredUserId = resolved.uid;
             contact.avatar           = resolved.avatar || null;
+            contact.avatarUrl        = resolved.avatar || null;
+            contact.photoUrl         = resolved.avatar || null;
             contact.name             = contact.name || resolved.name || '';
             // Normaliser le téléphone vers E.164 canonical
             contact.phone            = resolved.phone || contactNorm;
@@ -286,6 +294,8 @@ router.post(
               contacts[idx].userId           = resolved.uid;
               contacts[idx].registeredUserId = resolved.uid;
               contacts[idx].avatar           = resolved.avatar || null;
+              contacts[idx].avatarUrl        = resolved.avatar || null;
+              contacts[idx].photoUrl         = resolved.avatar || null;
               await db.collection('users').doc(uid).set(
                 { contacts_manual: contacts, contacts_updated_at: new Date().toISOString() },
                 { merge: true }
@@ -417,6 +427,8 @@ router.get(
           userId: resolved.uid,
           name  : resolved.name   || null,
           avatar: resolved.avatar || null,
+          avatarUrl: resolved.avatar || null,
+          photoUrl: resolved.avatar || null,
           phone : resolved.phone  || null,
         } : null,
       });

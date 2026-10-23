@@ -264,14 +264,17 @@ async function updateExternalConvLastMessage(db, conversationId, content, provid
  */
 /* ── Politique de repli offline (routage) ─────────────────── */
 /**
- * ROUTE_OFFLINE_HOLD=true : un destinataire OmniSMS résolu mais hors ligne
- * garde le message EN INTERNE (Firestore, channel 'app', status 'pending'),
- * livré à sa reconnexion (deliverPendingMessages). Aucune conversion
- * automatique d'un simple délai de réponse en SMS externe.
- * Défaut false → comportement historique (fallback SMS vers son numéro réel).
+ * ROUTE_OFFLINE_HOLD : un destinataire OmniSMS résolu mais hors ligne garde
+ * le message EN INTERNE (Firestore, channel 'app', status 'pending'), livré
+ * à sa reconnexion (deliverPendingMessages). L'absence de socket ne suffit
+ * JAMAIS à transformer un message interne en SMS externe.
+ * DÉFAUT : true (politique produit « interne d'abord »).
+ * ROUTE_OFFLINE_HOLD=false → comportement historique (fallback SMS immédiat
+ * vers le numéro réel du destinataire).
  */
 function isOfflineHoldEnabled() {
-  return String(process.env.ROUTE_OFFLINE_HOLD || 'false').trim().toLowerCase() === 'true';
+  const v = String(process.env.ROUTE_OFFLINE_HOLD || 'true').trim().toLowerCase();
+  return v !== 'false' && v !== '0' && v !== 'no';
 }
 
 async function routeMessage(opts = {}) {

@@ -850,7 +850,9 @@ async function processSmsReceived(webhookBody) {
       // garde le message EN INTERNE (déjà en Firestore) — pas de copie SMS.
       // Livraison à la reconnexion (socketService.deliverPendingMessages).
       // Défaut false → comportement historique (copie SMS à son vrai numéro).
-      const offlineHoldEnabled = String(process.env.ROUTE_OFFLINE_HOLD || 'false').trim().toLowerCase() === 'true';
+      // Défaut true (politique « interne d'abord ») — voir messageRouter.isOfflineHoldEnabled
+      const _hold = String(process.env.ROUTE_OFFLINE_HOLD || 'true').trim().toLowerCase();
+      const offlineHoldEnabled = _hold !== 'false' && _hold !== '0' && _hold !== 'no';
       if (offlineHoldEnabled) {
         logger.info('[INfiniReach] ROUTING — ROUTE_OFFLINE_HOLD=true → pas de copie SMS au propriétaire hors ligne', {
           resolvedRecipientUid: ownerUid,

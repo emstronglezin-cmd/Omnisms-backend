@@ -8,6 +8,7 @@
  * Aucun appel réseau : smsGateway/infobip/socketService/userResolver/queueService
  * et Firestore sont des stubs en mémoire. Aucun quota de production consommé.
  */
+process.env.ROUTE_OFFLINE_HOLD = 'false'; // périmètre de la suite : fallback SMS historique
 process.env.LOG_LEVEL = 'error';
 const path = require('path');
 

@@ -488,6 +488,8 @@ router.post(
           email        : user.email        || null,
           phone        : user.phone        || null,
           avatar       : user.avatar       || null,
+          avatarUrl    : user.avatar       || null,
+          photoUrl     : user.avatar       || null,
           phoneVerified: user.phoneVerified !== false,
           isSubscribed : user.isSubscribed || false,
           credits      : user.credits      || 0,
@@ -648,7 +650,7 @@ router.get('/me', authenticate, async (req, res) => {
     // Ne jamais renvoyer le hash du mot de passe
     const { password: _pw, ...safeUser } = user;
 
-    return res.status(200).json({ id: doc.id, ...safeUser });
+    return res.status(200).json(require('../services/profileSerializer').withAvatarFields({ id: doc.id, ...safeUser }));
   } catch (err) {
     logger.error('Erreur GET /me', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });

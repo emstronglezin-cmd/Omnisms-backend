@@ -15,6 +15,7 @@ const db           = require('../config/firebase');
 const firebaseAuth = require('../middleware/firebaseAuth');
 const { logger }   = require('../middleware/logger');
 const { normalizePhone } = require('../services/phoneNormalizer');
+const { withAvatarFields } = require('../services/profileSerializer');
 
 const auth = firebaseAuth;  // accepte Firebase token + JWT
 
@@ -30,13 +31,14 @@ router.get('/', auth, async (req, res) => {
     const user = snap.data();
     const { password: _pw, ...safeUser } = user;
 
-    return res.status(200).json({
+    return res.status(200).json(withAvatarFields({
       id          : snap.id,
       premium     : user.isSubscribed || false,
       isSubscribed: user.isSubscribed || false,
       credits     : user.credits || 0,
+      avatar      : user.avatar || null,
       ...safeUser,
-    });
+    }));
   } catch (err) {
     logger.error('Erreur GET /me', { error: err.message });
     return res.status(500).json({ error: 'Erreur serveur.', code: 'SERVER_ERROR' });
@@ -61,6 +63,13 @@ router.put('/profile', auth, async (req, res) => {
       if (e164Phone !== rawPhone) updates.phoneRaw = rawPhone;
     }
     if (bio   !== undefined && bio   !== null) updates.bio   = String(bio).trim();
+    // Photo acceptée ici aussi (data URI ou URL https) : certains clients (APK)
+    // envoient tout en un seul appel PUT. Data URI bornée (même limite que POST /avatar).
+    if (typeof req.body.avatar === 'string' && req.body.avatar.trim()) {
+      const v = req.body.avatar.trim();
+      if (v.startsWith('data:image/')) updates.avatar = v.slice(0, 1600 * 1024);
+      else if (/^https?:\/\//.test(v)) updates.avatar = v;
+    }
 
     // Username: validate format + uniqueness check
     if (username !== undefined && username !== null) {

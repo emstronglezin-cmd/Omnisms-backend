@@ -5,7 +5,7 @@
  * quota consommé.
  */
 process.env.LOG_LEVEL = 'error';
-delete process.env.ROUTE_OFFLINE_HOLD; // défaut : false (historique)
+process.env.ROUTE_OFFLINE_HOLD = 'true'; // DÉFAUT (politique interne d'abord) — les scénarios legacy forcent 'false'
 const path = require('path');
 const ROOT = path.join(__dirname, '..');
 
@@ -95,16 +95,17 @@ const check = (name, cond, extra) => {
   let r = await router.routeMessage({ ...base, targetPhone: '+22670000001' });
   check('destinataire CONNECTÉ (apk) → route OMNISMS, status sent, 0 SMS', r.route === 'OMNISMS' && !r.held && r.message.status === 'sent' && gatewayState.calls.length === 0);
 
-  /* ── 2. Hors ligne, flag OFF (défaut) → comportement historique : SMS ── */
+  /* ── 2. Hors ligne, ROUTE_OFFLINE_HOLD=false → comportement historique : SMS ── */
+  process.env.ROUTE_OFFLINE_HOLD = 'false';
   r = await router.routeMessage({ ...base, targetPhone: '+22670000002' });
-  check('flag OFF (défaut) → repli SMS historique vers le numéro du destinataire', r.route === 'SMS_EXTERNE' && gatewayState.calls.length === 1 && String(gatewayState.calls[0].to).endsWith('000002'));
+  check('flag =false → repli SMS historique vers le numéro du destinataire', r.route === 'SMS_EXTERNE' && gatewayState.calls.length === 1 && String(gatewayState.calls[0].to).endsWith('000002'));
   check('aucune émission Socket.IO pour un hors ligne (flag OFF)', !emissions.some((e) => e.uid === 'uid-dest-offline'));
 
-  /* ── 3. Hors ligne, flag ON → attente interne, AUCUN SMS ── */
+  /* ── 3. Hors ligne, flag ON (défaut) → attente interne, AUCUN SMS ── */
   process.env.ROUTE_OFFLINE_HOLD = 'true';
   const sentBefore = gatewayState.calls.length;
   r = await router.routeMessage({ ...base, targetPhone: '+22670000002', content: 'message en attente' });
-  check('flag ON → route OMNISMS + held:true + status pending', r.route === 'OMNISMS' && r.held === true && r.status === 'pending');
+  check('flag ON (défaut) → route OMNISMS + held:true + status pending', r.route === 'OMNISMS' && r.held === true && r.status === 'pending');
   check('flag ON → aucun SMS de plus', gatewayState.calls.length === sentBefore);
   const heldDoc = [...db._store.get('messages').values()].find((d) => d.status === 'pending' && d.channel === 'app' && d.receiverId === 'uid-dest-offline');
   check('message conservé en Firestore (channel app, status pending)', !!heldDoc);
