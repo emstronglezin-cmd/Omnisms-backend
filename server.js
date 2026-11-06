@@ -286,6 +286,7 @@ const smsGatewayInboundRoutes = require('./routes/sms.gateway.inbound');
 const transcriptionRoutes  = require('./routes/transcription.v2');
 const adminRoutes        = require('./routes/admin');
 const groupRoutes        = require('./routes/groups');
+const gatewayRoutes      = require('./routes/gateway');
 const userRoutes         = require('./routes/users');
 const meRoutes           = require('./routes/me');
 const notifRoutes        = require('./routes/notifications');
@@ -347,6 +348,7 @@ app.use('/api/admin/credits', require('./routes/credits.admin')); // module cré
 app.use('/admin',         adminRoutes);
 app.use('/api/admin',     adminRoutes);   // alias API (mêmes protections x-admin-key)
 app.use('/groups',        groupRoutes);
+app.use('/api/gateway',   gatewayRoutes);
 app.use('/users',         userRoutes);
 app.use('/me',            meRoutes);
 app.use('/api/me',        meRoutes);   // API prefix pour profil + avatar

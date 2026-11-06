@@ -58,6 +58,18 @@ function getSmsGateway() {
 function selectTransport() {
   const smsGateway = getSmsGateway();
 
+  // STRATÉGIE SMS RETENUE : passerelle Android propriétaire (outbox
+  // Firestore persistante + app Android autorisée). Indépendant d'INfiniReach.
+  try {
+    const androidGW = require('./androidGateway');
+    if (androidGW.isEnabled()) {
+      return {
+        provider: 'android_gateway',
+        send    : (opts) => androidGW.sendSMS(opts),
+      };
+    }
+  } catch (_) { /* provider absent */ }
+
   try {
     const smsgate = require('./smsGateProvider');
     if (smsgate && smsgate.isEnabled && smsgate.isEnabled()) {
@@ -155,10 +167,14 @@ async function processSmsJob(job) {
     });
 
     // Update Firestore message status
+    // CAS OUTBOX (passerelle Android) : la tâche est écrite mais PAS encore
+    // envoyée — le message reste 'pending' (smsStatus QUEUED_OUTBOX) jusqu'au
+    // résultat confirmé par l'appareil (jamais de faux « sent »).
+    const outboxQueued = result.state === 'QUEUED_OUTBOX';
     if (db && messageId) {
       try {
         await db.collection('messages').doc(messageId).update({
-          status      : 'sent',
+          status      : outboxQueued ? 'pending' : 'sent',
           smsMessageId: providerMsgId,
           smsProvider : result.provider || transport.provider,
           smsStatus   : result.state || result.status || 'SENT',
@@ -318,4 +334,5 @@ module.exports = {
   enqueueSmsJob,
   startSmsWorker,
   processSmsJob, // exported for unit tests
+  selectTransport, // exported for unit tests / diagnostics
 };

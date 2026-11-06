@@ -78,6 +78,15 @@ function resolveTransport() {
   if (provider === 'infobip') {
     logger.warn('[OTP] OTP_PROVIDER=infobip sans effet — Infobip a été retiré du projet');
   }
+  if (provider === 'android_gateway') {
+    const androidGW = require('./androidGateway');
+    if (androidGW.isEnabled()) {
+      return {
+        name: 'android_gateway',
+        send: (phone, text) => androidGW.sendSMS({ to: phone, text }),
+      };
+    }
+  }
   if (provider === 'gateway') {
     // Déconseillé pour l'OTP : dépend du téléphone passerelle (quota 402 actuel,
     // indisponibilité = plus d'inscriptions). Double clé volontaire.
