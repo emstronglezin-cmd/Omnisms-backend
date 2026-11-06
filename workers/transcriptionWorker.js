@@ -291,6 +291,10 @@ function emitTranscriptionEvent(userId, messageId, data) {
 let worker = null;
 
 function startWorker() {
+  if (String(process.env.QUEUE_TRANSCRIPTION_WORKER || 'true').toLowerCase() === 'false') {
+    logger.info('[TranscriptionWorker] QUEUE_TRANSCRIPTION_WORKER=false — worker désactivé (jobs inline).');
+    return null;
+  }
   if (worker) return worker;
 
   worker = createWorker('transcription', transcriptionProcessor, 1); // CPU → 1 seul concurrent

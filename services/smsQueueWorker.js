@@ -298,6 +298,10 @@ function startSmsWorker() {
     logger.info('[SmsWorker] WORKER_IN_WEB_PROCESS=false — worker SMS déporté (npm run worker).');
     return;
   }
+  if (String(process.env.QUEUE_SMS_WORKER || 'true').toLowerCase() === 'false') {
+    logger.info('[SmsWorker] QUEUE_SMS_WORKER=false — worker SMS désactivé (jobs inline).');
+    return;
+  }
   const concurrency = Math.max(1, parseInt(process.env.SMS_WORKER_CONCURRENCY, 10) || 2);
   // Backoff exponentiel avec jitter plein (+/-50%) : évite les retries synchronisés
   const backoffStrategy = (attemptsMade) => {

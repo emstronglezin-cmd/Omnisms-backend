@@ -389,7 +389,13 @@ app.get('/api/status', (_req, res) => {
 });
 
 /* ── Diagnostic endpoint (env var audit, no secret values) ── */
-app.get('/api/diag', (_req, res) => {
+app.get('/api/diag', (req, res) => {
+  // Protection : si ADMIN_KEY est configurée, exiger l'en-tête x-admin-key
+  // (compatibilité : sans ADMIN_KEY, comportement historique conservé).
+  const _adminKey = String(process.env.ADMIN_KEY || '');
+  if (_adminKey && String(req.headers['x-admin-key'] || '') !== _adminKey) {
+    return res.status(401).json({ error: 'Admin key requise.', code: 'ADMIN_KEY_REQUIRED' });
+  }
   // List of all env vars the app uses — report presence/absence without values
   const EXPECTED_VARS = [
     'NODE_ENV', 'PORT', 'JWT_SECRET', 'BACKEND_URL', 'FRONTEND_URL', 'CORS_ORIGIN',

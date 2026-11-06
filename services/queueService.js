@@ -327,6 +327,12 @@ function createWorker(queueName, processor, concurrency = 2, workerOptions = {})
     // → désactivable (QUEUE_SKIP_STALLED_CHECK, défaut true) pour économiser
     // le quota ; l'arbitrage des jobs bloqués repose alors sur les retries BullMQ.
     skipStalledCheck: String(process.env.QUEUE_SKIP_STALLED_CHECK ?? 'true') !== 'false',
+    // Coût au repos : la boucle de fetch bloque au plus drainDelay (BullMQ
+    // plafonne le blocage BZPOPMIN à 10 s). QUEUE_DRAIN_DELAY_MS=10 → ~259k
+    // cmd/mois/worker au lieu de ~518k (voir docs/REDIS_QUOTA.md).
+    ...(process.env.QUEUE_DRAIN_DELAY_MS
+      ? { drainDelay: Math.min(10, Math.max(5, parseInt(process.env.QUEUE_DRAIN_DELAY_MS, 10) || 5)) }
+      : {}),
     // stalledInterval: 30000 (default) — vérification jobs bloqués toutes les 30s
     // maxStalledCount: 1 (default) — 1 retry si stalled, puis échec
     // Backoff avec jitter (anti-tempête) + limiteur de débit optionnel

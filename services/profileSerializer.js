@@ -15,7 +15,9 @@ function absolutize(avatar) {
   if (!avatar || typeof avatar !== 'string') return null;
   if (avatar.startsWith('data:') || avatar.startsWith('http://') || avatar.startsWith('https://')) return avatar;
   if (avatar.startsWith('/')) {
-    const base = String(process.env.BACKEND_URL || '').replace(/\/+$/, '');
+    // Fallbacks : BACKEND_URL (config) → RENDER_EXTERNAL_URL (auto Render)
+    // → URL canonique (convention déjà utilisée par les contrôleurs paiement).
+    const base = String(process.env.BACKEND_URL || process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com').replace(/\/+$/, '');
     return base ? `${base}${avatar}` : avatar;
   }
   return avatar;

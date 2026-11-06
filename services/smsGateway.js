@@ -484,10 +484,13 @@ function validateWebhookSignature(req) {
   const { webhookSecret } = getConfig();
 
   if (!webhookSecret) {
-    // Pas de secret configuré → permissif (cas initial INfiniReach)
+    // Pas de secret configuré : permissif par défaut (première installation),
+    // mais INFINIREACH_REQUIRE_SIGNATURE=true → ÉCHEC FERMÉ (rejet) : on n'accepte
+    // jamais des webhooks non signés quand le mode strict est demandé.
     const enforced = process.env.INFINIREACH_REQUIRE_SIGNATURE === 'true';
     if (enforced) {
-      logger.error('[INfiniReach] webhook:invalid INFINIREACH_REQUIRE_SIGNATURE=true mais INFINIREACH_WEBHOOK_SECRET absent');
+      logger.error('[INfiniReach] webhook:rejected INFINIREACH_REQUIRE_SIGNATURE=true mais INFINIREACH_WEBHOOK_SECRET absent — requête rejetée');
+      return false;
     }
     return true;
   }
