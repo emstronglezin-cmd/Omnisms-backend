@@ -68,6 +68,11 @@ router.put('/profile', auth, async (req, res) => {
       if (e164Phone !== rawPhone) updates.phoneRaw = rawPhone;
     }
     if (bio   !== undefined && bio   !== null) updates.bio   = String(bio).trim();
+    // Consentement SMS de secours (V3.1) : le destinataire choisit si un SMS
+    // peut lui être envoyé via la passerelle quand il est hors ligne (défaut NON).
+    if (req.body.smsFallbackEnabled !== undefined) {
+      updates.smsFallbackEnabled = req.body.smsFallbackEnabled === true;
+    }
     // Photo acceptée ici aussi (data URI ou URL https) : certains clients (APK)
     // envoient tout en un seul appel PUT. Data URI bornée (même limite que POST /avatar).
     if (typeof req.body.avatar === 'string' && req.body.avatar.trim()) {

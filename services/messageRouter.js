@@ -440,6 +440,17 @@ async function routeMessage(opts = {}) {
         data : { type: 'new_message', messageId: savedId, conversationId: convId, senderId: senderUid, channel: 'app' },
       }).catch(() => {});
     } catch (_) { /* push best-effort */ }
+    // SECOURS SMS CONSENTI (V3.1) : si — et seulement si — le destinataire a
+    // activé smsFallbackEnabled (opt-in) ET son numéro est vérifié, un SMS de
+    // secours part via le transport actif (SMSGate ; SIM du téléphone passerelle).
+    // Sinon le message reste conservé et le motif est signalé CLAIREMENT ici.
+    let smsFallback = { status: 'skipped', reason: 'not_evaluated' };
+    try {
+      const fb = require('./smsFallback');
+      smsFallback = await fb.evaluateAndDispatch({ recipientUid: resolvedUid, messageId: savedId, dedupKey: msgId, content, senderName });
+    } catch (fbErr) {
+      smsFallback = { status: 'skipped', reason: 'fallback_error', error: fbErr.message };
+    }
     logger.info('[ROUTING] Destinataire OmniSMS hors ligne → message conservé en interne (ROUTE_OFFLINE_HOLD)', {
       senderUid,
       resolvedUid,
@@ -456,6 +467,7 @@ async function routeMessage(opts = {}) {
       messageId     : savedId,
       resolvedUid,
       conversationId: convId,
+      smsFallback   : smsFallback, // statut honnête du secours (sent | skipped:raison | failed)
       message       : heldMsg,
     };
   }
