@@ -428,6 +428,18 @@ async function routeMessage(opts = {}) {
         logger.warn('[ROUTING] Firestore save failed (offline hold)', { error: dbErr.message });
       }
     }
+    // PUSH DISTANT (V3) : l'app est en arrière-plan ou fermée (aucun socket)
+    // → notification FCM/APNs à tous les appareils du destinataire. Le canal
+    // temps réel Socket.IO reste inchangé pour les app au premier plan ; les
+    // deux mécanismes coexistent. Fire-and-forget : n'échoue JAMAIS la route.
+    try {
+      const pushService = require('./pushService');
+      pushService.sendPushToUser(resolvedUid, {
+        title: 'OmniSMS',
+        body : type === 'audio' ? '🎤 Message vocal' : String(content || '').slice(0, 120) || 'Nouveau message',
+        data : { type: 'new_message', messageId: savedId, conversationId: convId, senderId: senderUid, channel: 'app' },
+      }).catch(() => {});
+    } catch (_) { /* push best-effort */ }
     logger.info('[ROUTING] Destinataire OmniSMS hors ligne → message conservé en interne (ROUTE_OFFLINE_HOLD)', {
       senderUid,
       resolvedUid,

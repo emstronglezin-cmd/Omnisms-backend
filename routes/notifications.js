@@ -84,4 +84,61 @@ router.get('/preferences', authenticate, async (req, res) => {
   }
 });
 
+/* ══════════════════════════════════════════════════════════════════
+ * V3 — Registre des tokens de notifications PUSH distantes (FCM/APNs).
+ * Coexiste avec les préférences ci-dessus et avec Socket.IO (temps réel).
+ *  POST /notifications/register   {token, platform: android|ios|web, deviceId?}
+ *  POST /notifications/unregister {token}
+ *  GET  /notifications/devices    → appareils du compte (tokens masqués)
+ * Le push distant ne remplace pas Socket.IO : il cible les appareils
+ * SANS socket (app en arrière-plan ou fermée).
+ * ══════════════════════════════════════════════════════════════════ */
+const pushService = require('../services/pushService');
+
+function validPushToken(t) {
+  return typeof t === 'string' && t.length >= 20 && t.length <= 4096;
+}
+
+// POST /notifications/register — enregistrement / rafraîchissement du token
+router.post('/register', authenticate, async (req, res) => {
+  const { token, platform, deviceId } = req.body || {};
+  if (!validPushToken(token)) {
+    return res.status(400).json({ error: 'Token invalide (20 à 4096 caractères).', code: 'INVALID_TOKEN' });
+  }
+  if (platform && !['android', 'ios', 'web'].includes(platform)) {
+    return res.status(400).json({ error: 'platform doit être android, ios ou web.', code: 'INVALID_PLATFORM' });
+  }
+  const r = await pushService.registerToken({
+    uid: req.user.uid,
+    token,
+    platform: platform || 'android',
+    deviceId,
+  });
+  if (!r.ok) {
+    return res.status(500).json({ error: 'Enregistrement impossible.', code: r.code || 'SERVER_ERROR' });
+  }
+  const devices = await pushService.listDevices(req.user.uid);
+  return res.status(201).json({ ok: true, created: !!r.created, platform: r.platform, devices });
+});
+
+// POST /notifications/unregister — suppression (logout de l'appareil)
+router.post('/unregister', authenticate, async (req, res) => {
+  const { token } = req.body || {};
+  if (!validPushToken(token)) {
+    return res.status(400).json({ error: 'Token invalide.', code: 'INVALID_TOKEN' });
+  }
+  const r = await pushService.unregisterToken({ uid: req.user.uid, token });
+  if (!r.ok) {
+    const map = { FORBIDDEN: 403 };
+    return res.status(map[r.code] || 500).json({ error: r.code, code: r.code });
+  }
+  return res.status(200).json({ ok: true, removed: r.removed });
+});
+
+// GET /notifications/devices — appareils enregistrés (jamais de token en clair)
+router.get('/devices', authenticate, async (req, res) => {
+  const devices = await pushService.listDevices(req.user.uid);
+  return res.status(200).json({ devices });
+});
+
 module.exports = router;
