@@ -113,3 +113,13 @@ Render → `OFFLINE_SMS_PROVIDER=sms_gateway` (+ `INFINIREACH_*` valides) → le
 - Régression : **20 suites vertes** (routage, quota-402, crédits, OTP 17+25, OAuth 31, présence 16, offline-hold 11, account-deletion 16, etc.).
 - Boot réel vérifié : `/health` 200 avec `smsProvider` actif/inactif correct.
 - **Non testé (impossible en sandbox)** : SMS réel vers un vrai numéro, serveur SMSGate réel (cloud ou privé), DLR réels de bout en bout, multi-appareils. À faire via §9 avant production.
+
+---
+
+## 13. Alignement sur les variables Render (2026-11-06)
+Le code lit **en priorité** les noms configurés par le propriétaire : `SMS_GATEWAY_LOGIN`, `SMS_GATEWAY_PASSWORD`, `SMS_GATEWAY_DEVICE_ID`, `SMS_GATEWAY_SERVER_ADDRESS` (alias historiques `SMSGATE_*` toujours acceptés).
+- `SERVER_ADDRESS` est bien l'URL de base de l'API (`https://` ajouté si l'app fournit un hôte nu ; slash final retiré).
+- **Activation** : la présence des credentials active SMSGate (plus besoin de `OFFLINE_SMS_PROVIDER=smsgate`) ; `OFFLINE_SMS_PROVIDER=none` coupe tout ; `sms_gateway` reste la valeur héritée mais ne bloque plus SMSGate.
+- **Auth** : mode `auto` par défaut — JWT officiel d'abord, **repli automatique permanent en Basic** si le serveur n'expose pas `/auth/token` (401/403/404/405). Identifiants jamais loggés.
+- ⚠️ Le `Server Address` doit être joignable depuis Render (cloud `https://api.sms-gate.app` ou serveur privé public) — une adresse LAN ne l'est pas.
+- Tests : `test/smsgate-aliases-tests.js` (13/13) + régression 26/26.

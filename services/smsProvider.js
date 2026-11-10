@@ -8,19 +8,23 @@
  */
 
 function getProviderStatus() {
-  let smsgate = false;
-  try { const p = require('./smsGateProvider'); smsgate = !!(p.isConfigured && p.isConfigured()); } catch (_) {}
+  let smsgate = false, smsgateEnabled = false;
+  try {
+    const p = require('./smsGateProvider');
+    smsgate = !!(p.isConfigured && p.isConfigured());
+    smsgateEnabled = !!(p.isEnabled && p.isEnabled());
+  } catch (_) {}
   const infiniReach = !!(process.env.INFINIREACH_API_KEY && process.env.INFINIREACH_FROM_NUMBER
     && process.env.INFINIREACH_ENABLED !== 'false');
   const selected = String(process.env.OFFLINE_SMS_PROVIDER || 'sms_gateway').toLowerCase().trim();
-  const activeProvider = selected === 'smsgate' && smsgate ? 'smsgate'
+  const activeProvider = smsgateEnabled ? 'smsgate'
     : selected === 'sms_gateway' && infiniReach ? 'sms_gateway'
     : 'none';
   return {
     activeProvider,
     selected,
     smsgate: { configured: smsgate },
-    sms_gateway: { configured: infiniReach, paused: selected !== 'sms_gateway' },
+    sms_gateway: { configured: infiniReach, paused: smsgateEnabled },
   };
 }
 

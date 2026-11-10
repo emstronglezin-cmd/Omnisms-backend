@@ -24,15 +24,35 @@ const { logger } = require('../middleware/logger');
 /* ── Configuration ──────────────────────────────────────────── */
 function cfg() {
   return {
-    baseUrl   : String(process.env.SMSGATE_BASE_URL || '').trim().replace(/\/+$/, ''),
-    username  : String(process.env.SMSGATE_USERNAME || '').trim(),
-    password  : String(process.env.SMSGATE_PASSWORD || '').trim(),
-    deviceId  : String(process.env.SMSGATE_DEVICE_ID || '').trim(),
+    // ── Noms Render du propriétaire (SMS_GATEWAY_*) EN PRIORITÉ, alias SMSGATE_* conservés ──
+    // SMS_GATEWAY_LOGIN / SMS_GATEWAY_PASSWORD / SMS_GATEWAY_DEVICE_ID /
+    // SMS_GATEWAY_SERVER_ADDRESS = valeurs fournies par l'application SMSGate.
+    baseUrl   : normalizeBaseUrl(process.env.SMSGATE_BASE_URL || process.env.SMS_GATEWAY_SERVER_ADDRESS || ''),
+    username  : String(process.env.SMSGATE_USERNAME || process.env.SMS_GATEWAY_LOGIN || '').trim(),
+    password  : String(process.env.SMSGATE_PASSWORD || process.env.SMS_GATEWAY_PASSWORD || '').trim(),
+    deviceId  : String(process.env.SMSGATE_DEVICE_ID || process.env.SMS_GATEWAY_DEVICE_ID || '').trim(),
     timeoutMs : Math.min(Math.max(Number(process.env.SMSGATE_REQUEST_TIMEOUT_MS) || 10000, 1000), 60000),
-    authMode  : (String(process.env.SMSGATE_AUTH_MODE || 'jwt').trim().toLowerCase() === 'basic') ? 'basic' : 'jwt',
-    prefix    : process.env.SMSGATE_API_PREFIX !== undefined ? String(process.env.SMSGATE_API_PREFIX) : '/3rdparty/v1',
+    authMode  : normalizeAuthMode(process.env.SMSGATE_AUTH_MODE || process.env.SMS_GATEWAY_AUTH_MODE),
+    prefix    : (process.env.SMSGATE_API_PREFIX !== undefined || process.env.SMS_GATEWAY_API_PREFIX !== undefined)
+      ? String(process.env.SMSGATE_API_PREFIX !== undefined ? process.env.SMSGATE_API_PREFIX : process.env.SMS_GATEWAY_API_PREFIX)
+      : '/3rdparty/v1',
     ttlSec    : Math.min(Math.max(Number(process.env.SMSGATE_TOKEN_TTL_SECONDS) || 3600, 60), 86400),
   };
+}
+
+/** URL de base : sans slash final ; https:// ajouté si l'app fournit un hôte nu. */
+function normalizeBaseUrl(raw) {
+  let u = String(raw || '').trim().replace(/\/+$/, '');
+  if (u && !/^https?:\/\//i.test(u)) u = 'https://' + u;
+  return u;
+}
+/** Mode d'auth : 'basic' | 'jwt' | 'auto' (défaut : JWT, repli Basic automatique). */
+let _authModeOverride = null; // 'auto' → bascule réelle (basic) après échec de l'endpoint JWT
+function normalizeAuthMode(raw) {
+  const v = String(raw === undefined || raw === null ? 'auto' : raw).trim().toLowerCase();
+  if (v === 'basic') return 'basic';
+  if (v === 'jwt') return 'jwt';
+  return _authModeOverride || 'auto';
 }
 
 function isConfigured() {
@@ -40,10 +60,16 @@ function isConfigured() {
   return !!(c.baseUrl && c.username && c.password);
 }
 
-/** true si SMSGate est le fournisseur SÉLECTIONNÉ et configuré. */
+/**
+ * true si SMSGate est actif : la présence des credentials (4 variables du
+ * propriétaire sur Render, ou alias SMSGATE_*) EST le signal d'activation.
+ * OFFLINE_SMS_PROVIDER=smsgate reste valable ; = 'none' désactive tout.
+ * (Déploie le transport sans exiger un changement supplémentaire sur Render.)
+ */
 function isEnabled() {
-  const selected = String(process.env.OFFLINE_SMS_PROVIDER || 'sms_gateway').toLowerCase().trim();
-  return selected === 'smsgate' && isConfigured();
+  const selected = String(process.env.OFFLINE_SMS_PROVIDER || '').toLowerCase().trim();
+  if (selected === 'none') return false;
+  return isConfigured();
 }
 
 function maskPhone(phone) { return String(phone || '').replace(/\d{4}$/, '****'); }
@@ -122,10 +148,29 @@ async function refreshTokenPair() {
 
 /** Jeton d'accès valide (renouvelle 60 s avant expiration, avec rotation). */
 async function getAccessToken() {
-  if (cfg().authMode === 'basic') return null; // Basic : pas de jeton
-  if (_token && _token.expiresAtMs - 60000 > Date.now()) return _token.accessToken;
-  _token = _token ? await refreshTokenPair() : await obtainTokenPair();
-  return _token.accessToken;
+  const mode = cfg().authMode;
+  if (mode === 'basic') return null; // Basic : pas de jeton
+  if (mode === 'jwt') {
+    if (_token && _token.expiresAtMs - 60000 > Date.now()) return _token.accessToken;
+    _token = _token ? await refreshTokenPair() : await obtainTokenPair();
+    return _token.accessToken;
+  }
+  // mode 'auto' : JWT d'abord ; si l'endpoint /auth/token n'existe pas sur ce
+  // serveur (401/403/404/405) → repli PERMANENT en Basic (identifiants app).
+  try {
+    if (_token && _token.expiresAtMs - 60000 > Date.now()) return _token.accessToken;
+    _token = _token ? await refreshTokenPair() : await obtainTokenPair();
+    return _token.accessToken;
+  } catch (err) {
+    const sc = err && err.statusCode;
+    if (sc === 401 || sc === 403 || sc === 404 || sc === 405) {
+      _authModeOverride = 'basic';
+      _token = null;
+      logger.warn('[SMSGate] endpoint JWT indisponible sur ce serveur → auth Basic utilisée');
+      return null;
+    }
+    throw err; // réseau/quota : ambiguity gérée par l'appelant
+  }
 }
 
 function authHeader(token) {

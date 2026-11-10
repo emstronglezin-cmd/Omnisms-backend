@@ -195,7 +195,7 @@ app.get('/health', (_req, res) => {
       jwt           : jwtOk           ? 'ok' : 'MISSING — set JWT_SECRET',
       payments      : lpOk            ? 'ACTIVE'
                                         : `INACTIVE — variables manquantes : ${paymentEnv.getPaymentEnvStatus().missingRequired.join(', ') || 'SAASPAY_SECRET_KEY'}`,
-      smsProvider   : smsOk           ? 'ACTIVE' : 'INACTIVE — voir OFFLINE_SMS_PROVIDER / SMSGATE_* / INFINIREACH_*',
+      smsProvider   : smsOk           ? 'ACTIVE' : 'INACTIVE — voir SMS_GATEWAY_LOGIN/PASSWORD/SERVER_ADDRESS/DEVICE_ID (ou SMSGATE_* / OFFLINE_SMS_PROVIDER)',
       redis         : redisOk         ? 'CONFIGURED' : 'MISSING — using memory fallback (set REDIS_URL)',
       socketio      : 'ACTIVE',
       transcription : transcrCheck.ok
@@ -404,7 +404,8 @@ app.get('/api/diag', (req, res) => {
     'FIREBASE_SERVICE_ACCOUNT_JSON',
     'REDIS_URL',
     'GROQ_API_KEY', 'GROQ_WHISPER_MODEL',
-    'OFFLINE_SMS_PROVIDER', 'SMSGATE_BASE_URL', 'SMSGATE_USERNAME',
+    'OFFLINE_SMS_PROVIDER', 'SMS_GATEWAY_LOGIN', 'SMS_GATEWAY_PASSWORD', 'SMS_GATEWAY_SERVER_ADDRESS', 'SMS_GATEWAY_DEVICE_ID',
+    'SMSGATE_BASE_URL', 'SMSGATE_USERNAME',
     'SAASPAY_SECRET_KEY', 'SAASPAY_BASE_URL',
     'DEFAULT_PHONE_COUNTRY', 'WHISPER_MODEL', 'WHISPER_LANGUAGE',
   ];

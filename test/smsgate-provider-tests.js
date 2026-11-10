@@ -91,7 +91,10 @@ const check = (name, cond, extra) => {
 
   /* ── 1. Configuration / activation ── */
   check('isConfigured true (BASE_URL+USER+PASS)', p.isConfigured() === true);
-  check('isEnabled false sans OFFLINE_SMS_PROVIDER=smsgate', p.isEnabled() === false);
+  // NOUVELLE sémantique (alignement Render) : les credentials présents = activation.
+  check('isEnabled true par credentials (sans OFFLINE_SMS_PROVIDER)', p.isEnabled() === true);
+  process.env.OFFLINE_SMS_PROVIDER = 'none';
+  check('isEnabled false avec OFFLINE_SMS_PROVIDER=none (couper urgence)', p.isEnabled() === false);
   process.env.OFFLINE_SMS_PROVIDER = 'smsgate';
   check('isEnabled true avec smsgate', p.isEnabled() === true);
 
