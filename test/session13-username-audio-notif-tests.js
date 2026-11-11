@@ -262,7 +262,10 @@ async function main() {
   injectMock('../config/firebase', mockDb);
   injectMock('../services/redis', mockRedis);
   injectMock('../services/smsGateway', gatewayMock);
-  injectMock('../services/infobip', infobipMock);
+  // SMSGate EXCLUSIF depuis le retrait d'INfiniReach : le même mock sert de
+  // transport smsgate (même tableau calls → les assertions restent valides).
+  injectMock('../services/smsGateProvider', { ...gatewayMock, isEnabled: () => true, isConfigured: () => true });
+  // LEGACY RETIRÉ : services/infobip.js n'existe plus — plus aucun mock à injecter.
   injectMock('../services/transcriptionService', transcribeMock);
 
   /* ── Modules RÉELS ─────────────────────────────────────────────────────── */

@@ -1,290 +1,75 @@
 'use strict';
 /**
- * OmniSMS — Service SMS Gateway (INfiniReach)
+ * OmniSMS — Répartiteur SMS sortant (module générique, ex « Service INfiniReach »).
  *
- * Transport physique SMS principal du mode Offline :
- *   Backend OmniSMS → INfiniReach API → Z Fold2 Android → SIM → réseau SMS
+ * ── LEGACY DÉSACTIVÉ ──────────────────────────────────────────────────────
+ * Ce module était le client INfiniReach (https://api.infinireach.io).
+ * INfiniReach a été RETIRÉ du projet : plus aucune variable INFINIREACH_*,
+ * plus aucune URL, clé API ni appel réseau vers ce fournisseur. Le nom de
+ * fichier historique (smsGateway.js) est conservé car des harnais de test et
+ * des modules l'injectent ; l'interface publique est inchangée.
  *
- * Fournisseur : INfiniReach (https://api.infinireach.io)
- * Le Z Fold2 est enregistré et connecté dans l'application Android INfiniReach.
+ * Fournisseur officiel : SMSGate (services/smsGateProvider.js — application
+ * « SMS Gateway for Android » sur le téléphone passerelle, variables
+ * SMS_GATEWAY_LOGIN / SMS_GATEWAY_PASSWORD / SMS_GATEWAY_DEVICE_ID /
+ * SMS_GATEWAY_SERVER_ADDRESS).
  *
- * ── API Envoi SMS ─────────────────────────────────────────────────────────
+ * Chaîne d'envoi :
+ *   1. SMSGate (prioritaire, fournisseur sélectionné) ;
+ *   2. Sinon : erreur explicite — AUCUN fallback legacy, aucune bascule
+ *      silencieuse de fournisseur (règle projet).
+ * (Le pool multi-appareils — services/gatewayPool.js — reste disponible en
+ * module mais n'est plus branché dans cette chaîne : son dispatch était
+ * couplé au flux INfiniReach retiré.)
  *
- * POST https://api.infinireach.io/api/v1/messages
- * Headers :
- *   X-API-Key    : ${INFINIREACH_API_KEY}
- *   Content-Type : application/json
- * Body :
- *   {
- *     "to"         : "+22670000000",
- *     "message"    : "texte du SMS",
- *     "from"       : "+22600000000",   // numéro SIM du Z Fold2, obligatoire
- *     "channel"    : "sms",
- *     "externalId" : "omnisms-xxx"     // ID OmniSMS pour idempotence
- *   }
- * Réponse succès (200/201/202) :
- *   { id: "ir-xxx", status: "queued"|"sent", ... }
- *
- * ── Webhook SMS entrant ───────────────────────────────────────────────────
- *
- * INfiniReach envoie :
- *   POST /api/webhooks/sms-gateway/inbound
- *   {
- *     "event"    : "message.inbound",
- *     "timestamp": "...",
- *     "data"     : {
- *       "messageId" : "...",
- *       "direction" : "inbound",
- *       "from"      : "+22670000000",
- *       "to"        : "+22600000000",
- *       "body"      : "texte du SMS",
- *       "deviceId"  : "...",
- *       "timestamp" : "...",
- *       "status"    : "delivered"
- *     }
- *   }
- *
- * Événements DLR (statuts sortants) :
- *   message.sent, message.delivered, message.failed
- *
- * ── Variables d'environnement ─────────────────────────────────────────────
- *
- *   INFINIREACH_API_KEY    (requis) — Clé API INfiniReach
- *   INFINIREACH_FROM_NUMBER (requis) — Numéro SIM du Z Fold2 (champ "from", obligatoire)
- *   INFINIREACH_API_URL    (optionnel, défaut: https://api.infinireach.io)
- *   INFINIREACH_ENABLED    (optionnel, défaut: true)
- *
- *   Sélection transport :
- *   OFFLINE_SMS_PROVIDER           : 'sms_gateway' (INfiniReach, défaut historique)
- *                                    | 'smsgate' (SMSGate open source — recommandé)
- *   Infobip : retiré du projet (aucun fallback).
- *
- * ── Compatibilité avec l'architecture existante ───────────────────────────
- *
- * Ce module expose la même interface que l'ancien service sms-gate.app :
- *   isConfigured(), isSmsGatewayProvider(), isInfobipFallbackEnabled()
- *   sendSMS({ to, text, messageId }) → { success, gatewayMessageId, provider }
- *   validateWebhookSignature(req)
- *   getStatus()
- *
- * messageRouter.js et smsQueueWorker.js utilisent cette interface via
- * selectTransport() — aucune modification de ces fichiers n'est nécessaire.
+ * Interface publique conservée :
+ *   isConfigured(), isSmsGatewayProvider() [→ false, legacy],
+ *   getActiveProvider(), sendSMS({ to, text, messageId }),
+ *   validateWebhookSignature(req), getStatus(), logStartupDiagnostic()
  */
-
-const https  = require('https');
-const http   = require('http');
-const urlMod = require('url');
 const crypto = require('crypto');
-
 const { logger } = require('../middleware/logger');
 
-/* ── Config helpers ─────────────────────────────────────────── */
-
-/**
- * Lecture lazy de la configuration (jamais au require-time).
- * NE JAMAIS logger apiKey ou secret.
- */
-function getConfig() {
-  return {
-    apiKey    : process.env.INFINIREACH_API_KEY      || '',
-    fromNumber: process.env.INFINIREACH_FROM_NUMBER  || '',
-    apiUrl    : (process.env.INFINIREACH_API_URL || 'https://api.infinireach.io').replace(/\/$/, ''),
-    enabled   : process.env.INFINIREACH_ENABLED !== 'false', // true par défaut
-    webhookSecret: process.env.INFINIREACH_WEBHOOK_SECRET || '',
-  };
+/* ── SMSGate actif ? ─────────────────────────────────────────── */
+function smsgateReady() {
+  try {
+    const p = require('./smsGateProvider');
+    return !!(p.isEnabled && p.isEnabled());
+  } catch (_) { return false; }
 }
 
-/**
- * Retourne true si INfiniReach est configuré (apiKey + fromNumber présents).
- */
+/** true si le transport SMSGate est disponible. */
 function isConfigured() {
-  const { apiKey, fromNumber, enabled } = getConfig();
-  return !!(enabled && apiKey && fromNumber);
+  return smsgateReady();
 }
 
 /**
- * Retourne le provider Offline actif.
- * Valeurs : 'sms_gateway' (défaut) | 'infobip'
- */
-function getActiveProvider() {
-  return (process.env.OFFLINE_SMS_PROVIDER || 'sms_gateway').toLowerCase().trim();
-}
-
-/**
- * Retourne true si le provider actif est sms_gateway.
- * (INfiniReach hérite de ce nom — le routing existant est inchangé.)
+ * DEPRÉCIÉ — l'ancien fournisseur INfiniReach est désactivé définitivement.
+ * Retourne toujours false : AUCUNE configuration ne peut plus le sélectionner.
  */
 function isSmsGatewayProvider() {
-  return getActiveProvider() === 'sms_gateway';
-}
-
-/**
- * DEPRÉCIÉ — Infobip a été retiré du projet. Conservé pour compatibilité
- * d'appel : retourne toujours false (aucun fallback automatique, règle projet).
- */
-function isInfobipFallbackEnabled() {
   return false;
 }
 
-/* ── Diagnostic de démarrage ────────────────────────────────── */
-
-/**
- * Émet des logs de démarrage sûrs pour diagnostiquer la configuration INfiniReach.
- * Appelé UNE SEULE FOIS depuis server.js au démarrage.
- * Ne logue JAMAIS la valeur réelle de apiKey ou webhookSecret.
- */
-function logStartupDiagnostic() {
-  const { apiKey, fromNumber, apiUrl, enabled, webhookSecret } = getConfig();
-  const provider = getActiveProvider();
-  const isGw     = isSmsGatewayProvider();
-  const cfg      = isConfigured();
-
-  logger.info('[InfiniReach] ── Configuration au démarrage ─────────────────────────');
-  logger.info(`[InfiniReach] enabled          : ${enabled ? 'YES' : 'NO'}`);
-  logger.info(`[InfiniReach] INFINIREACH_API_KEY     : ${apiKey      ? 'CONFIGURED' : 'MISSING ⚠️'}`);
-  logger.info(`[InfiniReach] INFINIREACH_FROM_NUMBER : ${fromNumber  ? 'CONFIGURED (' + fromNumber.replace(/\d{4}$/, '****') + ')' : 'MISSING ⚠️'}`);
-  logger.info(`[InfiniReach] INFINIREACH_API_URL     : ${apiUrl      || 'https://api.infinireach.io (défaut)'}`);
-  logger.info(`[InfiniReach] INFINIREACH_WEBHOOK_SECRET : ${webhookSecret ? 'CONFIGURED' : 'non défini (mode permissif)'}`);
-  logger.info('[Offline SMS] ──────────────────────────────────────────────────────');
-  logger.info(`[Offline SMS] OFFLINE_SMS_PROVIDER           : ${provider} (${isGw ? 'INfiniReach' : 'autre'})`);
-  logger.info(`[Offline SMS] Infobip : retiré du projet (aucun fallback)`);
-  logger.info(`[Offline SMS] Transport résolu : ${isGw ? 'INfiniReach Z Fold2 (défaut historique)' : 'SMSGate ou aucun'}`);
-  logger.info(`[Offline SMS] isConfigured()   : ${cfg ? 'YES ✅' : 'NO ❌ — vérifier INFINIREACH_API_KEY + INFINIREACH_FROM_NUMBER'}`);
-  logger.info('[InfiniReach] ──────────────────────────────────────────────────────');
-
-  if (!cfg) {
-    logger.warn('[InfiniReach] Transport INfiniReach NON opérationnel. Vérifier les variables d\'environnement sur Render.');
-  }
+/** Fournisseur officiel : SMSGate. */
+function getActiveProvider() {
+  return 'smsgate';
 }
 
-/* ── Client HTTP bas niveau ─────────────────────────────────── */
-
+/* ── Envoi ──────────────────────────────────────────────────── */
 /**
- * Effectue une requête HTTPS/HTTP vers l'API INfiniReach.
- * Ne logge JAMAIS la clé API.
- *
- * @param {string} method         - GET | POST
- * @param {string} path           - Chemin (ex: '/api/v1/messages')
- * @param {object|null} payload   - Body JSON ou null
- * @param {number} [timeoutMs=15000]
- * @returns {Promise<{ statusCode: number, body: object }>}
- */
-function infiniReachRequest(method, path, payload, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    const { apiKey, apiUrl } = getConfig();
-
-    if (!apiKey) {
-      return reject(new Error(
-        '[INfiniReach] Non configuré : INFINIREACH_API_KEY manquant'
-      ));
-    }
-
-    let normalizedUrl = apiUrl.trim();
-    if (!normalizedUrl.match(/^https?:\/\//i)) {
-      normalizedUrl = 'https://' + normalizedUrl;
-    }
-
-    const parsed  = urlMod.parse(normalizedUrl + path);
-    const isHttps = parsed.protocol === 'https:';
-    const host    = parsed.hostname;
-    const port    = parsed.port
-      ? parseInt(parsed.port, 10)
-      : (isHttps ? 443 : 80);
-
-    if (!host) {
-      return reject(new Error(
-        `[INfiniReach] URL invalide — hostname introuvable dans "${apiUrl}"`
-      ));
-    }
-
-    const body = payload ? JSON.stringify(payload) : null;
-
-    const options = {
-      hostname: host,
-      port,
-      path    : parsed.path,
-      method,
-      headers : {
-        'X-API-Key'    : apiKey,    // jamais loggé, uniquement dans headers
-        'Content-Type' : 'application/json',
-        'Accept'       : 'application/json',
-        ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
-      },
-    };
-
-    logger.info('[INfiniReach] send:start', {
-      method,
-      host,
-      path: parsed.path,
-      // NE PAS inclure apiKey ici
-    });
-
-    const transport = isHttps ? https : http;
-    const req = transport.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        let parsedBody;
-        try   { parsedBody = JSON.parse(data); }
-        catch (_) { parsedBody = { raw: data }; }
-
-        resolve({ statusCode: res.statusCode, body: parsedBody });
-      });
-    });
-
-    req.on('error', (err) => {
-      logger.error('[INfiniReach] send:error', {
-        host,
-        path   : parsed.path,
-        method,
-        error  : err.message,
-        code   : err.code,
-        hint   : 'Vérifier INFINIREACH_API_URL et la connectivité réseau',
-      });
-      reject(err);
-    });
-
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`[INfiniReach] Timeout après ${timeoutMs}ms`));
-    });
-
-    if (body) req.write(body);
-    req.end();
-  });
-}
-
-/* ── Envoi SMS ──────────────────────────────────────────────── */
-
-/**
- * Envoie un SMS via INfiniReach → Z Fold2 → SIM → réseau SMS.
- *
- * @param {object} opts
- * @param {string}  opts.to         - Numéro destinataire E.164 (+22670000000)
- * @param {string}  opts.text       - Contenu du SMS
- * @param {string} [opts.messageId] - ID OmniSMS (idempotence via externalId)
- *
- * @returns {Promise<{
- *   success: boolean,
- *   gatewayMessageId?: string,
- *   messageId?: string,
- *   state?: string,
- *   provider: 'sms_gateway',
- *   error?: string,
- *   statusCode?: number
- * }>}
+ * Envoie un SMS via SMSGate.
+ * @param {object} p { to, text, messageId? }
+ * @returns {Promise<{success:boolean, gatewayMessageId?:string, provider:string, error?:string, ...}>}
  */
 async function sendSMS({ to, text, messageId = null } = {}) {
   if (!to || !text) {
-    throw new Error('[INfiniReach] sendSMS: "to" et "text" sont requis');
+    throw new Error('[SMS] sendSMS: "to" et "text" sont requis');
   }
 
-  // ── SMSGate (open source) — fournisseur sélectionné ─────────────
-  // OFFLINE_SMS_PROVIDER=smsgate + SMSGATE_* configurés → délégation totale
-  // à SMSGateProvider. INfiniReach reste disponible en repli de CONFIGURATION
-  // (jamais appelé ici). Une seule chaîne à la fois : jamais de double envoi.
   try {
     const smsgate = require('./smsGateProvider');
-    if (smsgate.isEnabled()) {
+    if (smsgate.isEnabled && smsgate.isEnabled()) {
       const started = Date.now();
       const r = await smsgate.sendSMS({ to, text, messageId });
       try {
@@ -294,219 +79,53 @@ async function sendSMS({ to, text, messageId = null } = {}) {
       return r;
     }
   } catch (sgErr) {
-    logger.warn('[SMSGate] Délégation impossible → chemin historique', { error: sgErr.message });
+    logger.warn('[SMSGate] Délégation impossible', { error: sgErr.message });
   }
-
-  // ── Pool de passerelles (GATEWAY_POOL_ENABLED=true, multi-appareils) ──
-  // Délègue la sélection d'appareil (least-loaded, failover, breaker).
-  // Désactivé par défaut : comportement mono-appareil historique.
-  try {
-    const pool = require('./gatewayPool');
-    if (pool.isEnabled()) {
-      const started = Date.now();
-      const poolRes = await pool.sendViaPool({
-        payload: { to, text, messageId },
-        send: async (_device, p) => _sendDirect(p),
-      });
-      const { metricsService } = require('./metrics');
-      metricsService.smsSend('gateway_pool', poolRes.success, Date.now() - started);
-      return poolRes.success
-        ? { ...poolRes.result, poolDeviceId: poolRes.deviceId }
-        : poolRes.result;
-    }
-  } catch (poolErr) {
-    logger.warn('[INfiniReach] Pool indisponible → envoi direct', { error: poolErr.message });
-  }
-
-  return _sendDirect({ to, text, messageId });
-}
-
-/** Implémentation historique mono-appareil (device par défaut du compte INfiniReach). */
-async function _sendDirect({ to, text, messageId = null } = {}) {
-  if (!isConfigured()) {
-    throw new Error(
-      '[INfiniReach] Non configuré — définir INFINIREACH_API_KEY et INFINIREACH_FROM_NUMBER'
-    );
-  }
-
-  const { fromNumber } = getConfig();
-
-  // Payload INfiniReach — tous les champs selon spec
-  const payload = {
-    to,
-    message : text,
-    from    : fromNumber,   // numéro SIM Z Fold2, champ obligatoire
-    channel : 'sms',
-  };
-
-  // externalId pour idempotence (évite d'envoyer deux fois le même SMS)
-  if (messageId) {
-    payload.externalId = `omnisms-${messageId}`;
-  }
-
-  logger.info('[INfiniReach] send:start', {
-    to        : to.replace(/\d{4}$/, '****'),
-    from      : fromNumber.replace(/\d{4}$/, '****'),
-    textLength: text.length,
-    externalId: messageId ? `omnisms-${messageId}` : null,
-  });
-
-  let response;
-  try {
-    response = await infiniReachRequest('POST', '/api/v1/messages', payload);
-  } catch (err) {
-    logger.error('[INfiniReach] send:error', {
-      error: err.message,
-      code : err.code,
-      to   : to.replace(/\d{4}$/, '****'),
-      hint : 'Vérifier INFINIREACH_API_KEY, INFINIREACH_FROM_NUMBER et INFINIREACH_API_URL',
-    });
-    return { success: false, error: err.message, code: err.code, provider: 'sms_gateway' };
-  }
-
-  const { statusCode, body } = response;
-
-  // 200/201/202 = succès
-  if (statusCode >= 200 && statusCode < 300) {
-    const gwMessageId = body?.id || body?.messageId || null;
-    const state       = body?.status || body?.state || 'queued';
-
-    logger.info('[INfiniReach] send:success', {
-      to          : to.replace(/\d{4}$/, '****'),
-      gwMessageId,
-      state,
-      statusCode,
-    });
-
-    return {
-      success         : true,
-      gatewayMessageId: gwMessageId,
-      messageId       : gwMessageId,  // alias pour compatibilité smsQueueWorker
-      state,
-      provider        : 'sms_gateway',
-      raw             : body,
-    };
-  }
-
-  // Erreurs
-  const errMsg = body?.message
-    || body?.error
-    || (body?.errors ? JSON.stringify(body.errors) : null)
-    || body?.raw
-    || JSON.stringify(body);
-
-  const hint = statusCode === 401
-    ? 'Clé API invalide — vérifier INFINIREACH_API_KEY dans Render'
-    : statusCode === 402
-    ? 'Quota du forfait INfiniReach atteint (100 messages/mois) — mettre à niveau le plan ou attendre la réinitialisation mensuelle ; aucun retry ne peut réussir avant'
-    : statusCode === 404
-    ? `Device non trouvé — vérifier que INFINIREACH_FROM_NUMBER (${fromNumber}) est bien enregistré dans l'application INfiniReach sur le Z Fold2. Le numéro SIM doit correspondre exactement au device enregistré dans votre compte INfiniReach.`
-    : statusCode === 400
-    ? 'Payload invalide — vérifier INFINIREACH_FROM_NUMBER et le format du numéro (E.164 : +22675405214)'
-    : statusCode === 429
-    ? 'Rate limit atteint — réessai automatique via BullMQ'
-    : statusCode === 503
-    ? 'Service INfiniReach indisponible ou Z Fold2 hors ligne / déconnecté'
-    : `Réponse inattendue INfiniReach (code ${statusCode})`;
-
-  logger.error('[INfiniReach] send:error', {
-    to        : to.replace(/\d{4}$/, '****'),
-    statusCode,
-    error     : errMsg,
-    apiUrlSet : !!getConfig().apiUrl,
-    fromSet   : !!getConfig().fromNumber,
-    hint,
-  });
 
   return {
-    success   : false,
-    error     : errMsg,
-    statusCode,
-    provider  : 'sms_gateway',
-    raw       : body,
+    success: false,
+    provider: 'none',
+    error: 'Aucun transport SMS actif — SMSGate requis (SMS_GATEWAY_LOGIN/PASSWORD/DEVICE_ID/SERVER_ADDRESS).',
   };
 }
 
-/* ── Statut d'un message sortant ────────────────────────────── */
-
+/* ── Validation des webhooks de la passerelle ───────────────── */
 /**
- * Récupère le statut d'un message envoyé.
- * (Utilisé par getMessageStatus dans l'ancien service — conservé pour compatibilité)
- *
- * @param {string} gatewayMessageId - ID retourné par sendSMS()
- * @returns {Promise<{ success: boolean, state?: string, error?: string }>}
- */
-async function getMessageStatus(gatewayMessageId) {
-  if (!isConfigured()) {
-    return { success: false, error: '[INfiniReach] Non configuré' };
-  }
-  if (!gatewayMessageId) {
-    return { success: false, error: 'gatewayMessageId requis' };
-  }
-
-  try {
-    const { statusCode, body } = await infiniReachRequest(
-      'GET', `/api/v1/messages/${encodeURIComponent(gatewayMessageId)}`, null
-    );
-    if (statusCode >= 200 && statusCode < 300) {
-      return {
-        success: true,
-        state  : body?.status || body?.state || 'Unknown',
-        raw    : body,
-      };
-    }
-    return {
-      success   : false,
-      error     : body?.message || JSON.stringify(body),
-      statusCode,
-    };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
-
-/* ── Validation signature webhook ───────────────────────────── */
-
-/**
- * Valide la signature HMAC du webhook INfiniReach (si configurée).
- *
- * INfiniReach n'utilise pas encore de signing secret pour ce premier test.
- * Cette fonction est conservée pour la compatibilité avec l'architecture existante
- * et pour une activation future (INFINIREACH_WEBHOOK_SECRET).
- *
- * Sans secret configuré → retourne toujours true (mode permissif).
- * Avec secret → HMAC-SHA256(rawBody, secret).
- *
+ * Valide la signature HMAC-SHA256 d'un webhook passerelle entrant.
+ * Variables GÉNÉRIQUES (l'ancien couple INFINIREACH_* est retiré) :
+ *   - SMS_GATEWAY_WEBHOOK_SECRET            : secret partagé (vide = permissif)
+ *   - SMS_GATEWAY_WEBHOOK_REQUIRE_SIGNATURE : 'true' → échec fermé si absent
+ * Comportement identique à l'historique : permissif par défaut, strict si
+ * explicitement demandé. Ne journalise JAMAIS la valeur du secret.
  * @param {object} req - Requête Express
  * @returns {boolean}
  */
 function validateWebhookSignature(req) {
-  const { webhookSecret } = getConfig();
+  const webhookSecret = String(process.env.SMS_GATEWAY_WEBHOOK_SECRET || '').trim();
+  const enforced = String(process.env.SMS_GATEWAY_WEBHOOK_REQUIRE_SIGNATURE || '').trim().toLowerCase() === 'true';
 
   if (!webhookSecret) {
-    // Pas de secret configuré : permissif par défaut (première installation),
-    // mais INFINIREACH_REQUIRE_SIGNATURE=true → ÉCHEC FERMÉ (rejet) : on n'accepte
-    // jamais des webhooks non signés quand le mode strict est demandé.
-    const enforced = process.env.INFINIREACH_REQUIRE_SIGNATURE === 'true';
+    // Pas de secret configuré : permissif par défaut, mais échec FERMÉ si le
+    // mode strict est demandé (on n'accepte jamais un webhook non signé alors).
     if (enforced) {
-      logger.error('[INfiniReach] webhook:rejected INFINIREACH_REQUIRE_SIGNATURE=true mais INFINIREACH_WEBHOOK_SECRET absent — requête rejetée');
+      logger.error('[SMSGATE] webhook:rejected REQUIRE_SIGNATURE=true mais SMS_GATEWAY_WEBHOOK_SECRET absent — requête rejetée');
       return false;
     }
     return true;
   }
 
-  // Lire la signature depuis l'en-tête (INfiniReach peut utiliser X-Signature ou similaire)
+  // Lire la signature depuis l'en-tête (alias historique toléré en transition).
   const sig = req.headers['x-signature']
+    || req.headers['x-gateway-signature']
     || req.headers['x-infinireach-signature']
     || '';
 
   if (!sig) {
-    const enforced = process.env.INFINIREACH_REQUIRE_SIGNATURE === 'true';
     if (enforced) {
-      logger.warn('[INfiniReach] webhook:invalid Signature manquante (mode strict)');
+      logger.warn('[SMSGATE] webhook:invalid Signature manquante (mode strict)');
       return false;
     }
-    logger.warn('[INfiniReach] webhook:invalid Signature manquante (mode permissif)');
+    logger.warn('[SMSGATE] webhook:invalid Signature manquante (mode permissif)');
     return true;
   }
 
@@ -520,56 +139,52 @@ function validateWebhookSignature(req) {
   const expectedNorm = expectedSig.toLowerCase();
 
   if (sigNorm.length !== expectedNorm.length) {
-    logger.warn('[INfiniReach] webhook:invalid Longueur signature incorrecte');
+    logger.warn('[SMSGATE] webhook:invalid Longueur signature incorrecte');
     return false;
   }
 
   try {
     return crypto.timingSafeEqual(
       Buffer.from(expectedNorm, 'hex'),
-      Buffer.from(sigNorm,      'hex'),
+      Buffer.from(sigNorm, 'hex')
     );
   } catch (_) {
-    logger.warn('[INfiniReach] webhook:invalid Format hex invalide');
     return false;
   }
 }
 
-/* ── Statut du service ──────────────────────────────────────── */
-
-/**
- * Retourne l'état de configuration pour le health check.
- * Ne jamais inclure apiKey dans la réponse.
- */
+/* ── Statut (sans secret) ───────────────────────────────────── */
 function getStatus() {
-  const { apiUrl, fromNumber, webhookSecret, enabled } = getConfig();
   return {
-    provider        : 'sms_gateway',
-    implementation  : 'INfiniReach',
-    appUrl          : 'https://api.infinireach.io',
+    provider        : 'smsgate',
     configured      : isConfigured(),
-    active          : isSmsGatewayProvider(),
-    enabled,
-    apiUrl          : apiUrl || null,
-    hasApiKey       : !!getConfig().apiKey,
-    hasFromNumber   : !!fromNumber,
-    fromNumber      : fromNumber ? fromNumber.replace(/\d{4}$/, '****') : null,
-    hasWebhookSecret: !!webhookSecret,
-    infobipFallback : false, // retiré du projet
+    legacy          : 'infinireach disabled',
+    webhookSecret   : String(process.env.SMS_GATEWAY_WEBHOOK_SECRET || '').trim() ? 'CONFIGURED' : 'non défini (mode permissif)',
+    webhookStrict   : String(process.env.SMS_GATEWAY_WEBHOOK_REQUIRE_SIGNATURE || '').trim().toLowerCase() === 'true',
   };
 }
 
-/* ── Exports ─────────────────────────────────────────────────── */
-// Interface identique à l'ancien service sms-gate.app :
-// messageRouter.js et smsQueueWorker.js restent inchangés.
+/* ── Diagnostic de démarrage ────────────────────────────────── */
+/**
+ * Logs de démarrage sûrs (jamais de secret). Appelé UNE SEULE FOIS depuis server.js.
+ */
+function logStartupDiagnostic() {
+  const st = getStatus();
+  logger.info('SMS PROVIDER: SMSGATE');
+  logger.info('LEGACY PROVIDER: INFINIREACH DISABLED');
+  logger.info('[SMSGATE] Config au démarrage (aucun secret) : ' + JSON.stringify({
+    smsgateConfigured : st.configured,
+    offlineSmsProvider: String(process.env.OFFLINE_SMS_PROVIDER || 'smsgate (défaut)'),
+    webhookSecret     : st.webhookSecret,
+    webhookStrict     : st.webhookStrict,
+  }));
+}
 
 module.exports = {
   isConfigured,
   isSmsGatewayProvider,
-  isInfobipFallbackEnabled,
   getActiveProvider,
   sendSMS,
-  getMessageStatus,
   validateWebhookSignature,
   getStatus,
   logStartupDiagnostic,

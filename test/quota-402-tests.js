@@ -46,11 +46,12 @@ const db = makeDb();
 /* ── Stubs fournisseurs & présence & résolution & file ───────── */
 const gatewayState = { results: [], calls: [] };
 {
-  const p = path.join(ROOT, 'services', 'smsGateway.js');
+  // SMSGate EXCLUSIF depuis le retrait d'INfiniReach : le transport mocké est
+  // smsgate (même tableau gatewayState → assertions inchangées).
+  const p = path.join(ROOT, 'services', 'smsGateProvider.js');
   require.cache[p] = { id: p, filename: p, loaded: true, exports: {
-    isSmsGatewayProvider: () => true,
+    isEnabled: () => true,
     isConfigured: () => true,
-    isInfobipFallbackEnabled: () => false,
     sendSMS: async (opts) => {
       gatewayState.calls.push(opts);
       const r = gatewayState.results.shift();
@@ -60,8 +61,12 @@ const gatewayState = { results: [], calls: [] };
   } };
 }
 {
-  const p = path.join(ROOT, 'services', 'infobip.js');
-  require.cache[p] = { id: p, filename: p, loaded: true, exports: { isConfigured: () => false } };
+  const p = path.join(ROOT, 'services', 'smsGateway.js');
+  require.cache[p] = { id: p, filename: p, loaded: true, exports: {
+    isSmsGatewayProvider: () => false,
+    isConfigured: () => false,
+    sendSMS: async () => ({ success: false, error: 'legacy disabled' }),
+  } };
 }
 const presence = { online: new Set() };
 let emitCalls = 0;

@@ -1,7 +1,7 @@
 {
   "name": "omnisms-backend",
   "version": "4.3.0",
-  "description": "OmniSMS Backend — Messages, Transcription Groq/Faster-Whisper, SMS Infobip, LeekPay, Socket.IO, BullMQ",
+  "description": "OmniSMS Backend — Messages, Transcription Groq/Faster-Whisper, SMS SMSGate, SaaSPay, Socket.IO, BullMQ",
   "main": "server.js",
   "engines": {
     "node": ">=18.0.0",

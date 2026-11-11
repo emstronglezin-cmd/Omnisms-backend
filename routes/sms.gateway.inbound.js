@@ -1,8 +1,11 @@
 'use strict';
 /**
- * OmniSMS — Webhook INfiniReach (SMS Entrants)
+ * OmniSMS — Webhook passerelle (SMS Entrants)
  *
- * Fournisseur : INfiniReach (https://api.infinireach.io)
+ * Fournisseur ACTUEL : SMSGate (« SMS Gateway for Android », téléphone passerelle).
+ * LEGACY : INfiniReach (https://api.infinireach.io) a été RETIRÉ du projet —
+ * aucune variable INFINIREACH_* n'est plus lue ; le FORMAT de webhook historique
+ * est conservé (publié par l'app de la passerelle).
  * Transport   : INfiniReach → Samsung Z Fold2 → SIM → réseau SMS (et retour)
  *
  * Route principale :
@@ -375,7 +378,9 @@ async function processSmsReceived(webhookBody) {
   //      vers le gateway (75...) — seul le cas from==to est bloqué ici.
   const fromRawNorm   = senderRaw   ? normalizePhone(senderRaw)   || senderRaw   : '';
   const toRawNorm     = recipientRaw ? normalizePhone(recipientRaw) || recipientRaw : '';
-  const gatewayNumber = (process.env.INFINIREACH_FROM_NUMBER || '').trim();
+  // Var générique (anti-boucle) ; ancien nom toléré en transition (simple
+  // numéro SIM passerelle — PAS une configuration fournisseur).
+  const gatewayNumber = (process.env.SMS_GATEWAY_DEVICE_NUMBER || process.env.INFINIREACH_FROM_NUMBER || '').trim();
 
   if (fromRawNorm && toRawNorm && fromRawNorm === toRawNorm) {
     logger.warn('[INfiniReach] ANTI-BOUCLE — from == to → message ignoré (auto-envoi gateway)', {
@@ -891,7 +896,7 @@ async function processSmsReceived(webhookBody) {
           // même numéro déclencherait un nouveau webhook → boucle infinie.
           // Grâce à la résolution UID→profil, ce cas ne devrait plus se produire
           // (le vrai profil != gateway), mais l'anti-boucle reste en dernier rempart.
-          const gwNum = (process.env.INFINIREACH_FROM_NUMBER || '').trim();
+          const gwNum = (process.env.SMS_GATEWAY_DEVICE_NUMBER || process.env.INFINIREACH_FROM_NUMBER || '').trim();
           const normalizedGw  = gwNum ? (normalizePhone(gwNum) || gwNum) : '';
           const normalizedFallback = normalizePhone(fallbackTo) || fallbackTo;
 
@@ -1045,7 +1050,10 @@ router.post('/sms-gateway/inbound', (req, res) => {
 
 /* ─────────────────────────────────────────────────────────────
    GET /api/webhooks/sms-gateway/status
-   Health check + guide de configuration INfiniReach
+   Health check + guide de configuration de la passerelle (SMSGate).
+   LEGACY : INfiniReach RETIRÉ — le format de webhook historique est conservé
+   (l'app de la passerelle publie ce format) ; la configuration INFINIREACH_*
+   n'existe plus.
    ─────────────────────────────────────────────────────────── */
 router.get('/sms-gateway/status', (_req, res) => {
   const smsGateway = getSmsGateway();
@@ -1053,31 +1061,31 @@ router.get('/sms-gateway/status', (_req, res) => {
 
   return res.status(200).json({
     status       : 'active',
-    service      : 'INfiniReach Inbound Webhook v2',
+    service      : 'SMSGate Inbound Webhook v2',
     webhookUrl   : `${backendUrl}/api/webhooks/sms-gateway/inbound`,
     provider     : smsGateway ? smsGateway.getStatus() : { configured: false },
     transport    : {
-      name       : 'INfiniReach',
-      apiUrl     : 'https://api.infinireach.io',
-      sendEndpoint: 'POST /api/v1/messages',
-      auth       : 'X-API-Key header',
+      name       : 'SMSGate',
+      note       : 'Application « SMS Gateway for Android » sur le téléphone passerelle',
+      legacy     : 'INfiniReach disabled',
     },
     configuration: {
-      step1: 'Installer l\'application INfiniReach sur le Z Fold2',
-      step2: 'Se connecter et enregistrer le device',
-      step3: `Configurer le webhook dans INfiniReach : URL = ${backendUrl}/api/webhooks/sms-gateway/inbound, Event = message.inbound`,
-      step4: 'Configurer les env vars Render : INFINIREACH_API_KEY, INFINIREACH_FROM_NUMBER',
-      step5: '(Optionnel) Configurer INFINIREACH_WEBHOOK_SECRET pour valider les signatures webhook',
+      step1: 'Installer l\'application SMS Gateway for Android sur le téléphone passerelle',
+      step2: 'Activer le mode serveur HTTP et créer les identifiants app',
+      step3: `Configurer le webhook de l\'app : URL = ${backendUrl}/api/webhooks/sms-gateway/inbound`,
+      step4: 'Configurer les env vars Render : SMS_GATEWAY_LOGIN, SMS_GATEWAY_PASSWORD, SMS_GATEWAY_DEVICE_ID, SMS_GATEWAY_SERVER_ADDRESS',
+      step5: '(Optionnel) Configurer SMS_GATEWAY_WEBHOOK_SECRET pour valider les signatures webhook',
     },
     envVarsRequired: [
-      'INFINIREACH_API_KEY',
-      'INFINIREACH_FROM_NUMBER',
+      'SMS_GATEWAY_LOGIN',
+      'SMS_GATEWAY_PASSWORD',
+      'SMS_GATEWAY_DEVICE_ID',
+      'SMS_GATEWAY_SERVER_ADDRESS',
     ],
     envVarsOptional: [
-      'INFINIREACH_API_URL (défaut: https://api.infinireach.io)',
-      'INFINIREACH_ENABLED (défaut: true)',
-      'INFINIREACH_WEBHOOK_SECRET (vide = mode permissif)',
-      'INFINIREACH_REQUIRE_SIGNATURE (défaut: false)',
+      'SMS_GATEWAY_DEVICE_NUMBER (anti-boucle, numéro SIM passerelle)',
+      'SMS_GATEWAY_WEBHOOK_SECRET (vide = mode permissif)',
+      'SMS_GATEWAY_WEBHOOK_REQUIRE_SIGNATURE (défaut: false)',
     ],
   });
 });

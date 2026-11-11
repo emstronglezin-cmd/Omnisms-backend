@@ -47,15 +47,15 @@ function req(port, method, url, headers = {}) {
 
   /* ── Webhook : signature stricte / permissive (appel unitaire direct) ── */
   if (phase === 'webhook') {
-    delete process.env.INFINIREACH_WEBHOOK_SECRET;
-    delete process.env.INFINIREACH_REQUIRE_SIGNATURE;
+    delete process.env.SMS_GATEWAY_WEBHOOK_SECRET;
+    delete process.env.SMS_GATEWAY_WEBHOOK_REQUIRE_SIGNATURE;
     const gw = require(path.join(QUOTA_ROOT, 'services', 'smsGateway'));
     const noSig = { headers: {}, rawBody: '{"a":1}' };
     out.r1_permissiveNoSecret = gw.validateWebhookSignature(noSig) === true;
-    process.env.INFINIREACH_REQUIRE_SIGNATURE = 'true';
+    process.env.SMS_GATEWAY_WEBHOOK_REQUIRE_SIGNATURE = 'true';
     out.r2_strictNoSecretRejected = gw.validateWebhookSignature(noSig) === false; // NOUVEAU comportement
-    process.env.INFINIREACH_REQUIRE_SIGNATURE = '';
-    process.env.INFINIREACH_WEBHOOK_SECRET = 'sekret-test';
+    process.env.SMS_GATEWAY_WEBHOOK_REQUIRE_SIGNATURE = '';
+    process.env.SMS_GATEWAY_WEBHOOK_SECRET = 'sekret-test';
     const crypto = require('crypto');
     const body = '{"event":"sms.delivered","id":"m1"}';
     const good = crypto.createHmac('sha256', 'sekret-test').update(body).digest('hex');
@@ -64,9 +64,9 @@ function req(port, method, url, headers = {}) {
     // Comportement historique documenté : secret configuré + signature absente
     // = permissif par défaut (transition douce) ; le strict passe par REQUIRE.
     out.r5_missingSigPermissiveByDefault = gw.validateWebhookSignature({ headers: {}, rawBody: body }) === true;
-    process.env.INFINIREACH_REQUIRE_SIGNATURE = 'true';
+    process.env.SMS_GATEWAY_WEBHOOK_REQUIRE_SIGNATURE = 'true';
     out.r6_missingSigStrictRejected = gw.validateWebhookSignature({ headers: {}, rawBody: body }) === false;
-    process.env.INFINIREACH_REQUIRE_SIGNATURE = '';
+    process.env.SMS_GATEWAY_WEBHOOK_REQUIRE_SIGNATURE = '';
   }
 
   /* ── drainDelay configurable ── */

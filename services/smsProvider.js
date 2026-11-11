@@ -1,10 +1,10 @@
 'use strict';
 /**
- * OmniSMS — SMS Provider Status (neutre).
- * Fournisseurs possibles : smsgate (SMSGate open source) | sms_gateway (INfiniReach, en pause
- * sauf sélection explicite). Infobip : retiré du projet.
- * Pour l'envoi : passer par services/smsGateway.js (point d'entrée unique) ou
- * services/smsGateProvider.js (SMSGate direct).
+ * OmniSMS — Statut fournisseur SMS + point d'envoi générique.
+ * Fournisseur OFFICIEL : smsgate (SMSGate open source — application Android
+ * sur le téléphone passerelle). LEGACY : INfiniReach DÉSACTIVÉ définitivement
+ * (plus aucune variable INFINIREACH_* lue, plus aucun appel, plus de fallback).
+ * Infobip : retiré du projet.
  */
 
 function getProviderStatus() {
@@ -14,20 +14,23 @@ function getProviderStatus() {
     smsgate = !!(p.isConfigured && p.isConfigured());
     smsgateEnabled = !!(p.isEnabled && p.isEnabled());
   } catch (_) {}
-  const infiniReach = !!(process.env.INFINIREACH_API_KEY && process.env.INFINIREACH_FROM_NUMBER
-    && process.env.INFINIREACH_ENABLED !== 'false');
-  const selected = String(process.env.OFFLINE_SMS_PROVIDER || 'sms_gateway').toLowerCase().trim();
-  const activeProvider = smsgateEnabled ? 'smsgate'
-    : selected === 'sms_gateway' && infiniReach ? 'sms_gateway'
-    : 'none';
+  const selected = String(process.env.OFFLINE_SMS_PROVIDER || 'smsgate').toLowerCase().trim();
+  const activeProvider = smsgateEnabled ? 'smsgate' : 'none';
   return {
     activeProvider,
     selected,
     smsgate: { configured: smsgate },
-    sms_gateway: { configured: infiniReach, paused: smsgateEnabled },
+    // Clé conservée pour compatibilité des lectures /health — désormais inerte.
+    sms_gateway: { configured: false, disabled: true, legacy: 'infinireach' },
+    legacy: { provider: 'infinireach', disabled: true },
   };
 }
 
+/**
+ * Envoi générique : SMSGate UNIQUEMENT (aucun fallback vers un fournisseur
+ * legacy — une indisponibilité est une erreur visible, jamais une bascule
+ * silencieuse).
+ */
 async function sendSMS(to, message, opts = {}) {
   try {
     const p = require('./smsGateProvider');
@@ -36,14 +39,7 @@ async function sendSMS(to, message, opts = {}) {
       return { success: !!r.success, provider: 'smsgate', result: r, error: r.success ? null : r.error };
     }
   } catch (_) {}
-  try {
-    const g = require('./smsGateway');
-    if (g.isSmsGatewayProvider() && g.isConfigured()) {
-      const r = await g.sendSMS({ to, text: message });
-      return { success: !!r.success, provider: 'sms_gateway', result: r, error: r.success ? null : r.error };
-    }
-  } catch (_) {}
-  return { success: false, provider: 'none', error: 'Aucun fournisseur SMS actif (voir OFFLINE_SMS_PROVIDER).' };
+  return { success: false, provider: 'none', error: 'Aucun fournisseur SMS actif — SMSGate requis (SMS_GATEWAY_*).' };
 }
 
 module.exports = { sendSMS, getProviderStatus };

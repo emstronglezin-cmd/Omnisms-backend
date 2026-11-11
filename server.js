@@ -4,7 +4,7 @@
  *
  * Production-ready · Express · Socket.IO · Firebase graceful degradation
  * Payments      : LeekPay.me (Mobile Money + Carte)
- * SMS Outbound  : SMSGate (open source, OFFLINE_SMS_PROVIDER=smsgate) — INfiniReach en pause
+ * SMS Outbound  : SMSGate EXCLUSIF (SMS_GATEWAY_*) — INfiniReach RETIRÉ (legacy désactivé)
  * SMS Inbound   : Webhook passerelle POST /api/webhooks/sms-gateway/inbound → Firestore + Socket.IO
  * Messages      : GET /api/messages (conversations), GET /api/messages/:id, POST /api/messages/send
  * Transcription : POST /api/transcription (Faster-Whisper async BullMQ)
@@ -163,7 +163,7 @@ app.get('/', (_req, res) => {
     sms      : smsOk,
     realtime : true,
     payments : lpOk      ? 'ACTIVE' : 'INACTIVE — set SAASPAY_SECRET_KEY (or legacy LEEKPAY_SECRET_KEY)',
-    smsProvider : String(process.env.OFFLINE_SMS_PROVIDER || 'sms_gateway'),
+    smsProvider : String(process.env.OFFLINE_SMS_PROVIDER || 'smsgate'),
     env      : process.env.NODE_ENV || 'development',
     time     : new Date().toISOString(),
   });
@@ -533,7 +533,7 @@ try {
   logger.warn('[Worker] Could not start SMS worker.', { error: err.message });
 }
 
-/* ── INfiniReach : diagnostic de démarrage (logs sûrs, jamais la clé) ── */
+/* ── Diagnostic fournisseur SMS au démarrage (logs sûrs, jamais de secret) ── */
 try {
   const smsGateway = require('./services/smsGateway');
   smsGateway.logStartupDiagnostic();

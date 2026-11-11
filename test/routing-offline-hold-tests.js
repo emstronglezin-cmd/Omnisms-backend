@@ -51,12 +51,17 @@ require.cache[path.join(ROOT, 'config', 'firebase.js')] = { id: 'fb', filename: 
 
 /* ── Stubs : gateway SMS (compteur), présence contrôlée, résolution ── */
 const gatewayState = { calls: [] };
-require.cache[path.join(ROOT, 'services', 'smsGateway.js')] = { id: 'gw', filename: path.join(ROOT, 'services/smsGateway.js'), loaded: true, exports: {
-  isSmsGatewayProvider: () => true,
+// SMSGate EXCLUSIF : le transport mocké est smsgate (même gatewayState → assertions inchangées).
+require.cache[path.join(ROOT, 'services', 'smsGateProvider.js')] = { id: 'sg', filename: path.join(ROOT, 'services/smsGateProvider.js'), loaded: true, exports: {
+  isEnabled: () => true,
   isConfigured: () => true,
   sendSMS: async (opts) => { gatewayState.calls.push(opts); return { success: true, gatewayMessageId: 'stub-1' }; },
 } };
-require.cache[path.join(ROOT, 'services', 'infobip.js')] = { id: 'ib', filename: path.join(ROOT, 'services/infobip.js'), loaded: true, exports: { isConfigured: () => false } };
+require.cache[path.join(ROOT, 'services', 'smsGateway.js')] = { id: 'gw', filename: path.join(ROOT, 'services/smsGateway.js'), loaded: true, exports: {
+  isSmsGatewayProvider: () => false,
+  isConfigured: () => false,
+  sendSMS: async () => ({ success: false, error: 'legacy disabled' }),
+} };
 
 const presence = { online: new Set(['uid-dest-online']) };
 const emissions = [];

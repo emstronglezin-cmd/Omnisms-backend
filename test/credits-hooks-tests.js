@@ -53,16 +53,19 @@ const db = makeDb();
 require.cache[path.join(ROOT, 'config/firebase.js')] = { id: 'fb', filename: path.join(ROOT, 'config/firebase.js'), loaded: true, exports: db };
 
 const gwState = { results: [], calls: [] };
-require.cache[path.join(ROOT, 'services/smsGateway.js')] = {
-  id: 'gw', filename: path.join(ROOT, 'services/smsGateway.js'), loaded: true,
+// SMSGate EXCLUSIF : le transport mocké est smsgate (même gwState → assertions inchangées).
+require.cache[path.join(ROOT, 'services/smsGateProvider.js')] = {
+  id: 'sg', filename: path.join(ROOT, 'services/smsGateProvider.js'), loaded: true,
   exports: {
-    isSmsGatewayProvider: () => true,
+    isEnabled: () => true,
     isConfigured: () => true,
-    isInfobipFallbackEnabled: () => false,
     sendSMS: async (o) => { gwState.calls.push(o); const r = gwState.results.shift(); if (!r) throw new Error('stub: pas de réponse'); return r; },
   },
 };
-require.cache[path.join(ROOT, 'services/infobip.js')] = { id: 'ib', filename: path.join(ROOT, 'services/infobip.js'), loaded: true, exports: { isConfigured: () => false } };
+require.cache[path.join(ROOT, 'services/smsGateway.js')] = {
+  id: 'gw', filename: path.join(ROOT, 'services/smsGateway.js'), loaded: true,
+  exports: { isSmsGatewayProvider: () => false, isConfigured: () => false, sendSMS: async () => ({ success: false, error: 'legacy disabled' }) },
+};
 require.cache[path.join(ROOT, 'services/socketService.js')] = {
   id: 'so', filename: path.join(ROOT, 'services/socketService.js'), loaded: true,
   exports: { isUserOnline: async () => false, getIO: () => null, emitToUser: () => {} },

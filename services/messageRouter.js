@@ -639,24 +639,16 @@ async function routeMessage(opts = {}) {
   }
 
   // Déterminer le transport Offline actif.
-  // MIGRATION SMSGate : OFFLINE_SMS_PROVIDER=smsgate → SMSGateProvider (prioritaire).
-  // INfiniReach ('sms_gateway') : MIS EN PAUSE — actif uniquement si sélectionné
-  // explicitement. Infobip : RETIRÉ du projet (plus aucun transport, plus de fallback).
-  let smsGateway = null;
+  // SMSGate EXCLUSIF : l'ancien transport INfiniReach ('sms_gateway') a été
+  // RETIRÉ du projet — aucune variable ni sélection ne peut plus l'activer.
+  // Infobip : retiré également (aucun fallback, règle projet).
   let smsgate    = null;
   let transport  = 'none';
 
-  try { smsGateway = require('./smsGateway'); } catch (_) {}
-  try { smsgate    = require('./smsGateProvider'); } catch (_) {}
+  try { smsgate = require('./smsGateProvider'); } catch (_) {}
   const smsgateEnabled = !!(smsgate && smsgate.isEnabled && smsgate.isEnabled());
-  const infiniReachSelected = !!(smsGateway && smsGateway.isSmsGatewayProvider && smsGateway.isSmsGatewayProvider());
   if (smsgateEnabled) transport = 'smsgate';
-  else if (infiniReachSelected) {
-    if (smsGateway.isConfigured && smsGateway.isConfigured()) transport = 'sms_gateway';
-    else logger.warn('[ROUTING] INfiniReach sélectionné mais non configuré — aucun transport SMS');
-  } else if (infiniReachSelected === false && (smsGateway && smsGateway.getActiveProvider ? smsGateway.getActiveProvider() : '') === 'sms_gateway') {
-    logger.warn('[ROUTING] INfiniReach EN PAUSE — OFFLINE_SMS_PROVIDER=smsgate attendu pour SMSGate');
-  }
+  else logger.warn('[ROUTING] SMSGate non configuré (SMS_GATEWAY_LOGIN/PASSWORD/DEVICE_ID/SERVER_ADDRESS) — aucun transport SMS');
 
   // SESSION 13 — destinataire résolu SANS numéro de téléphone (ex : compte
   // créé via Google, username résolu dont le profil n'a pas de phone).
@@ -671,19 +663,15 @@ async function routeMessage(opts = {}) {
     });
   }
 
-  const useGateway = !smsgateEnabled && infiniReachSelected && smsGateway && smsGateway.isConfigured && smsGateway.isConfigured();
-
   if (!e164Target) {
     transport = 'none'; // ne jamais appeler un provider sans destination
   } else if (smsgateEnabled) {
     transport = 'smsgate';
-  } else if (useGateway) {
-    transport = 'sms_gateway';
   } else {
     logger.warn('[ROUTING] Aucun transport SMS configuré — message externe non délivré', {
       senderUid,
       targetPhone: e164Target.replace(/\d{4}$/, '****'),
-      hint: 'Configurer INFINIREACH_API_KEY + INFINIREACH_FROM_NUMBER (INfiniReach Z Fold2) ou INFOBIP_API_KEY + INFOBIP_BASE_URL (standby)',
+      hint: 'Configurer SMSGate : SMS_GATEWAY_LOGIN + SMS_GATEWAY_PASSWORD + SMS_GATEWAY_DEVICE_ID + SMS_GATEWAY_SERVER_ADDRESS',
     });
   }
 
@@ -763,8 +751,7 @@ async function routeMessage(opts = {}) {
         }).catch(() => {});
       }
       // Réponse explicite à l'expéditeur (limitée dans le temps — anti-spam)
-      const sendReply = (transport === 'sms_gateway' && smsGateway) ? (o) => smsGateway.sendSMS(o)
-        : (transport === 'smsgate' && smsgate) ? (o) => smsgate.sendSMS(o)
+      const sendReply = (transport === 'smsgate' && smsgate) ? (o) => smsgate.sendSMS(o)
         : null;
       await _billing.notifyInsufficientBalance({ db, uid: senderUid, senderPhoneE164: senderE164, sendSms: sendReply });
       return {
@@ -786,19 +773,8 @@ async function routeMessage(opts = {}) {
   if (transport !== 'none' && type === 'text' && content) {
     // ── Tentative directe (synchrone) ───────────────────────
     try {
-      if (transport === 'sms_gateway') {
-        // ── Transport principal : SMS Gateway Z Fold2 ────────
-        smsResult = await smsGateway.sendSMS({
-          to       : e164Target,
-          text     : smsText,
-          messageId: savedId !== msgId ? savedId : null,
-          ttl      : 3600,
-        });
-
-        // Aucun fallback automatique : INfiniReach en pause/échec = erreur visible
-        // (pas de bascule silencieuse de fournisseur — règle projet).
-      } else if (transport === 'smsgate') {
-        // ── Transport SMSGate (open source) ──────────────────
+      if (transport === 'smsgate') {
+        // ── Transport SMSGate (open source) — fournisseur exclusif ──
         smsResult = await smsgate.sendSMS({
           to       : e164Target,
           text     : smsText,
@@ -990,14 +966,7 @@ async function routeMessage(opts = {}) {
 
       try {
         let audioSmsResult = null;
-        if (transport === 'sms_gateway') {
-          audioSmsResult = await smsGateway.sendSMS({
-            to       : e164Target,
-            text     : smsTextAudio,
-            messageId: savedId !== msgId ? savedId : null,
-            ttl      : 3600,
-          });
-        } else if (transport === 'smsgate') {
+        if (transport === 'smsgate') {
           // FIX V3.2 : le chemin audio synchrone ignorait SMSGate (transport
           // apparu après) → le texte transcrit n'était PAS envoyé.
           const smsgate = require('./smsGateProvider');
@@ -1009,7 +978,7 @@ async function routeMessage(opts = {}) {
               ttl      : 3600,
             });
           }
-        } else if (transport === 'infobip') {
+        } else if (false && transport === 'infobip') { // LEGACY RETIRÉ — branche neutralisée
           const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
           audioSmsResult = await infobip.sendSMS({
             to       : e164Target,
@@ -1239,7 +1208,10 @@ async function continueAudioSmsAfterTranscription(opts = {}) {
     }
 
     // ── Anti-boucle : jamais de SMS vers la SIM passerelle elle-même ────
-    const gw     = (process.env.INFINIREACH_FROM_NUMBER || '').trim();
+    // Var générique ; l'ancien nom INFINIREACH_FROM_NUMBER reste toléré en
+    // transition (simple numéro SIM de l'appareil passerelle — PAS une
+    // configuration fournisseur).
+    const gw     = (process.env.SMS_GATEWAY_DEVICE_NUMBER || process.env.INFINIREACH_FROM_NUMBER || '').trim();
     const gwNorm = gw ? (normalizePhone(gw) || gw) : '';
     if (gwNorm && check.to === gwNorm) {
       await ref.update({ audioSmsStatus: 'skipped_gateway_number', updatedAt: now }).catch(() => {});

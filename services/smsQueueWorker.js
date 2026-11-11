@@ -42,21 +42,15 @@ function getDb() {
   } catch (_) { return null; }
 }
 
-function getSmsGateway() {
-  try { return require('./smsGateway'); } catch (_) { return null; }
-}
-
 /* ── Transport selector ─────────────────────────────────────── */
 /**
  * Sélectionne le transport pour le retry SMS.
- * MIGRATION SMSGate : SMSGate prioritaire quand OFFLINE_SMS_PROVIDER=smsgate ;
- * INfiniReach ('sms_gateway') actif uniquement s'il est explicitement sélectionné.
- * Infobip : retiré du projet (plus de fallback).
+ * SMSGate EXCLUSIF : l'ancien transport INfiniReach ('sms_gateway') a été
+ * retiré du projet — aucune sélection ne peut plus l'activer.
  *
  * @returns {{ provider: string, send: Function }|null}
  */
 function selectTransport() {
-  const smsGateway = getSmsGateway();
 
   // STRATÉGIE SMS RETENUE : passerelle Android propriétaire (outbox
   // Firestore persistante + app Android autorisée). Indépendant d'INfiniReach.
@@ -80,14 +74,7 @@ function selectTransport() {
     }
   } catch (_) { /* provider absent */ }
 
-  // INfiniReach si (et seulement si) explicitement sélectionné
-  if (smsGateway && smsGateway.isSmsGatewayProvider() && smsGateway.isConfigured()) {
-    return {
-      provider: 'sms_gateway',
-      send    : (opts) => smsGateway.sendSMS(opts),
-    };
-  }
-
+  // LEGACY RETIRÉ : aucune branche INfiniReach — SMSGate ou rien.
   return null;
 }
 
