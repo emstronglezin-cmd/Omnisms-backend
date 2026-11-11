@@ -586,6 +586,17 @@ function initSocketIO(httpServer) {
       const Redis = require('ioredis');
       const pub = new Redis(redisUrl, { lazyConnect: false, maxRetriesPerRequest: null });
       const sub = pub.duplicate();
+      // Gestionnaires d'erreur OBLIGATOIRES : sans eux, une coupure Redis
+      // (quota épuisé, « Connection is closed ») devient un rejet non géré.
+      // Log débit-limité (1/min), jamais de secret — dégradation silencieuse.
+      let _lastAdapterErr = 0;
+      const adapterErr = (tag) => (err) => {
+        if (Date.now() - _lastAdapterErr < 60000) return;
+        _lastAdapterErr = Date.now();
+        logger.warn(`[Socket.IO] Redis adapter ${tag} — mono-instance dégradée`, { error: String((err && err.message) || err).slice(0, 120) });
+      };
+      pub.on('error', adapterErr('pub'));
+      sub.on('error', adapterErr('sub'));
       _io.adapter(createAdapter(pub, sub));
       logger.info('[Socket.IO] Redis adapter ACTIF — multi-instances possible.');
     } else {

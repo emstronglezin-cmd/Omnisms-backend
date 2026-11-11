@@ -80,6 +80,23 @@ require.cache[path.join(ROOT, 'services', 'userResolver.js')] = { id: 'ur', file
   resolveUserByPhone: async (phone) => (PHONE_MAP[phone] ? { found: true, uid: PHONE_MAP[phone], phone } : { found: false }),
   resolveUserByUid: async (uid) => ({ found: true, uid }),
   normalizeEmail: (e) => String(e || '').toLowerCase(),
+  // Miroir minimal des règles réelles de resolveVerifiedPhoneByUid (source de
+  // vérité Firestore) : false explicite bloquant, legacy actif vérifié, E.164.
+  resolveVerifiedPhoneByUid: async (uid) => {
+    const dbi = require(path.join(ROOT, 'config', 'firebase.js'));
+    const snap = await dbi.collection('users').doc(String(uid)).get();
+    if (!snap || !snap.exists) return { found: false, reason: 'user_not_found' };
+    const u = snap.data() || {};
+    if (u.deleted === true) return { found: false, reason: 'user_not_found' };
+    const raw = String(u.phone || u.phoneNumber || '').trim();
+    if (!raw) return { found: false, reason: 'no_phone' };
+    if (u.phoneVerified === false) return { found: false, reason: 'phone_unverified' };
+    if (u.phoneVerified !== true && u.status && u.status !== 'active') return { found: false, reason: 'phone_unverified' };
+    let ph = /^[+][1-9]\d{6,14}$/.test(raw) ? raw : null;
+    if (!ph) { try { ph = require(path.join(ROOT, 'services', 'phoneNormalizer.js')).normalizePhone(raw) || null; } catch (_) {} }
+    if (!ph) return { found: false, reason: 'invalid_phone' };
+    return { found: true, phone: ph, source: u.phone ? 'firestore.phone' : 'firestore.phoneNumber', basis: u.phoneVerified === true ? 'otp_verified' : 'legacy_active', user: u };
+  },
 } };
 
 let failures = 0;

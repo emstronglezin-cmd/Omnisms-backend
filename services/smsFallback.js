@@ -61,29 +61,19 @@ async function checkEligibility(recipientUid) {
   if (String(process.env.SMS_FALLBACK_ENABLED ?? 'true').trim().toLowerCase() === 'false') return { eligible: false, reason: 'disabled_globally' };
   const db = getDb();
   if (!db || !recipientUid) return { eligible: false, reason: 'missing_context' };
-  let user = null;
-  try {
-    const snap = await db.collection('users').doc(String(recipientUid)).get();
-    user = snap && snap.exists ? snap.data() : null;
-  } catch (_) { user = null; }
-  if (!user) return { eligible: false, reason: 'recipient_not_found' };
-  if (user.smsFallbackEnabled === false) return { eligible: false, reason: 'recipient_opted_out' };
-  // Vérification : strict (true) OU héritage legacy (champ ABSENT + compte actif —
-  // convention du dépôt : auth.js « user.phoneVerified !== false », userResolver
-  // « phoneVerified=false EXCLUS par défaut »). Un false EXPLICITE (OTP en attente)
-  // bloque toujours le secours — la vérification des numéros n'est jamais contournée.
-  const verified = user.phoneVerified === true || (user.phoneVerified == null && user.status === 'active');
-  if (!verified) return { eligible: false, reason: 'phone_unverified' };
-  // Numéro : E.164 canonique direct, sinon normalisation (comptes anciens :
-  // espaces, 00xx, format local) — JAMAIS l'UID, jamais un numéro invalide.
-  const raw = String(user.phone || '').trim();
-  let phone = /^\+[1-9]\d{6,14}$/.test(raw) ? raw : null;
-  if (!phone) {
-    try { phone = require('./phoneNormalizer').normalizePhone(raw) || null; } catch (_) { phone = null; }
+  // Résolution CENTRALE (services/userResolver.js) : source de vérité unique
+  // Firestore users/{uid} — priorité phone → phoneNumber, E.164, vérification
+  // selon le mécanisme existant (true / phoneVerifiedAt / legacy actif) ;
+  // un false explicite (OTP en attente) bloque TOUJOURS. Un seul document lu.
+  const res = await require('./userResolver').resolveVerifiedPhoneByUid(recipientUid);
+  if (!res.found) {
+    const reasonMap = { user_not_found: 'recipient_not_found', no_phone: 'no_valid_phone', invalid_phone: 'no_valid_phone', phone_unverified: 'phone_unverified' };
+    return { eligible: false, reason: reasonMap[res.reason] || 'recipient_not_found' };
   }
-  if (!phone || !/^\+[1-9]\d{6,14}$/.test(phone)) return { eligible: false, reason: 'no_valid_phone' };
-  logger.info('[ROUTING] Verified phone resolved', { recipientUid: String(recipientUid).slice(0, 10), to: maskPhone(phone) });
-  return { eligible: true, phone, user };
+  const user = res.user || {};
+  if (user.smsFallbackEnabled === false) return { eligible: false, reason: 'recipient_opted_out' };
+  logger.info('[ROUTING] Verified phone resolved', { recipientUid: String(recipientUid).slice(0, 10), to: maskPhone(res.phone), basis: res.basis, source: res.source });
+  return { eligible: true, phone: res.phone, user };
 }
 
 /** Le transport SMS actif est-il disponible ? */

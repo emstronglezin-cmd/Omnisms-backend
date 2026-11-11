@@ -44,6 +44,34 @@ router.post('/send', authenticate, async (req, res) => {
       }
     }
 
+    // SECOURS SMSGate (même politique que le routage v2) : destinataire OmniSMS
+    // HORS LIGNE + numéro vérifié → SMS réel via SMSGate ; sinon rien (le
+    // message est déjà conservé dans l'historique). Anti-doublon partagé
+    // (marqueurs smsFallback/sms_fallback_dedup posés après succès seulement).
+    if (type === 'text') {
+      setImmediate(async () => {
+        try {
+          const { isUserOnline } = require('../services/socketService');
+          const online = await isUserOnline(receiverId).catch(() => false);
+          if (online) return; // livré en interne — jamais de SMS supplémentaire
+          const fb = require('../services/smsFallback');
+          const out = await fb.evaluateAndDispatch({
+            recipientUid: receiverId,
+            messageId    : ref.id,
+            dedupKey     : ref.id,
+            content      : msgData.content,
+            senderName   : (req.user && (req.user.name || req.user.username)) || null,
+          });
+          logger.info('[MESSAGES] /send : secours hors ligne évalué', {
+            messageId: ref.id, receiverId: String(receiverId).slice(0, 10),
+            smsFallback: out && out.status ? `${out.status}${out.reason ? ':' + out.reason : ''}` : out,
+          });
+        } catch (fbErr) {
+          logger.warn('[MESSAGES] /send : secours non évalué', { messageId: ref.id, error: fbErr.message });
+        }
+      });
+    }
+
     logger.info('Message envoyé', { messageId: ref.id, senderId: req.user.uid });
     return res.status(201).json({ message: 'Message envoyé avec succès.', data: { id: ref.id, ...msgData } });
   } catch (err) {

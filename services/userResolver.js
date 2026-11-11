@@ -391,6 +391,67 @@ async function resolveUserByUid(uid, opts = {}) {
   }
 }
 
+/* ── Résolution CENTRALE du numéro vérifié d'un destinataire (par UID) ────── */
+/**
+ * SOURCE DE VÉRITÉ UNIQUE : Firestore users/{uid}.
+ * Firebase Auth n'est PAS une source de numéro dans ce projet : l'inscription
+ * est custom (email/mot de passe + profil Firestore) ; le numéro vit
+ * exclusivement dans le doc utilisateur, écrit en E.164 à l'inscription
+ * (routes/auth.js) puis confirmé par OTP (routes/otp.js → phoneVerified=true,
+ * phoneVerifiedAt).
+ *
+ * Priorité des champs téléphone : phone (canonique) → phoneNumber (alias
+ * défensif) → normalisation E.164 du format trouvé (anciens comptes, défaut BF).
+ *
+ * Vérification — mécanisme EXISTANT, jamais contourné :
+ *   1. phoneVerified === true      → vérifié (OTP validé) ;
+ *   2. phoneVerifiedAt présent     → vérifié (preuve d'achèvement OTP) ;
+ *   3. phoneVerified === false     → NON vérifié (OTP en attente) : un false
+ *      explicite bloque TOUJOURS — aucun numéro n'est auto-déclaré vérifié ;
+ *   4. phoneVerified absent (comptes pré-OTP, champ status parfois absent
+ *      lui aussi) → vérifié si le compte n'est pas explicitement inactif
+ *      (status absent ou 'active') OU verificationRequired === false —
+ *      convention du dépôt (auth.js « phoneVerified !== false »,
+ *      userResolver « phoneVerified=false EXCLUS par défaut »).
+ *
+ * @param {string} uid - UID Firestore du destinataire
+ * @returns {Promise<{found:true, phone:string, source:string, basis:string, user:object}
+ *                  |{found:false, reason:'user_not_found'|'no_phone'|'phone_unverified'|'invalid_phone'}>}
+ */
+async function resolveVerifiedPhoneByUid(uid) {
+  const db = getDb();
+  if (!db || !uid) return { found: false, reason: 'user_not_found' };
+  let user = null;
+  try {
+    const snap = await db.collection('users').doc(String(uid)).get();
+    user = snap && snap.exists ? snap.data() : null;
+  } catch (err) {
+    logger.warn('[UserResolver] resolveVerifiedPhoneByUid error', { error: err.message });
+    return { found: false, reason: 'user_not_found' };
+  }
+  if (!user || user.deleted === true) return { found: false, reason: 'user_not_found' };
+
+  const raw = String(user.phone || user.phoneNumber || '').trim();
+  if (!raw) return { found: false, reason: 'no_phone' };
+
+  let basis = null;
+  if (user.phoneVerified === true) basis = 'otp_verified';
+  else if (user.phoneVerifiedAt) basis = 'otp_verified_at';
+  else if (user.phoneVerified === false) return { found: false, reason: 'phone_unverified' }; // OTP en attente — blocage EXPPLICITE
+  else if (user.verificationRequired === false || !user.status || user.status === 'active') basis = 'legacy_active';
+  else return { found: false, reason: 'phone_unverified' }; // status explicite non actif (pending_verification, suspendu…)
+
+  const phone = /^\+[1-9]\d{6,14}$/.test(raw) ? raw : (normalizePhone(raw) || null);
+  if (!phone) return { found: false, reason: 'invalid_phone' };
+  return {
+    found: true,
+    phone,
+    source: user.phone ? 'firestore.phone' : 'firestore.phoneNumber',
+    basis,
+    user,
+  };
+}
+
 /* ── SESSION 13 — Destinataire saisi par username (#username) ─────────────── */
 
 // UID Firestore auto-généré (users.add() → 20 caractères) ou UID Firebase Auth (28).
@@ -594,6 +655,7 @@ module.exports = {
   resolveUserByEmail,
   resolveUserByUsername,
   resolveUserByUid,
+  resolveVerifiedPhoneByUid,
   // Normalisation
   normalizeEmail,
   normalizeUsername,
