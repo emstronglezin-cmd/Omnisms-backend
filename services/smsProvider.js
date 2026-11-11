@@ -28,11 +28,11 @@ function getProviderStatus() {
   };
 }
 
-async function sendSMS(to, message) {
+async function sendSMS(to, message, opts = {}) {
   try {
     const p = require('./smsGateProvider');
     if (p.isEnabled && p.isEnabled()) {
-      const r = await p.sendSMS({ to, text: message });
+      const r = await p.sendSMS({ to, text: message, messageId: (opts && opts.messageId) || null });
       return { success: !!r.success, provider: 'smsgate', result: r, error: r.success ? null : r.error };
     }
   } catch (_) {}

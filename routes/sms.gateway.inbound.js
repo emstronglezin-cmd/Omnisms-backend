@@ -289,6 +289,8 @@ async function updateDeliveryStatus(event, data, db) {
 
       await snap.docs[0].ref.update(updateData);
 
+      if (newStatus === 'delivered') logger.info('[SMSGATE] SMS delivery confirmed', { gwMessageId: String(gwMessageId).slice(0, 12), docId: snap.docs[0].id });
+      if (newStatus === 'failed') logger.warn('[SMSGATE] SMS failed (accusé passerelle)', { gwMessageId: String(gwMessageId).slice(0, 12), docId: snap.docs[0].id });
       logger.info('[INfiniReach/DLR] Statut message mis à jour', {
         gwMessageId,
         event,

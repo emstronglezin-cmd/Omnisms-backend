@@ -391,6 +391,13 @@ async function routeMessage(opts = {}) {
       recipientOnline: recipientIsOnline,
       targetPhone: targetPhone ? targetPhone.replace(/\d{4}$/, '****') : '(uid direct)',
     });
+    // Tags distincts demandés pour le diagnostic prod :
+    logger.info(recipientIsOnline
+      ? '[ROUTING] Recipient online → OmniSMS interne (Socket.IO)'
+      : '[ROUTING] Recipient offline → évaluation du secours SMS', {
+      resolvedUid,
+      targetPhone: targetPhone ? targetPhone.replace(/\d{4}$/, '****') : '(uid direct)',
+    });
   }
 
   /* ── 2 bis. OmniSMS OFFLINE → attente interne (ROUTE_OFFLINE_HOLD=true) ── */
@@ -468,6 +475,9 @@ async function routeMessage(opts = {}) {
       messageId     : savedId,
       conversationId: convId,
       type,
+      // Motif EXPLICITE du secours dans le log prod (sent | armed | skipped:raison | failed)
+      // — avant : la raison du non-envoi était invisible côté exploitation.
+      smsFallback   : smsFallback && smsFallback.status ? `${smsFallback.status}${smsFallback.reason ? ':' + smsFallback.reason : ''}` : 'not_evaluated',
     });
     return {
       route         : 'OMNISMS',

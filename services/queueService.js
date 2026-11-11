@@ -90,15 +90,23 @@ function shutdownForQuota(reason) {
     reason: String(reason).slice(0, 200),
     recover: String(process.env.QUEUE_AUTO_RECOVER || 'true') !== 'false' ? 'probe active' : 'QUEUE_AUTO_RECOVER=false',
   });
+  // Fermer PROPREMENT workers/queues AVANT de couper les connexions :
+  // sinon les commandes BullMQ en vol rejettent (« Connection is closed »,
+  // rejets de promesses non gérés).
+  const closes = [];
   for (const name of Object.keys(workers)) {
-    try { const w = workers[name]; w.close ? w.close().catch(() => {}) : null; } catch (_) {}
+    try { const w = workers[name]; if (w && w.close) closes.push(Promise.resolve().then(() => w.close()).catch(() => {})); } catch (_) {}
     delete workers[name];
   }
-  for (const name of Object.keys(queues)) { try { queues[name].close().catch(() => {}); } catch (_) {} delete queues[name]; }
-  try { redisConnection && redisConnection.disconnect(false); } catch (_) {}
-  try { workerConnection && workerConnection.disconnect(false); } catch (_) {}
-  redisConnection = null;
-  workerConnection = null;
+  for (const name of Object.keys(queues)) { try { const q = queues[name]; if (q && q.close) closes.push(Promise.resolve().then(() => q.close()).catch(() => {})); } catch (_) {} delete queues[name]; }
+  Promise.race([Promise.all(closes), new Promise((r) => setTimeout(r, 3000))])
+    .catch(() => {})
+    .then(() => {
+      try { redisConnection && redisConnection.disconnect(false); } catch (_) {}
+      try { workerConnection && workerConnection.disconnect(false); } catch (_) {}
+      redisConnection = null;
+      workerConnection = null;
+    });
   scheduleRecoveryProbe();
 }
 
@@ -250,7 +258,9 @@ function getQueue(name, opts = {}) {
  * @returns {Promise<object>}  - Job BullMQ ou résultat inline
  */
 async function addJob(queueName, data, opts = {}) {
-  const q = getQueue(queueName);
+  // Quota épuisé → inline DIRECT : aucune commande Redis tentée
+  // (évite les « Connection is closed » et les rejets de promesses non gérés).
+  const q = quotaExhausted ? null : getQueue(queueName);
 
   if (q) {
     try {

@@ -250,6 +250,7 @@ async function sendSMS(p = {}) {
   if (ttl) payload.ttl = Math.min(Math.max(Number(ttl) || 3600, 60), 86400);
   if (c.deviceId) payload.deviceId = c.deviceId;
 
+  logger.info('[SMSGATE] Sending SMS', { to: maskPhone(to), deviceId: c.deviceId || null, ttl: payload.ttl || null, messageId: messageId ? String(messageId).slice(0, 12) : null });
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const token = await getAccessToken();
@@ -264,16 +265,16 @@ async function sendSMS(p = {}) {
         continue; // une seule re-auth puis retry
       }
       if (out.status === 429) {
-        logger.warn('[SMSGate] Limite de requêtes atteinte (429)', { to: maskPhone(to) });
+        logger.warn('[SMSGATE] SMS failed (limite fournisseur 429)', { to: maskPhone(to) });
         return { success: false, provider: 'smsgate', statusCode: 429, error: 'RATE_LIMITED' };
       }
       if (out.status >= 500) {
         // Ambigu : l'API a pu accepter le message malgré l'erreur
-        logger.warn('[SMSGate] Erreur serveur (ambigu)', { status: out.status, to: maskPhone(to) });
+        logger.warn('[SMSGATE] Gateway unavailable (HTTP 5xx — résultat ambigu)', { status: out.status, to: maskPhone(to) });
         return { success: false, provider: 'smsgate', statusCode: out.status, error: 'PROVIDER_ERROR', ambiguous: true };
       }
       if (!out.ok) {
-        logger.warn('[SMSGate] Requête rejetée', { status: out.status, to: maskPhone(to) });
+        logger.warn('[SMSGATE] SMS failed (rejet fournisseur)', { status: out.status, to: maskPhone(to) });
         return { success: false, provider: 'smsgate', statusCode: out.status, error: (out.body && (out.body.message || out.body.error)) || `HTTP_${out.status}` };
       }
 
@@ -282,12 +283,12 @@ async function sendSMS(p = {}) {
       if (Array.isArray(gwId)) gwId = gwId[0];
       if (gwId && typeof gwId === 'object') gwId = gwId.id;
       if (!gwId) {
-        logger.warn('[SMSGate] Réponse sans identifiant de message', { to: maskPhone(to) });
+        logger.warn('[SMSGATE] SMS failed (réponse sans id — ambigu)', { to: maskPhone(to) });
         return { success: false, provider: 'smsgate', statusCode: out.status, error: 'NO_MESSAGE_ID', ambiguous: true };
       }
 
       memoSet(messageId, String(gwId));
-      logger.info('[SMSGate] SMS accepté', { to: maskPhone(to), gatewayMessageId: String(gwId).slice(0, 12), ttl: payload.ttl || null });
+      logger.info('[SMSGATE] SMS accepted', { to: maskPhone(to), gatewayMessageId: String(gwId).slice(0, 12), ttl: payload.ttl || null });
       return { success: true, gatewayMessageId: String(gwId), state: 'pending', provider: 'smsgate', statusCode: out.status };
     } catch (err) {
       const aborted = err && (err.name === 'AbortError' || err.name === 'TimeoutError');
@@ -295,7 +296,7 @@ async function sendSMS(p = {}) {
         // erreur réseau ponctuelle → un seul retry immédiat
         continue;
       }
-      logger.error('[SMSGate] Erreur réseau/timeout', { to: maskPhone(to), error: aborted ? `timeout après ${c.timeoutMs} ms` : err.message });
+      logger.error('[SMSGATE] Gateway unavailable (réseau/timeout)', { to: maskPhone(to), error: aborted ? `timeout après ${c.timeoutMs} ms` : err.message });
       return { success: false, provider: 'smsgate', statusCode: 0, error: aborted ? 'TIMEOUT' : 'NETWORK_ERROR', ambiguous: true };
     }
   }
@@ -335,6 +336,7 @@ async function checkStatus(gatewayMessageId) {
 
   function fromStatusBody(body) {
     const state = mapState(body && (body.state || body.status));
+    if (state === 'delivered') logger.info('[SMSGATE] SMS delivery confirmed', { gatewayMessageId: String(gatewayMessageId).slice(0, 12) });
     return {
       found   : true,
       state,

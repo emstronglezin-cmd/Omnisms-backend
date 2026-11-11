@@ -68,9 +68,21 @@ async function checkEligibility(recipientUid) {
   } catch (_) { user = null; }
   if (!user) return { eligible: false, reason: 'recipient_not_found' };
   if (user.smsFallbackEnabled === false) return { eligible: false, reason: 'recipient_opted_out' };
-  if (user.phoneVerified !== true) return { eligible: false, reason: 'phone_unverified' };
-  const phone = String(user.phone || '').trim();
-  if (!/^\+[1-9]\d{6,14}$/.test(phone)) return { eligible: false, reason: 'no_valid_phone' };
+  // Vérification : strict (true) OU héritage legacy (champ ABSENT + compte actif —
+  // convention du dépôt : auth.js « user.phoneVerified !== false », userResolver
+  // « phoneVerified=false EXCLUS par défaut »). Un false EXPLICITE (OTP en attente)
+  // bloque toujours le secours — la vérification des numéros n'est jamais contournée.
+  const verified = user.phoneVerified === true || (user.phoneVerified == null && user.status === 'active');
+  if (!verified) return { eligible: false, reason: 'phone_unverified' };
+  // Numéro : E.164 canonique direct, sinon normalisation (comptes anciens :
+  // espaces, 00xx, format local) — JAMAIS l'UID, jamais un numéro invalide.
+  const raw = String(user.phone || '').trim();
+  let phone = /^\+[1-9]\d{6,14}$/.test(raw) ? raw : null;
+  if (!phone) {
+    try { phone = require('./phoneNormalizer').normalizePhone(raw) || null; } catch (_) { phone = null; }
+  }
+  if (!phone || !/^\+[1-9]\d{6,14}$/.test(phone)) return { eligible: false, reason: 'no_valid_phone' };
+  logger.info('[ROUTING] Verified phone resolved', { recipientUid: String(recipientUid).slice(0, 10), to: maskPhone(phone) });
   return { eligible: true, phone, user };
 }
 
@@ -84,7 +96,7 @@ async function dispatchFallbackSms({ phone, text, recipientUid, messageId, dedup
   const db = getDb();
   let result;
   try {
-    result = await require('./smsProvider').sendSMS(phone, text);
+    result = await require('./smsProvider').sendSMS(phone, text, { messageId: (String(messageId || dedupKey || '') || null) });
   } catch (err) {
     logger.warn('[SmsFallback] envoi échoué', { error: err.message, to: maskPhone(phone) });
     result = { success: false, error: err.message };
@@ -117,7 +129,11 @@ async function dispatchFallbackSms({ phone, text, recipientUid, messageId, dedup
 }
 
 async function evaluateAndDispatch({ recipientUid, messageId, content, senderName, dedupKey }) {
-  const skip = (reason) => ({ status: 'skipped', reason });
+  const skip = (reason) => {
+    // Motif EXPLICITE dans les logs (avant : skip silencieux → diagnostic impossible).
+    logger.warn('[SMS_FALLBACK] Secours SMS non envoyé — motif', { messageId, reason, kind: 'text' });
+    return { status: 'skipped', reason };
+  };
 
   if (String(process.env.SMS_FALLBACK_ENABLED ?? 'true').trim().toLowerCase() === 'false') return skip('disabled_globally');
   const db = getDb();
@@ -126,8 +142,12 @@ async function evaluateAndDispatch({ recipientUid, messageId, content, senderNam
   // Anti-doublon NIVEAU MESSAGE : le doc a déjà un statut de secours.
   try {
     const existing = await db.collection('messages').doc(String(messageId)).get();
-    if (existing && existing.exists && (existing.data() || {}).smsFallback && (existing.data().smsFallback || {}).status) {
-      return skip('already_handled');
+    if (existing && existing.exists) {
+      const prevFb = (existing.data() || {}).smsFallback || {};
+      // Seul un SUCCÈS bloque la re-route. Un ÉCHEC (gateway indisponible, etc.)
+      // reste RETENTABLE sans doublon possible : les marqueurs `sms_fallback_dedup`
+      // ne sont posés qu'après un succès confirmé.
+      if (prevFb.status === 'sent') return skip('already_handled');
     }
   } catch (_) { /* lecture non bloquante */ }
   // Anti-doublon NIVEAU MESSAGE LOGIQUE : une re-route du même message
@@ -184,11 +204,15 @@ async function downloadAudioPath(audioUrl) {
  */
 async function armAudioFallback({ recipientUid, messageId, audioUrl, senderName, dedupKey }) {
   const db = getDb();
-  if (!db || !recipientUid || !messageId) return { status: 'skipped', reason: 'missing_context' };
+  const skipA = (reason, extra) => {
+    logger.warn('[SMS_FALLBACK] vocal non armé — motif', { messageId, reason, ...(extra || {}) });
+    return { status: 'skipped', reason };
+  };
+  if (!db || !recipientUid || !messageId) return skipA('missing_context');
   const elig = await checkEligibility(recipientUid);
-  if (!elig.eligible) return { status: 'skipped', reason: elig.reason };
-  if (!transportAvailable()) return { status: 'skipped', reason: 'no_sms_provider' };
-  if (!audioUrl) return { status: 'skipped', reason: 'no_audio' };
+  if (!elig.eligible) return skipA(elig.reason);
+  if (!transportAvailable()) return skipA('no_sms_provider');
+  if (!audioUrl) return skipA('no_audio');
   try {
     let audioPath = resolveAudioPath(audioUrl);
     if (!audioPath && /^https?:\/\//i.test(audioUrl)) audioPath = await downloadAudioPath(audioUrl);
