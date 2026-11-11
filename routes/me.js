@@ -68,8 +68,8 @@ router.put('/profile', auth, async (req, res) => {
       if (e164Phone !== rawPhone) updates.phoneRaw = rawPhone;
     }
     if (bio   !== undefined && bio   !== null) updates.bio   = String(bio).trim();
-    // Consentement SMS de secours (V3.1) : le destinataire choisit si un SMS
-    // peut lui être envoyé via la passerelle quand il est hors ligne (défaut NON).
+    // SMS de secours (V3.2) : AUTO par défaut pour les comptes vérifiés (décision
+    // produit « joindre même sans Internet ») ; smsFallbackEnabled=false = opt-out.
     if (req.body.smsFallbackEnabled !== undefined) {
       updates.smsFallbackEnabled = req.body.smsFallbackEnabled === true;
     }

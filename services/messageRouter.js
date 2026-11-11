@@ -408,6 +408,7 @@ async function routeMessage(opts = {}) {
       content       : content ? content.trim() : null,
       type,
       channel       : 'app',
+      senderName    : senderName || null, // utilisé par le secours SMS vocal (« [OmniSMS Vocal] {nom} : … »)
       audioUrl      : audioUrl || null,
       duration      : duration || null,
       status        : 'pending',
@@ -447,7 +448,15 @@ async function routeMessage(opts = {}) {
     let smsFallback = { status: 'skipped', reason: 'not_evaluated' };
     try {
       const fb = require('./smsFallback');
-      smsFallback = await fb.evaluateAndDispatch({ recipientUid: resolvedUid, messageId: savedId, dedupKey: msgId, content, senderName });
+      if (type === 'audio') {
+        // VOCAL hors ligne : transcription (pipeline existant) PUIS SMS texte.
+        // Jamais de « texte de secours » sur un vocal, jamais de suppression
+        // du fichier audio original.
+        const armed = await fb.armAudioFallback({ recipientUid: resolvedUid, messageId: savedId, audioUrl, senderName, dedupKey: msgId });
+        smsFallback = armed.status === 'armed' ? { status: 'armed', reason: 'transcription_then_sms' } : armed;
+      } else {
+        smsFallback = await fb.evaluateAndDispatch({ recipientUid: resolvedUid, messageId: savedId, dedupKey: msgId, content, senderName });
+      }
     } catch (fbErr) {
       smsFallback = { status: 'skipped', reason: 'fallback_error', error: fbErr.message };
     }
@@ -978,6 +987,18 @@ async function routeMessage(opts = {}) {
             messageId: savedId !== msgId ? savedId : null,
             ttl      : 3600,
           });
+        } else if (transport === 'smsgate') {
+          // FIX V3.2 : le chemin audio synchrone ignorait SMSGate (transport
+          // apparu après) → le texte transcrit n'était PAS envoyé.
+          const smsgate = require('./smsGateProvider');
+          if (smsgate && smsgate.isEnabled && smsgate.isEnabled()) {
+            audioSmsResult = await smsgate.sendSMS({
+              to       : e164Target,
+              text     : smsTextAudio,
+              messageId: savedId !== msgId ? savedId : null,
+              ttl      : 3600,
+            });
+          }
         } else if (transport === 'infobip') {
           const deliveryUrl = `${process.env.RENDER_EXTERNAL_URL || 'https://omnisms-backend.onrender.com'}/api/webhooks/infobip/inbound`;
           audioSmsResult = await infobip.sendSMS({

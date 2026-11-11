@@ -62,15 +62,29 @@ function isFinalAttempt(job) {
  */
 async function resumeAudioSms(job, messageId, text, collection) {
   const router = getAudioSmsRouter();
-  if (!router || typeof router.continueAudioSmsAfterTranscription !== 'function') return null;
-  try {
-    return await router.continueAudioSmsAfterTranscription({
-      messageId, transcription: text, collection, jobId: job && job.id,
-    });
-  } catch (err) {
-    logger.warn('[AUDIO_SMS] Reprise Audio → SMS : erreur inattendue', { messageId, error: err.message });
-    return null;
+  // 1) Chemin EXTERNE existant (channel 'sms', receiverId = téléphone).
+  if (router && typeof router.continueAudioSmsAfterTranscription === 'function') {
+    try {
+      const handled = await router.continueAudioSmsAfterTranscription({
+        messageId, transcription: text, collection, jobId: job && job.id,
+      });
+      // Traité par le chemin externe → terminé. 'skipped' → tenter le secours
+      // hors ligne V3.2 (destinataire OmniSMS armé via smsAfterTranscription).
+      if (handled && handled.action && handled.action !== 'skipped') return handled;
+    } catch (err) {
+      logger.warn('[AUDIO_SMS] Reprise Audio → SMS : erreur inattendue', { messageId, error: err.message });
+    }
   }
+  // 2) V3.2 : destinataire OmniSMS HORS LIGNE (armé par smsFallback) → SMS texte.
+  try {
+    const fb = require('../services/smsFallback');
+    if (fb && typeof fb.resumeAfterTranscription === 'function') {
+      return await fb.resumeAfterTranscription({ messageId, transcription: text });
+    }
+  } catch (err) {
+    logger.warn('[AUDIO_SMS] Reprise secours hors ligne : erreur inattendue', { messageId, error: err.message });
+  }
+  return null;
 }
 
 /** Échec de transcription : statut d'erreur propre côté SMS (aucun SMS envoyé). */
