@@ -125,8 +125,8 @@ const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(sr
   const rc = await p.sendSMS({ to: '+22670000004', text: 'Bad creds', messageId: 'm-401-c' });
   await sleep(100);
   check('Basic refusé aussi → échec HONNÊTE (jamais « envoyé »)', rc.success === false && rc.statusCode === 401, rc);
-  check('tentatives bornées (2 POST /messages, pas de boucle)', C.messageCalls === 2, C);
-  check('message d erreur Actionnable (mode + vars à vérifier, sans secret)', /auth Basic refusée/.test(String(rc.error)) && /SMS_GATEWAY_LOGIN/.test(String(rc.error)), rc.error);
+  check('tentatives bornées (4 POST /messages — auto-réparation plafonnée, pas de boucle)', C.messageCalls === 4, C);
+  check("message d'erreur actionnable (AUTH_REJECTED + vars à vérifier, sans secret)", /AUTH_REJECTED/.test(String(rc.error)) && /SMS_GATEWAY_LOGIN/.test(String(rc.error)) && /SMSGate « /.test(String(rc.error)), rc.error);
   serverC.close();
 
   /* ══ Sonde RÉELLE (contrat du service public — aucun identifiant réel) ══ */

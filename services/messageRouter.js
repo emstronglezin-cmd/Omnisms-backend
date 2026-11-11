@@ -770,6 +770,34 @@ async function routeMessage(opts = {}) {
 
   let smsResult = null;
 
+  // ANTI-BOUCLE : destination = SIM passerelle elle-même → aucun SMS (le
+  // chemin « reprise vocale » avait déjà cette garde ; ici pour le texte).
+  const _gwRaw  = (process.env.SMS_GATEWAY_DEVICE_NUMBER || process.env.INFINIREACH_FROM_NUMBER || '').trim();
+  const _gwNorm = _gwRaw ? (normalizePhone(_gwRaw) || _gwRaw) : '';
+  if (_gwNorm && e164Target === _gwNorm) {
+    logger.warn('[ROUTING] Destination = numéro passerelle → SMS annulé (anti-boucle)', {
+      senderUid,
+      targetPhone: e164Target.replace(/\d{4}$/, '****'),
+      messageId  : savedId,
+    });
+    if (db && savedId && savedId !== msgId) {
+      await db.collection('messages').doc(savedId).update({
+        status   : 'failed',
+        smsError : 'DESTINATION_IS_GATEWAY_NUMBER',
+        updatedAt: new Date().toISOString(),
+      }).catch(() => {});
+    }
+    return {
+      route         : 'SMS_EXTERNE',
+      transport,
+      conversationId: convId,
+      messageId     : savedId,
+      resolvedUid   : resolvedUid || null,
+      smsResult     : { success: false, error: 'GATEWAY_NUMBER' },
+      message       : msg,
+    };
+  }
+
   if (transport !== 'none' && type === 'text' && content) {
     // ── Tentative directe (synchrone) ───────────────────────
     try {

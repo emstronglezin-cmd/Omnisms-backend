@@ -72,6 +72,15 @@ async function checkEligibility(recipientUid) {
   }
   const user = res.user || {};
   if (user.smsFallbackEnabled === false) return { eligible: false, reason: 'recipient_opted_out' };
+  // ANTI-BOUCLE : le numéro résolu est la SIM passerelle elle-même → jamais de
+  // SMS vers elle-même (message conservé, motif explicite). Le chemin vocal
+  // avait déjà cette garde (skipped_gateway_number) — ici pour le texte.
+  const gwRaw  = (process.env.SMS_GATEWAY_DEVICE_NUMBER || process.env.INFINIREACH_FROM_NUMBER || '').trim();
+  const gwNorm = gwRaw ? (require('./phoneNormalizer').normalizePhone(gwRaw) || gwRaw) : '';
+  if (gwNorm && res.phone === gwNorm) {
+    logger.warn('[SMS_FALLBACK] Destinataire = numéro passerelle → secours annulé (anti-boucle)');
+    return { eligible: false, reason: 'gateway_number' };
+  }
   logger.info('[ROUTING] Verified phone resolved', { recipientUid: String(recipientUid).slice(0, 10), to: maskPhone(res.phone), basis: res.basis, source: res.source });
   return { eligible: true, phone: res.phone, user };
 }

@@ -48,6 +48,11 @@ function normalizeBaseUrl(raw) {
 }
 /** Mode d'auth : 'basic' | 'jwt' | 'auto' (défaut : JWT, repli Basic automatique). */
 let _authModeOverride = null; // 'auto' → bascule réelle (basic) après échec de l'endpoint JWT
+let _authFlipFlops = 0;       // alternances Basic↔JWT (auto-réparation, plafonnées)
+/** Hôte du serveur configuré (jamais de secret : host seul, userinfo exclu). */
+function _hostOf(u) {
+  try { return new URL(u).host; } catch (_) { return String(u || '').replace(/^[a-z]+:\/\//i, '').split('/')[0] || '?'; }
+}
 function normalizeAuthMode(raw) {
   const v = String(raw === undefined || raw === null ? 'auto' : raw).trim().toLowerCase();
   if (v === 'basic') return 'basic';
@@ -251,7 +256,8 @@ async function sendSMS(p = {}) {
   if (c.deviceId) payload.deviceId = c.deviceId;
 
   logger.info('[SMSGATE] Sending SMS', { to: maskPhone(to), deviceId: c.deviceId || null, ttl: payload.ttl || null, messageId: messageId ? String(messageId).slice(0, 12) : null });
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  let lastRejection = 0; // dernier statut HTTP d'authentification rejetée
+  for (let attempt = 1; attempt <= 4; attempt++) {
     try {
       const token = await getAccessToken();
       const out = await fetchJson(`${c.baseUrl}${c.prefix}/messages`, {
@@ -260,22 +266,33 @@ async function sendSMS(p = {}) {
         body   : JSON.stringify(payload),
       });
 
-      if (out.status === 401 && attempt === 1 && cfg().authMode !== 'basic') {
+      if (out.status === 401) lastRejection = 401;
+      if (out.status === 401 && cfg().authMode !== 'basic') {
         // 401 sur /messages : le jeton JWT est refusé par le serveur.
-        //  - mode auto  → repli PERMANENT en Basic (identifiants app = vérité
-        //    terrain) : sans cela, le JWT rejeté restait en cache → 401
-        //    persistant sur CHAQUE envoi (cause du bug prod) ;
-        //  - mode jwt explicite → invalidation + re-auth, retry unique ;
-        //  - mode basic → identifiants réellement invalides : échec honnête
-        //    (pas de retry inutile, jamais de secret dans les logs).
+        //  - mode auto  → repli en Basic (identifiants app = vérité terrain) :
+        //    sans cela, le JWT rejeté restait en cache → 401 persistant sur
+        //    CHAQUE envoi (cause du bug prod) ;
+        //  - mode jwt explicite → invalidation + re-auth (boucle bornée).
         if (cfg().authMode === 'auto') {
           _authModeOverride = 'basic';
           _token = null;
-          logger.warn('[SMSGate] 401 sur /messages avec JWT → repli Basic permanent (identifiants app)');
+          logger.warn('[SMSGate] 401 sur /messages avec JWT → repli Basic (identifiants app)', { server: _hostOf(c.baseUrl) });
         } else {
           invalidateToken();
         }
-        continue; // une seule re-auth / repli puis retry
+        continue;
+      }
+      if (out.status === 401 && cfg().authMode === 'basic' && _authModeOverride === 'basic' && _authFlipFlops < 3) {
+        // Basic refusé LUI AUSSI (alors que c'est NOUS qui avions basculé) :
+        // JWT ET Basic sont rejetés → identifiants/serveur à vérifier, OU
+        // rejet JWT transitoire. Auto-réparation BORNÉE : re-tenter le JWT
+        // (re-auth complète), max 3 alternances par process ; sinon échec
+        // honnête. Jamais de secret dans les logs (host seul).
+        _authFlipFlops++;
+        _authModeOverride = null;
+        _token = null;
+        logger.warn(`[SMSGate] 401 Basic également refusé → re-tentative JWT (auto-réparation ${_authFlipFlops}/3)`, { server: _hostOf(c.baseUrl) });
+        continue;
       }
       if (out.status === 429) {
         logger.warn('[SMSGATE] SMS failed (limite fournisseur 429)', { to: maskPhone(to) });
@@ -288,11 +305,12 @@ async function sendSMS(p = {}) {
       }
       if (!out.ok) {
         const authUsed = cfg().authMode === 'basic' ? 'Basic' : 'JWT';
-        logger.warn('[SMSGATE] SMS failed (rejet fournisseur)', { status: out.status, auth: authUsed, to: maskPhone(to) });
+        const host = _hostOf(c.baseUrl);
+        logger.warn('[SMSGATE] SMS failed (rejet fournisseur)', { status: out.status, auth: authUsed, server: host, to: maskPhone(to) });
         const detail = (out.body && (out.body.message || out.body.error)) || `HTTP_${out.status}`;
         return { success: false, provider: 'smsgate', statusCode: out.status,
           error: out.status === 401
-            ? `${detail} — auth ${authUsed} refusée par le serveur SMSGate (vérifier SMS_GATEWAY_LOGIN/PASSWORD et SMS_GATEWAY_SERVER_ADDRESS : identifiants app et MÊME serveur que l application du téléphone)`
+            ? `${detail} — auth ${authUsed} refusée par le serveur SMSGate « ${host} » (vérifier SMS_GATEWAY_LOGIN/PASSWORD : identifiants app du téléphone ; et SMS_GATEWAY_SERVER_ADDRESS : MÊME serveur que l application passerelle)`
             : detail };
       }
 
@@ -317,6 +335,11 @@ async function sendSMS(p = {}) {
       logger.error('[SMSGATE] Gateway unavailable (réseau/timeout)', { to: maskPhone(to), error: aborted ? `timeout après ${c.timeoutMs} ms` : err.message });
       return { success: false, provider: 'smsgate', statusCode: 0, error: aborted ? 'TIMEOUT' : 'NETWORK_ERROR', ambiguous: true };
     }
+  }
+  if (lastRejection === 401) {
+    // Toutes les tentatives d'authentification ont été refusées : échec
+    // HONNÊTE et actionnable (host seul — jamais de secret).
+    return { success: false, provider: 'smsgate', statusCode: 401, error: `AUTH_REJECTED — JWT et Basic refusés par le serveur SMSGate « ${_hostOf(c.baseUrl)} » (vérifier SMS_GATEWAY_LOGIN/PASSWORD : identifiants app du téléphone ; SMS_GATEWAY_SERVER_ADDRESS : MÊME serveur que l application passerelle)` };
   }
   return { success: false, provider: 'smsgate', statusCode: 0, error: 'NETWORK_ERROR', ambiguous: true };
 }

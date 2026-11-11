@@ -129,6 +129,26 @@ router.post('/webhook/leekpay', webhookLogger, controller.handleWebhook);
 // Alias SaaSPay (nouveau endpoint recommandé — configurer dans SasPay)
 router.post('/webhook/saaspay', webhookLogger, controller.handleWebhook);
 
+// ── Vérification d'URL du webhook (GET) ──────────────────────
+// Les tests du dashboard/navigateur font un GET sur l'URL configurée chez
+// SaaSPay → 404 avant ce correctif. Réponse : 200 diagnostique, AUCUN état
+// modifié, JAMAIS de Premium (les événements réels arrivent en POST,
+// signature HMAC X-SaaSPay-Signature +/ou confirmation fournisseur).
+function webhookVerification(service) {
+  return (_req, res) => {
+    logger.info('[SaaSPay Route] Vérification webhook (GET) — aucune action', { service });
+    return res.status(200).json({
+      service,
+      webhook   : 'active',
+      method    : 'POST',
+      message   : 'Endpoint opérationnel — les événements SaaSPay sont livrés en POST (signature X-SaaSPay-Signature).',
+      timestamp : new Date().toISOString(),
+    });
+  };
+}
+router.get('/webhook/saaspay', webhookVerification('SaaSPay'));
+router.get('/webhook/leekpay', webhookVerification('LeekPay (legacy)'));
+
 // ══════════════════════════════════════════════════════════════
 //  ROUTE 3 : GET /api/payment/status/:transactionId
 //  Statut d'un paiement
