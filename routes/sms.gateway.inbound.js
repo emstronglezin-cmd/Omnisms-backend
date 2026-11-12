@@ -984,6 +984,33 @@ async function processGatewayWebhook(body) {
         await updateDeliveryStatus(event, data, getDb());
         break;
 
+      // ── Événements SMSGate (application « SMS Gateway for Android ») ──
+      // Payload typique : { event: 'sms:delivered', messagePayload: { id, message, phoneNumber, ... } }
+      // (pas de champ .data → lire messagePayload sur le corps COMPLET du webhook)
+      // L'association au message OmniSMS se fait par smsMessageId = id passerelle.
+      case 'sms:sent':
+      case 'sms:delivered':
+      case 'sms:failed': {
+        const legacy = { 'sms:sent': 'message.sent', 'sms:delivered': 'message.delivered', 'sms:failed': 'message.failed' }[event];
+        const mp     = (data && data.messagePayload) || (body && body.messagePayload) || (data && data.payload) || (body && body.payload) || data || {};
+        await updateDeliveryStatus(legacy, {
+          messageId: mp.id || mp.messageId || (data && data.messageId) || (body && body.messageId) || null,
+          reason   : mp.error || mp.reason || (data && data.error) || (body && body.error) || null,
+          timestamp: mp.receivedAt || mp.timestamp || (data && data.timestamp) || (body && body.timestamp) || null,
+        }, getDb());
+        break;
+      }
+      case 'sms:received': {
+        const mp = (data && data.messagePayload) || (body && body.messagePayload) || (data && data.payload) || (body && body.payload) || data || {};
+        await processSmsReceived({ data: {
+          from     : mp.phoneNumber || mp.from || mp.sender || (data && data.from) || (body && body.from) || null,
+          to       : process.env.SMS_GATEWAY_DEVICE_NUMBER || mp.deviceNumber || mp.to || (data && data.to) || (body && body.to) || null,
+          body     : mp.message || mp.body || mp.text || (data && data.body) || (body && body.body) || '',
+          messageId: mp.id || mp.messageId || (data && data.messageId) || (body && body.messageId) || null,
+        } });
+        break;
+      }
+
       // ── Inconnu ────────────────────────────────────────────
       default:
         logger.debug('[INfiniReach] webhook:received Événement inconnu', {

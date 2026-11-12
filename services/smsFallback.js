@@ -114,6 +114,9 @@ async function dispatchFallbackSms({ phone, text, recipientUid, messageId, dedup
     if (db) {
       await db.collection('messages').doc(String(messageId)).set({
         smsFallback: { ...out, contentPreview: text.slice(0, 40), updatedAt: nowIso() },
+        // Champ plat pour l'association des DLR SMSGate (webhook sms:delivered)
+        ...(out.gatewayMessageId ? { smsMessageId: out.gatewayMessageId } : {}),
+        ...(status === 'sent' ? { smsAcceptedAt: nowIso() } : {}),
       }, { merge: true });
       if (status === 'sent') {
         for (const k of [...new Set([String(dedupKey || ''), String(messageId)].filter(Boolean))]) {

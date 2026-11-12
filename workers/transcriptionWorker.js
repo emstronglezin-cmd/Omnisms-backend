@@ -301,6 +301,54 @@ function emitTranscriptionEvent(userId, messageId, data) {
   }
 }
 
+/* ── Reprise des transcriptions orphelines ────────────────── */
+/**
+ * Ré-arme les vocaux dont le job a été PERDU (avant le fix inline-quota :
+ * « No queue or handler — job NON exécuté » → transcriptionStatus 'pending'
+ * à jamais). Borné, idempotent (le worker + le claim audioSms protègent
+ * contre les doubles SMS), TRANSCRIPTION_SWEEP=false pour désactiver.
+ */
+async function sweepOrphanTranscriptions() {
+  if (String(process.env.TRANSCRIPTION_SWEEP || 'true').toLowerCase() === 'false') return { requeued: 0 };
+  const db = getDb();
+  if (!db || db._stub) return { requeued: 0 };
+  let snap;
+  try {
+    snap = await db.collection('messages').where('transcriptionStatus', '==', 'pending').limit(60).get();
+  } catch (err) {
+    logger.warn('[TranscriptionWorker] Sweep impossible (lecture)', { error: err.message });
+    return { requeued: 0 };
+  }
+  const cutoff = Date.now() - 10 * 60 * 1000; // > 10 min : rien d'in-flight
+  let requeued = 0;
+  for (const doc of (snap.docs || [])) {
+    if (requeued >= 25) break; // borne par boot
+    const d = doc.data() || {};
+    if (d.type !== 'audio' || !d.audioUrl) continue;
+    if (d.transcription) continue;                                   // déjà transcrit
+    const st = d.smsAfterTranscription;
+    if (st && st !== 'pending') continue;                            // déjà traité/terminé
+    const created = Date.parse(d.createdAt || '') || 0;
+    if (!created || created > cutoff) continue;                      // trop récent
+    try {
+      const fb = require('../services/smsFallback');
+      const out = await fb.armAudioFallback({
+        recipientUid : d.receiverId || d.userId || null,
+        messageId    : doc.id,
+        audioUrl     : d.audioUrl,
+        senderName   : d.senderName || null,
+        dedupKey     : d.id || doc.id,
+      });
+      if (out && out.status === 'armed') requeued++;
+      logger.info('[TranscriptionWorker] Sweep transcription orpheline', { messageId: doc.id, result: out && out.status });
+    } catch (err) {
+      logger.warn('[TranscriptionWorker] Sweep re-arm échoué (non bloquant)', { messageId: doc.id, error: err.message });
+    }
+  }
+  if (requeued > 0) logger.info(`[TranscriptionWorker] Reprise : ${requeued} transcription(s) orpheline(s) ré-armée(s).`);
+  return { requeued };
+}
+
 /* ── Démarrage du worker ──────────────────────────────────── */
 let worker = null;
 
@@ -317,6 +365,9 @@ function startWorker() {
   } else {
     logger.info('[TranscriptionWorker] Running in inline mode (no Redis).');
   }
+  // Reprise des vocaux perdus (jobs non exécutés avant le fix inline-quota) :
+  // différée de 20 s pour laisser le boot se terminer, non bloquante.
+  setTimeout(() => { sweepOrphanTranscriptions().catch(() => {}); }, 20000).unref?.();
   return worker;
 }
 
@@ -324,4 +375,5 @@ module.exports = {
   startWorker,
   setSocketIO,
   transcriptionProcessor,
+  sweepOrphanTranscriptions,
 };

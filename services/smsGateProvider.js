@@ -257,6 +257,7 @@ async function sendSMS(p = {}) {
 
   logger.info('[SMSGATE] Sending SMS', { to: maskPhone(to), deviceId: c.deviceId || null, ttl: payload.ttl || null, messageId: messageId ? String(messageId).slice(0, 12) : null });
   let lastRejection = 0; // dernier statut HTTP d'authentification rejetée
+  const t0 = Date.now(); // mesure du délai backend → acceptation SMSGate
   for (let attempt = 1; attempt <= 4; attempt++) {
     try {
       const token = await getAccessToken();
@@ -324,7 +325,7 @@ async function sendSMS(p = {}) {
       }
 
       memoSet(messageId, String(gwId));
-      logger.info('[SMSGATE] SMS accepted', { to: maskPhone(to), gatewayMessageId: String(gwId).slice(0, 12), ttl: payload.ttl || null });
+      logger.info('[SMSGATE] SMS accepted', { to: maskPhone(to), gatewayMessageId: String(gwId).slice(0, 12), ttl: payload.ttl || null, durationMs: Date.now() - t0 });
       return { success: true, gatewayMessageId: String(gwId), state: 'pending', provider: 'smsgate', statusCode: out.status };
     } catch (err) {
       const aborted = err && (err.name === 'AbortError' || err.name === 'TimeoutError');

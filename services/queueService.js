@@ -90,6 +90,16 @@ function shutdownForQuota(reason) {
     reason: String(reason).slice(0, 200),
     recover: String(process.env.QUEUE_AUTO_RECOVER || 'true') !== 'false' ? 'probe active' : 'QUEUE_AUTO_RECOVER=false',
   });
+  // CRITIQUE (fix « No queue or handler — job NON exécuté ») : enregistrer les
+  // processeurs comme handlers INLINE AVANT de fermer les workers. Sans cela,
+  // après l'épuisement du quota, addJob() ne trouve NI file NI handler → les
+  // jobs « transcription » (et sms) étaient PERDUS, statut pending à jamais.
+  for (const [name, spec] of Object.entries(workerSpecs)) {
+    if (!INLINE_HANDLERS[name] && spec && spec.processor) {
+      INLINE_HANDLERS[name] = spec.processor;
+      logger.info(`[Queue] Handler inline « ${name} » enregistré (dégradation quota).`);
+    }
+  }
   // Fermer PROPREMENT workers/queues AVANT de couper les connexions :
   // sinon les commandes BullMQ en vol rejettent (« Connection is closed »,
   // rejets de promesses non gérés).
@@ -455,6 +465,7 @@ module.exports = {
   getQueue,
   getQueueStatus,
   registerInlineHandler,
+  shutdownForQuota,
   shutdownQueues,
   _quotaTestReset,
 };
