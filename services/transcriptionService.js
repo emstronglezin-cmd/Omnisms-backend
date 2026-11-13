@@ -40,6 +40,9 @@ const WHISPER_SERVICE_URL= () => (process.env.WHISPER_SERVICE_URL || 'http://loc
 const WHISPER_MODEL      = () => process.env.WHISPER_MODEL      || 'small';
 const WHISPER_LANGUAGE   = () => process.env.WHISPER_LANGUAGE   || 'fr';
 const WHISPER_DEVICE     = () => process.env.WHISPER_DEVICE     || 'cpu';
+// FIABILITÉ (API Groq/Whisper) : prompt de contexte français — réduit les
+// hallucinations/inventions sur les audios difficiles (noms, chiffres).
+const GROQ_PROMPT        = () => process.env.GROQ_PROMPT || 'Note vocale OmniSMS en français. Transcrire fidèlement, sans invention.';
 
 /* ═══════════════════════════════════════════════════════════════
    MOTEUR 1 — GROQ Whisper API
@@ -106,6 +109,10 @@ async function transcribeViaGroq(options) {
   const langPart  = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\n${language}`;
   // Champ response_format
   const fmtPart   = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nverbose_json`;
+  // FIABILITÉ (API Groq) : temperature=0 → sortie déterministe (moins
+  // d'hallucinations et de textes inventés) + prompt contexte français.
+  const tempPart   = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="temperature"\r\n\r\n0`;
+  const promptPart = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n${GROQ_PROMPT()}`;
   // Fin
   const endPart   = `\r\n--${boundary}--\r\n`;
 
@@ -113,9 +120,11 @@ async function transcribeViaGroq(options) {
   const modelBuf   = Buffer.from(modelPart, 'utf8');
   const langBuf    = Buffer.from(langPart,  'utf8');
   const fmtBuf     = Buffer.from(fmtPart,   'utf8');
+  const tempBuf    = Buffer.from(tempPart,  'utf8');
+  const promptBuf  = Buffer.from(promptPart, 'utf8');
   const endBuf     = Buffer.from(endPart,   'utf8');
 
-  const bodyBuffer = Buffer.concat([headerBuf, fileBuffer, modelBuf, langBuf, fmtBuf, endBuf]);
+  const bodyBuffer = Buffer.concat([headerBuf, fileBuffer, modelBuf, langBuf, fmtBuf, tempBuf, promptBuf, endBuf]);
 
   const groqStart = Date.now();
   logger.info('[Transcription] Groq request started', {

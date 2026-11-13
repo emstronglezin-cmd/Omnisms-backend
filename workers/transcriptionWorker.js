@@ -176,6 +176,13 @@ async function transcriptionProcessor(job) {
   let result;
   try {
     result = await transcribe({ audioPath: audioFilePath, language, model });
+    // FIABILITÉ GROQ : texte vide/manifestement incomplet → UNE nouvelle
+    // tentative (souvent transitoire). On retente la TRANSCRIPTION, jamais
+    // l'envoi : aucun SMS en double possible.
+    if (result && !(result.text || '').trim() && fs.existsSync(audioFilePath)) {
+      logger.warn('[Transcription] Texte vide → nouvelle tentative unique', { jobId: job.id, messageId });
+      result = await transcribe({ audioPath: audioFilePath, language, model });
+    }
     const groqMs = Date.now() - groqStart;
     logger.info('[Transcription] Groq response received', {
       jobId : job.id,

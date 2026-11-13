@@ -149,6 +149,8 @@ function scheduleRecoveryProbe() {
           for (const [name, spec] of Object.entries(workerSpecs)) {
             createWorker(name, spec.processor, spec.concurrency, spec.workerOptions);
           }
+          // Réintégration propre des tâches de secours dans les files normales.
+          recoverFallbackTasks({ limit: 20, preferQueue: true }).catch(() => {});
         } catch (e) {
           quotaExhausted = true;
           logLimited('recover-fail', '[Queue] Reconnexion après quota échouée — nouvelle sonde.', { error: e.message });
@@ -267,6 +269,82 @@ function getQueue(name, opts = {}) {
  * @param {object}  [opts]     - Options BullMQ (priority, delay, etc.)
  * @returns {Promise<object>}  - Job BullMQ ou résultat inline
  */
+/* ── Secours durable Firestore (outbox) pour les tâches critiques ── */
+// Redis/BullMQ reste le chemin principal : l'outbox n'est écrite QUE sur
+// les chemins inline (dégradés). Tâches suivies : transcription, sms.
+const FALLBACK_TRACKED_QUEUES = new Set(['transcription', 'sms']);
+
+async function _runInlineTracked(queueName, data, handler) {
+  let recorded = null;
+  if (FALLBACK_TRACKED_QUEUES.has(queueName) && data && data.messageId) {
+    try {
+      const fbOut = require('./fallbackOutbox');
+      recorded = await fbOut.recordTask({ kind: queueName, id: String(data.messageId), data });
+      if (recorded && recorded.alreadyDone) {
+        // Tâche déjà terminée (redémarrage, re-route) → JAMAIS ré-exécutée.
+        return { jobId: `inline-${Date.now()}`, queued: false, inline: true, result: { already_done: true } };
+      }
+    } catch (_) { /* outbox indisponible → inline sans secours, non bloquant */ }
+  }
+  try {
+    const result = await handler({ data });
+    if (recorded) {
+      try {
+        const fbOut = require('./fallbackOutbox');
+        // sms : result.success===false = échec réel → retry borné (pas de « done » trompeur)
+        if (queueName === 'sms' && result && result.success === false) await fbOut.markAttemptFailed(recorded.id, String(result.error || 'sms send failed'));
+        else await fbOut.markDone(recorded.id);
+      } catch (_) {}
+    }
+    return { jobId: `inline-${Date.now()}`, queued: false, inline: true, result };
+  } catch (e2) {
+    if (recorded) { try { const fbOut = require('./fallbackOutbox'); await fbOut.markAttemptFailed(recorded.id, e2.message); } catch (_) {} }
+    throw e2;
+  }
+}
+
+/** Reprise des tâches de secours dues (boot + périodique + retour Redis).
+ *  preferQueue:true → réintégration dans les files BullMQ normales quand
+ *  Redis est de retour ; sinon exécution via les processeurs enregistrés. */
+async function recoverFallbackTasks(opts = {}) {
+  const fbOut = require('./fallbackOutbox');
+  const tasks = await fbOut.recoverDueTasks({ limit: opts.limit || 10 });
+  const out = { done: 0, queued: 0, failed: 0, skipped: 0 };
+  for (const task of tasks || []) {
+    try {
+      let handled = false;
+      if (opts.preferQueue && !quotaExhausted) {
+        try {
+          const q = getQueue(task.kind);
+          if (q) { await q.add(task.kind, task.data); await fbOut.markDone(task.id); out.queued++; handled = true; }
+        } catch (_) { /* file indisponible → inline ci-dessous */ }
+      }
+      if (!handled) {
+        const proc = INLINE_HANDLERS[task.kind] || (workerSpecs[task.kind] && workerSpecs[task.kind].processor);
+        if (!proc) { await fbOut.release(task.id); out.skipped++; continue; }
+        await proc({ data: task.data });
+        await fbOut.markDone(task.id);
+        out.done++;
+      }
+    } catch (err) {
+      try { await fbOut.markAttemptFailed(task.id, err.message); } catch (_) {}
+      out.failed++;
+    }
+  }
+  if (tasks.length) logger.info(`[Queue] Outbox secours : ${JSON.stringify(out)}`);
+  return out;
+}
+
+let fallbackTimer = null;
+/** Démarrage de la reprise : un cycle différé au boot puis 1/min. */
+function startFallbackRecovery() {
+  if (fallbackTimer) return;
+  const every = Math.max(30000, parseInt(process.env.FALLBACK_RECOVERY_INTERVAL_MS || '60000', 10) || 60000);
+  setTimeout(() => { recoverFallbackTasks({ limit: 10 }).catch(() => {}); }, 15000).unref?.();
+  fallbackTimer = setInterval(() => { recoverFallbackTasks({ limit: 10, preferQueue: true }).catch(() => {}); }, every);
+  if (fallbackTimer.unref) fallbackTimer.unref();
+}
+
 async function addJob(queueName, data, opts = {}) {
   // Quota épuisé → inline DIRECT : aucune commande Redis tentée
   // (évite les « Connection is closed » et les rejets de promesses non gérés).
@@ -284,14 +362,10 @@ async function addJob(queueName, data, opts = {}) {
       if (handler) {
         // Dégradation contrôlée : exécution immédiate inline (le SMS part
         // quand même) — résultat marqué queued:false, jamais un faux succès.
+        // SECOURS DURABLE : tâche enregistrée dans l'outbox Firestore avant
+        // exécution (survit aux redémarrages, retry borné à délais progressifs).
         logLimited('inline-degrade', `[Queue] "${queueName}" indisponible (${quota ? 'quota' : err.message.slice(0, 80)}) — exécution inline.`);
-        try {
-          const result = await handler({ data });
-          return { jobId: `inline-${Date.now()}`, queued: false, inline: true, result };
-        } catch (e2) {
-          logger.error(`[Queue] Job inline échoué pour "${queueName}"`, { error: e2.message });
-          throw e2;
-        }
+        return await _runInlineTracked(queueName, data, handler);
       }
       logger.error(`[Queue] Job NON ajouté (pas de handler inline) pour "${queueName}"`, { error: err.message });
       return { jobId: null, queued: false, error: err.message };
@@ -302,13 +376,7 @@ async function addJob(queueName, data, opts = {}) {
   const handler = INLINE_HANDLERS[queueName];
   if (handler) {
     logger.info(`[Queue] Inline execution for "${queueName}" (no Redis).`);
-    try {
-      const result = await handler({ data });
-      return { jobId: `inline-${Date.now()}`, queued: false, inline: true, result };
-    } catch (err) {
-      logger.error(`[Queue] Inline job failed for "${queueName}"`, { error: err.message });
-      throw err;
-    }
+    return await _runInlineTracked(queueName, data, handler);
   }
 
   logger.warn(`[Queue] No queue or handler for "${queueName}" — job NON exécuté.`);
@@ -466,6 +534,8 @@ module.exports = {
   getQueueStatus,
   registerInlineHandler,
   shutdownForQuota,
+  recoverFallbackTasks,
+  startFallbackRecovery,
   shutdownQueues,
   _quotaTestReset,
 };

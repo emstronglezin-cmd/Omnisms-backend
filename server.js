@@ -524,6 +524,12 @@ try {
   logger.warn('[Worker] Could not start transcription worker.', { error: err.message });
 }
 
+/* ── Reprise des tâches de secours (outbox Firestore, survit aux redémarrages) ── */
+try {
+  const { startFallbackRecovery } = require('./services/queueService');
+  startFallbackRecovery();
+} catch (_) { /* non bloquant */ }
+
 /* ── Worker SMS (retry outbound) ─────────────────────────── */
 try {
   const { startSmsWorker } = require('./services/smsQueueWorker');
